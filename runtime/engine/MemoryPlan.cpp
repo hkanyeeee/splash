@@ -4,6 +4,7 @@
 #include "metal/abi/PagedAttention.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -623,6 +624,29 @@ std::string EngineMemoryPlan::toStatusJson() const {
   return out.str();
 }
 
+uint64_t EngineMemoryPolicy::workingSetMarginBytes(
+    const DeviceCapabilities &device, uint64_t maximumMemoryBytes) noexcept {
+  const char *option = std::getenv("SPLASH_LOCAL_MEMORY_44G");
+  if (option && std::string_view(option) == "1" &&
+      device.deviceName == "Apple M4 Max" && device.appleGpuFamily == 9 &&
+      device.gpuCoreCount == 40 && device.physicalMemoryBytes == 48 * kGiB &&
+      device.recommendedMaxWorkingSetBytes == 44 * kGiB &&
+      maximumMemoryBytes == 44 * kGiB)
+    return 0;
+  return workingSetMarginBytes(device.recommendedMaxWorkingSetBytes);
+}
+
+uint64_t EngineMemoryPolicy::hardBudgetBytes(
+    const DeviceCapabilities &device, uint64_t maximumMemoryBytes) noexcept {
+  const uint64_t margin = workingSetMarginBytes(device, maximumMemoryBytes);
+  const uint64_t automatic = device.recommendedMaxWorkingSetBytes > margin
+                                ? device.recommendedMaxWorkingSetBytes - margin
+                                : 0;
+  return maximumMemoryBytes && maximumMemoryBytes < automatic
+             ? maximumMemoryBytes
+             : automatic;
+}
+
 EngineMemoryPlanResult
 evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          const ModelMemoryProfile &model,
@@ -657,7 +681,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   }
 
   breakdown.workingSetMarginBytes = EngineMemoryPolicy::workingSetMarginBytes(
-      breakdown.recommendedWorkingSetBytes);
+      device, maximumMemoryBytes);
   if (breakdown.recommendedWorkingSetBytes <=
       breakdown.workingSetMarginBytes) {
     return {std::nullopt,
@@ -667,7 +691,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                     std::move(breakdown))};
   }
   breakdown.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
-      breakdown.recommendedWorkingSetBytes, maximumMemoryBytes);
+      device, maximumMemoryBytes);
 
   breakdown.kvPageBytes = model.targetKvLayout.bytesPerModelPage();
   breakdown.fixedRuntimeBytes = model.fixedRuntimeBytes();

@@ -447,6 +447,17 @@ public:
         ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
+        if (captureAlignedGenerationState) {
+          const uint32_t boundary = static_cast<uint32_t>(
+              (item.logicalPosition + tokens.size() - step.outputTokensWithoutKv) / 32 * 32);
+          if (boundary > item.logicalPosition &&
+              boundary >= item.logicalPosition - state.generated + 32)
+            step.generationCheckpoint = GenerationCheckpoint{boundary, std::make_shared<State>()};
+        }
+        if (captureGenerationState && state.generated >= 64 &&
+            item.logicalPosition % 32 == 0)
+          step.generationCheckpoint = GenerationCheckpoint{
+              static_cast<uint32_t>(item.logicalPosition), std::make_shared<State>()};
         if (speculative != speculativeCounts.end()) {
           step.draftedTokens = speculative->second.first;
           step.acceptedDraftTokens = speculative->second.second;
@@ -921,6 +932,8 @@ public:
   bool *kvGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
   bool decodeFinishes = true;
+  bool captureGenerationState = false;
+  bool captureAlignedGenerationState = false;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> speculativeCounts;
   uint32_t decodeTokensWithoutKv = 0;
   // When set, the decode step emits poisonToken (instead of 42) for

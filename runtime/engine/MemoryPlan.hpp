@@ -278,6 +278,16 @@ struct EngineMemoryPolicy {
                : automatic;
   }
 
+  // Local opt-in for the user's 48 GiB, 40-core M4 Max: --max-memory
+  // 44G may use Metal's full 44 GiB recommendation. Host pressure and
+  // reserve checks remain independent of this working-set margin.
+  [[nodiscard]] static uint64_t
+  workingSetMarginBytes(const DeviceCapabilities &device,
+                        uint64_t maximumMemoryBytes) noexcept;
+  [[nodiscard]] static uint64_t
+  hardBudgetBytes(const DeviceCapabilities &device,
+                  uint64_t maximumMemoryBytes) noexcept;
+
   // A bounded host cushion, independent of the engine's Metal capacity.
   [[nodiscard]] static constexpr uint64_t
   hostAvailableReserveBytes(uint64_t physicalMemoryBytes) noexcept {

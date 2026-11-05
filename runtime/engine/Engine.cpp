@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -20,6 +21,24 @@ constexpr int kMaskWaitLimitMilliseconds = 5000;
 // A junction costs a cached state, its capture and up to a draft window of
 // draft-context rows; a later request must save at least that much prefill.
 constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
+
+// Opt-in policy for this Qwen3.8 tokenizer. A cached prefix immediately
+// before the final message can serve an edit/fork of that message.
+uint32_t localMessageBoundary(std::span<const uint32_t> tokens, uint32_t vocabulary) {
+  const char *option = std::getenv("SPLASH_LOCAL_TAIL_CHECKPOINT");
+  if (!option || std::string_view(option) != "message" ||
+      vocabulary != 248320 || tokens.size() < 16384)
+    return 0;
+  const auto assistant = std::find(tokens.rbegin(), tokens.rend(), 248045U);
+  if (assistant == tokens.rend()) return 0;
+  const size_t at = tokens.size() - 1 - size_t(assistant - tokens.rbegin());
+  if (at + 2 >= tokens.size() || tokens[at + 1] != 74455 || tokens[at + 2] != 198)
+    return 0;
+  const auto message = std::find(assistant + 1, tokens.rend(), 248045U);
+  if (message == tokens.rend()) return 0;
+  return uint32_t(tokens.size() - 1 - size_t(message - tokens.rbegin())) /
+         KvCache::pageTokens * KvCache::pageTokens;
+}
 
 // What the request's KV blocks are cached under beside its tokens.
 PromptIdentity promptIdentity(const EngineRequest &request) noexcept {
@@ -1268,6 +1287,9 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
            stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
   }
+  if (const uint32_t boundary = localMessageBoundary(
+          std::span(active.exactTokens).first(active.promptTokens), config_.vocabularySize))
+    addStateBoundary(active, stateBoundary, boundary, true, true);
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
@@ -1391,6 +1413,8 @@ void Engine::publishReachedStateBoundaries(
     const Request::StateBoundary objective =
         active.stateBoundaries[active.stateBoundaryCursor++];
     const bool checkpoint = objective.disposable;
+    const bool messageBoundary = checkpoint && objective.tokens == localMessageBoundary(
+        std::span(active.exactTokens).first(active.promptTokens), config_.vocabularySize);
     // The conversation's next turn resumes from the prompt's replay point. A
     // rebuilt replay point counts as a replay-state publication, not a
     // junction.
@@ -1454,7 +1478,7 @@ void Engine::publishReachedStateBoundaries(
         continue;
       }
       const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
-      if (!replay && resident)
+      if (!replay && !messageBoundary && resident)
         static_cast<void>(retireCheckpoint(active));
       // The command has completed, so the state it ended at for its lane's
       // checkpoint is taken from the lane now. The replay point keeps that
@@ -1505,7 +1529,9 @@ void Engine::publishReachedStateBoundaries(
     // until this state is published; a refused publication leaves it the
     // lane's recovery point, unless it retired above to give this state its
     // buffers.
-    if (!replay)
+    // Keep the earlier recovery point when adding this optional fork point.
+    // Both remain disposable under the normal cache memory policy.
+    if (!replay && !messageBoundary)
       static_cast<void>(retireCheckpoint(active));
     active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                          : StateCheckpoint{};
@@ -2568,6 +2594,26 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
           static_cast<uint32_t>(active.exactTokens.size()) -
           result.outputTokensWithoutKv;
       publishCommittedBlocks(active, storedTokens);
+      if (result.generationCheckpoint) {
+        const GenerationCheckpoint &checkpoint = *result.generationCheckpoint;
+        const uint32_t boundary = checkpoint.tokens;
+        if (!checkpoint.state || boundary % KvCache::pageTokens ||
+            boundary <= active.promptTokens ||
+            boundary < active.exactTokens.size() - result.outputTokens.size() ||
+            boundary > storedTokens)
+          throw std::logic_error("invalid generation checkpoint");
+        const uint64_t block = cache_.blockAt(active.request.id, boundary);
+        if (cache_.stateTailFull(block) &&
+            (!active.latestCheckpoint || retireCheckpoint(active))) {
+          if (cache_.reuseStoredState(block, true)) {
+            ++counters_.deduplicatedStatePublications;
+          } else {
+            cache_.publishCompositeState(block, checkpoint.state, true);
+            ++counters_.checkpointPublications;
+          }
+          active.latestCheckpoint = cache_.checkpointState(block);
+        }
+      }
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;

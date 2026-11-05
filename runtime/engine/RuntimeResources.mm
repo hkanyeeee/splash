@@ -730,7 +730,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const kv::SlotFormat kvFormat(kvLayout);
   const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
   const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
-      device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
+      device, config.maximumMemoryBytes);
   model::StreamableWeights streamable;
   // The arenas of the loaded model by what streams of it, and those of a
   // runtime whose K/V spills, which only a block-sparse target with a

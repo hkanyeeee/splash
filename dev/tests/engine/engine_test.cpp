@@ -12849,8 +12849,185 @@ void testReplayPointTakesTheExpertStoreBeforeWhatIsInUse() {
   }
 }
 
+void testGenerationCheckpointLifecycle() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor(1);
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 8;
+  executor.captureGenerationState = true;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(64, 7);
+  double now = 1;
+  for (uint64_t id : {1ULL, 2ULL}) {
+    auto input = request(id, prompt);
+    input.maxNewTokens = 192;
+    engine.submit(input);
+    tickUntil(engine, now, [&] { return idle(engine); },
+              "generation did not finish");
+    require(events.outputs[id].size() == 192 && events.completedCount == id &&
+                events.failedCount == 0,
+            "generation checkpoint changed output or failed duplicate request");
+    const auto snapshot = engine.snapshot();
+    require(snapshot.resources.stateCache.checkpointEntries == 1,
+            "rolling generation checkpoints accumulated");
+    require(snapshot.checkpointPublications == (id == 1 ? 4U : 7U),
+            "duplicate generation state was published instead of reused");
+  }
+  auto next = prompt;
+  next.insert(next.end(), 192, 42);
+  next.push_back(17);
+  require(cache.probe(next, {}).cachedTokens() == 224,
+          "generation checkpoint missing at exact last page");
+  const uint32_t computed = executor.prefillRows;
+  engine.submit(request(3, next));
+  tickUntil(engine, now, [&] { return idle(engine); }, "follow-up did not finish");
+  require(events.starts.back() == 224 && executor.prefillRows - computed == 33 &&
+              events.failedCount == 0,
+          "follow-up did not restore the generated prefix exactly");
+
+  auto input = request(4, std::vector<uint32_t>(64, 19));
+  input.maxNewTokens = 192;
+  engine.submit(input);
+  tickUntil(engine, now, [&] { return events.outputs[4].size() >= 64; },
+            "cancel fixture never decoded");
+  const uint64_t published = engine.snapshot().checkpointPublications;
+  auto held = std::make_shared<std::atomic<bool>>(false);
+  executor.holdDecodeUntil = held;
+  tickUntil(engine, now, [&] { return engine.commandInFlight(); },
+            "cancel fixture has no command");
+  engine.cancel(4);
+  held->store(true);
+  tickUntil(engine, now, [&] { return idle(engine); },
+            "cancelled capture did not drain");
+  require(engine.snapshot().checkpointPublications == published &&
+              engine.snapshot().cancelled == 1,
+          "cancelled decode published its captured state");
+}
+
+void testAlignedGenerationCheckpointLifecycle() {
+  test::TestKvStorage storage(128, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor(1);
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 7;
+  executor.captureAlignedGenerationState = true;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(64, 7);
+  double now = 1;
+  for (uint64_t id : {1ULL, 2ULL}) {
+    auto input = request(id, prompt);
+    input.maxNewTokens = 224;
+    engine.submit(input);
+    tickUntil(engine, now, [&] { return idle(engine); },
+              "generation did not finish");
+    require(events.outputs[id].size() == 224 && events.completedCount == id &&
+                events.failedCount == 0,
+            "generation checkpoint changed output or failed duplicate request");
+    const auto snapshot = engine.snapshot();
+    require(snapshot.resources.stateCache.checkpointEntries == 1,
+            "rolling generation checkpoints accumulated");
+    require(snapshot.checkpointPublications == (id == 1 ? 7U : 13U),
+            "duplicate generation state was published instead of reused");
+  }
+  auto next = prompt;
+  next.insert(next.end(), 224, 42);
+  next.push_back(17);
+  require(cache.probe(next, {}).cachedTokens() == 288,
+          "generation checkpoint missing at exact last page");
+  const uint32_t computed = executor.prefillRows;
+  engine.submit(request(3, next));
+  tickUntil(engine, now, [&] { return idle(engine); }, "follow-up did not finish");
+  require(events.starts.back() == 288 && executor.prefillRows - computed == 1 &&
+              events.failedCount == 0,
+          "follow-up did not restore the generated prefix exactly");
+
+  auto input = request(4, std::vector<uint32_t>(64, 19));
+  input.maxNewTokens = 224;
+  engine.submit(input);
+  tickUntil(engine, now, [&] { return events.outputs[4].size() >= 91; },
+            "cancel fixture never decoded");
+  const uint64_t published = engine.snapshot().checkpointPublications;
+  auto held = std::make_shared<std::atomic<bool>>(false);
+  executor.holdDecodeUntil = held;
+  tickUntil(engine, now, [&] { return engine.commandInFlight(); },
+            "cancel fixture has no command");
+  engine.cancel(4);
+  held->store(true);
+  tickUntil(engine, now, [&] { return idle(engine); },
+            "cancelled capture did not drain");
+  require(engine.snapshot().checkpointPublications == published &&
+              engine.snapshot().cancelled == 1,
+          "cancelled decode published its captured state");
+}
+
+void testMessageCheckpointRetainsRecoveryPoint() {
+  struct Environment final {
+    std::optional<std::string> previous;
+    Environment() {
+      if (const char *value = std::getenv("SPLASH_LOCAL_TAIL_CHECKPOINT"))
+        previous = value;
+      setenv("SPLASH_LOCAL_TAIL_CHECKPOINT", "message", 1);
+    }
+    ~Environment() {
+      if (previous)
+        setenv("SPLASH_LOCAL_TAIL_CHECKPOINT", previous->c_str(), 1);
+      else
+        unsetenv("SPLASH_LOCAL_TAIL_CHECKPOINT");
+    }
+  } environment;
+  test::TestKvStorage storage(2048, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  auto config = test::engineConfig();
+  config.vocabularySize = 248320;
+  config.maxContext = 32768;
+  engine::Engine engine(config, cache, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> prompt(20193, 7);
+  prompt[19900] = 248045;
+  prompt[19901] = 846;
+  prompt[19902] = 198;
+  prompt[20185] = 248045;
+  prompt[20186] = 74455;
+  prompt[20187] = 198;
+  double now = 1;
+  engine.submit(request(1, prompt));
+  tickUntil(engine, now, [&] { return idle(engine); },
+            "message checkpoint producer did not finish");
+  require(events.failedCount == 0, "message checkpoint producer failed");
+  auto earlier = prompt;
+  std::fill(earlier.begin() + 19000, earlier.end(), 29);
+  require(cache.probe(earlier, {}).cachedTokens() == 16384,
+          "message capture lost the earlier recovery point");
+  auto fork = prompt;
+  std::fill(fork.begin() + 19903, fork.begin() + 20183, 19);
+  require(cache.probe(fork, {}).cachedTokens() == 19872,
+          "message checkpoint was not retained at the expected boundary");
+  const uint32_t computed = executor.prefillRows;
+  engine.submit(request(2, fork));
+  tickUntil(engine, now, [&] { return idle(engine); },
+            "message checkpoint fork did not finish");
+  require(events.starts.back() == 19872 && executor.prefillRows - computed == 321 &&
+              events.failedCount == 0,
+          "fork did not reuse the exact message checkpoint");
+  require(engine.snapshot().resources.stateCache.checkpointEntries == 2,
+          "the earlier and message checkpoints were not both retained");
+}
+
 int main() {
   try {
+    testMessageCheckpointRetainsRecoveryPoint();
+    testGenerationCheckpointLifecycle();
+    testAlignedGenerationCheckpointLifecycle();
     testSpeculativeCountsStayWithEachConcurrentRequest();
     testImpossibleSpeculativeCountsFailOnlyTheirOwnLane();
     testUnusableThinkingBudgetIsRefused();

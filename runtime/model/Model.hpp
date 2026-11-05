@@ -375,6 +375,16 @@ struct ModelBatchItem final {
   std::vector<StateCapture> stateCaptures{};
 };
 
+// Exact generated-prefix state at a page boundary inside the returned
+// decode step, including its start or last committed KV row. It excludes
+// terminal output tokens that have no KV row.
+struct GenerationCheckpoint final {
+  uint32_t tokens = 0;
+  std::shared_ptr<const CompositeState> state;
+
+  bool operator==(const GenerationCheckpoint &) const = default;
+};
+
 struct ModelStepResult final {
   uint64_t requestId = 0;
   // A prefill's rows, which only its last pass consumes (BatchPlan::passes):
@@ -419,6 +429,8 @@ struct ModelStepResult final {
   // and emits it first. Reported so that the engine can send it to the client
   // now rather than with that cycle.
   std::optional<uint32_t> firstToken{};
+
+  std::optional<GenerationCheckpoint> generationCheckpoint{};
 
   bool operator==(const ModelStepResult &) const = default;
 };

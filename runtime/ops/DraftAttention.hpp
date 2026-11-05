@@ -125,6 +125,13 @@ public:
                              metal::MetalBuffer context,
                              metal::MetalBuffer window, uint32_t rows,
                              uint32_t startPosition, uint32_t width);
+  // Commits only the retained prefix of one lane's eight decode rows.
+  // Rejected rows must not overwrite older slots of a cached window.
+  static void addWindowCommit(metal::CommandGraph &graph,
+                              metal::MetalBuffer context,
+                              metal::MetalBuffer window,
+                              metal::MetalBuffer retainedCount,
+                              uint32_t startPosition, uint32_t width);
   // Loads the rows of positions startPosition on back into `rows` rows.
   static void addWindowLoad(metal::CommandGraph &graph,
                             metal::MetalBuffer window,

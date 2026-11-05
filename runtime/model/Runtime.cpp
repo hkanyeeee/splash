@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <list>
@@ -358,10 +359,14 @@ struct Runtime::Impl {
     // the prompt (with any replayed generation) and the emitted output, which
     // the target may read (QwenTargetRequest).
     std::vector<uint32_t> tokens;
+    uint64_t generationCheckpointTokens = 0;
   };
 
   struct DecodeLaneResult final {
     Request *request = nullptr;
+    std::shared_ptr<QwenStateReservation> generationSnapshot;
+    QwenLogicalLengths generationLengths;
+    uint32_t generationPrefix = 0;
     uint32_t retained = 0;
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
@@ -2101,6 +2106,68 @@ struct Runtime::Impl {
                        {penaltyTable, std::span(stateLanes).first(lanes)});
   }
 
+  // Opt-in local policy for the measured dense Qwen3.8-27B layout. A
+  // decoder with auxiliary state needs its own pre-cycle capture before
+  // enabling this path. Bootstrap requests never retain generated state.
+  bool keepsGenerationWindow(const Request &entry) const {
+    static const bool enabled = [] {
+      const char *value = std::getenv("SPLASH_LOCAL_GENERATION_CACHE");
+      return value && std::string_view(value) == "1";
+    }();
+    return enabled && entry.id < (uint64_t{1} << 63) &&
+           geometry.target.vocabularySize == 248320 &&
+           geometry.target.hiddenSize == 5120 &&
+           states.layout().target.layers == 48 &&
+           !states.layout().target.auxiliaryBytes;
+  }
+
+
+  bool usesAlignedGeneration(const Request &entry) const {
+    static const bool enabled = [] {
+      const char *value = std::getenv("SPLASH_LOCAL_ALIGNED_GENERATION");
+      return value && std::string_view(value) == "1";
+    }();
+    const auto &layout = states.layout();
+    return enabled && keepsGenerationWindow(entry) &&
+           layout.target.format == ops::GdnStateFormat::Float32 &&
+           layout.target.convolutionChannels == 10240 &&
+           layout.target.recurrentGroups == 48 &&
+           layout.target.recurrentRows == 128 &&
+           layout.target.recurrentColumns == 128 &&
+           layout.target.convolutionLayerBytes() == 65536 &&
+           layout.draft.contextWidth == 5120;
+  }
+
+  void encodeGenerationSnapshots(CommandGraph &graph,
+                                 std::span<const DecodeLaneResult> lanes,
+                                 std::span<const ModelBatchItem> items) {
+    for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
+      const auto &capture = lanes[lane];
+      if (!capture.generationSnapshot || !capture.generationPrefix)
+        continue;
+      const auto &entry = *capture.request;
+      const auto &layout = states.layout();
+      const uint64_t slot = decodeArena->gdnTapeSlot(
+          entry.stateLane, states.metadata(entry.stateLane).activeParity ^ 1);
+      const uint64_t tapeBytes = layout.target.layers *
+          ops::gdnTapeLayerBytes(geometry.target.gdnShape());
+      const auto tape = backend.view(
+          decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount), slot, tapeBytes);
+      // next() is the exact START cell. This step's rows remain in its tape.
+      // The candidate is private and will only be sealed if acceptance
+      // actually retained all rows through this page boundary.
+      graph.add("verify_gdn_prefix_f32",
+                {states.next(entry.stateLane).stateBase, tape,
+                 capture.generationSnapshot->buffers().gdn->buffers().stateBase},
+                capture.generationPrefix, {48, 48, 1});
+      ops::DraftAttention::addWindowStore(
+          graph, decodeArena->get(lane, DecodeTensor::ContextHidden),
+          capture.generationSnapshot->buffers().window->buffer(),
+          capture.generationPrefix, static_cast<uint32_t>(items[lane].logicalPosition),
+          layout.draft.contextWidth);
+    }
+  }
+
   void encodeDraftStateCommitBatch(CommandGraph &graph,
                                    std::span<Request *const> entries,
                                    std::span<const ModelBatchItem> items) {
@@ -2129,6 +2196,20 @@ struct Runtime::Impl {
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addContextCommit(graph, std::move(buffers),
                                 std::span(startPositions).first(lanes));
+    // Keep the existing quantized context-window representation current.
+    // Only accepted rows are written, so rejected proposals cannot destroy
+    // older rows which the next cycle or a snapshot still needs.
+    const uint32_t width = states.layout().draft.contextWidth;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const Request &entry = *entries[lane];
+      if (!keepsGenerationWindow(entry))
+        continue;
+      ops::DraftAttention::addWindowCommit(
+          graph, decodeArena->get(lane, DecodeTensor::ContextHidden),
+          states.window(entry.stateLane),
+          decodeArena->get(lane, DecodeTensor::RetainedCount),
+          startPositions[lane], width);
+    }
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,
@@ -2310,6 +2391,24 @@ struct Runtime::Impl {
       output.insert(output.end(), targetTokens,
                     targetTokens + (laneResult.retained - 1));
 
+      std::shared_ptr<const CompositeState> generationState;
+      if (laneResult.generationSnapshot &&
+          laneResult.retained >= laneResult.generationPrefix) {
+        // A natural start-boundary capture copies the target's new cell,
+        // which folded the previous pending tape but not this cycle's rows.
+        // An inside-cycle capture already folded exactly its prefix into
+        // the private destination; only now is its acceptance established.
+        const MetalBuffer &source = states.next(entry.stateLane).stateBase;
+        const MetalBuffer &destination =
+            laneResult.generationSnapshot->buffers().gdn->buffers().stateBase;
+        if (source.sizeBytes() != destination.sizeBytes())
+          throw std::logic_error("generation snapshot extent mismatch");
+        if (!laneResult.generationPrefix)
+          std::memcpy(destination.contents(), source.contents(), source.sizeBytes());
+        generationState = states.seal(*laneResult.generationSnapshot,
+                                     laneResult.generationLengths);
+        entry.generationCheckpointTokens = laneResult.generationLengths.targetTokens;
+      }
       states.swapDecodeParity(entry.stateLane, laneResult.retained);
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
@@ -2317,7 +2416,7 @@ struct Runtime::Impl {
           entry.stateLane,
           advanceDraftContext(states.metadata(entry.stateLane).lengths,
                               nextLength, items[lane].logicalPosition,
-                              nextLength, false, false));
+                              nextLength, false, keepsGenerationWindow(entry)));
       entry.generatedTokens += laneResult.retained;
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
@@ -2335,6 +2434,10 @@ struct Runtime::Impl {
                          DecodeStage::Regular,
                          verified - std::min(verified, laneResult.endDrafts),
                          accepted - std::min(accepted, laneResult.endDrafts)});
+      if (generationState)
+        results.back().generationCheckpoint = GenerationCheckpoint{
+            static_cast<uint32_t>(laneResult.generationLengths.targetTokens),
+            std::move(generationState)};
       ModelStepResult &result = results.back();
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
@@ -2446,6 +2549,7 @@ struct Runtime::Impl {
           CommandGraph commit;
           impl_.encodeVerifyCommit(commit, {entries.data(), lanes_.size()}, items_,
                                    {maximumRetained.data(), lanes_.size()});
+          impl_.encodeGenerationSnapshots(commit, lanes_, items_);
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -3045,6 +3149,38 @@ Runtime::decodeAsync(const BatchPlan &plan,
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
 
+    if (impl_->usesAlignedGeneration(entry)) {
+      const uint64_t boundary =
+          (item.logicalPosition / kv::kPageTokens + 1) * kv::kPageTokens;
+      if (boundary <= item.logicalPosition + laneResult.maximumRetained &&
+          boundary >= entry.promptTokens + 32 &&
+          boundary >= entry.generationCheckpointTokens + 32) {
+        const auto lengths = Impl::advanceDraftContext(
+            impl_->states.metadata(entry.stateLane).lengths, boundary,
+            item.logicalPosition, boundary, false, true);
+        impl_->states.validateLengths(lengths, true);
+        metal::AllocationFailure refusal;
+        laneResult.generationSnapshot = impl_->states.reserve(refusal);
+        if (laneResult.generationSnapshot) {
+          laneResult.generationLengths = lengths;
+          laneResult.generationPrefix = static_cast<uint32_t>(boundary - item.logicalPosition);
+          impl_->states.copyWindow(entry.stateLane, *laneResult.generationSnapshot);
+        }
+      }
+    } else if (impl_->keepsGenerationWindow(entry) && entry.generatedTokens >= 64 &&
+        item.logicalPosition % kv::kPageTokens == 0 &&
+        item.logicalPosition >= entry.generationCheckpointTokens + 128) {
+      const QwenLogicalLengths lengths =
+          impl_->states.metadata(entry.stateLane).lengths;
+      impl_->states.validateLengths(lengths, true);
+      metal::AllocationFailure refusal;
+      laneResult.generationSnapshot = impl_->states.reserve(refusal);
+      if (laneResult.generationSnapshot) {
+        laneResult.generationLengths = lengths;
+        // Copy the old window before this cycle appends its accepted rows.
+        impl_->states.copyWindow(entry.stateLane, *laneResult.generationSnapshot);
+      }
+    }
     impl_->prepareDecodeLane(entry, item, lane);
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;
@@ -3079,6 +3215,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                               DecodeTensor::Hidden0, width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, *reads);
   impl_->encodeVerifyCommit(commandGraph, entries, items, {maximumRetained.data(), width});
+  impl_->encodeGenerationSnapshots(commandGraph, lanes, items);
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();

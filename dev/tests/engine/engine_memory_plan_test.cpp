@@ -290,6 +290,62 @@ void testHardBudgetBoundaries() {
           "maximum working set overflowed the preflight ceiling");
 }
 
+void testLocalM4Memory44G() {
+  constexpr const char *option = "SPLASH_LOCAL_MEMORY_44G";
+  const char *old = std::getenv(option);
+  const std::optional<std::string> saved = old ? std::optional(std::string(old)) : std::nullopt;
+  struct Restore {
+    const std::optional<std::string> &saved;
+    ~Restore() {
+      if (saved) setenv("SPLASH_LOCAL_MEMORY_44G", saved->c_str(), 1);
+      else unsetenv("SPLASH_LOCAL_MEMORY_44G");
+    }
+  } restore{saved};
+  auto mac = device(44 * kGiB);
+  mac.deviceName = "Apple M4 Max";
+  mac.gpuCoreCount = 40;
+  mac.physicalMemoryBytes = 48 * kGiB;
+  auto profile = model();
+  profile.targetKvLayout.format = kv::Format::BFloat16;
+  unsetenv(option);
+  const auto baseline = test::requireMemoryPlan(mac, profile, 44 * kGiB);
+  require(baseline.breakdown().hardBudgetBytes == 43 * kGiB,
+          "the default M4 policy unexpectedly uses the extra GiB");
+  setenv(option, "1", 1);
+  const auto expanded = test::requireMemoryPlan(mac, profile, 44 * kGiB);
+  require(expanded.breakdown().configuredMemoryLimitBytes == 44 * kGiB &&
+              expanded.breakdown().hardBudgetBytes == 44 * kGiB &&
+              expanded.breakdown().workingSetMarginBytes == 0 &&
+              expanded.breakdown().dynamicBudgetBytes == baseline.breakdown().dynamicBudgetBytes + kGiB &&
+              expanded.breakdown().kvPageBytes == baseline.breakdown().kvPageBytes,
+          "the local opt-in did not add exactly one GiB with the same KV layout");
+  require(EngineMemoryPolicy::hardBudgetBytes(mac, 44 * kGiB) == expanded.breakdown().hardBudgetBytes,
+          "preload and loaded plans disagree on the local budget");
+  for (uint64_t limit : {uint64_t{0}, 43 * kGiB, 45 * kGiB})
+    require(EngineMemoryPolicy::hardBudgetBytes(mac, limit) == 43 * kGiB,
+            "a different or automatic limit enabled the local override");
+  for (const char *disabled : {"0", "true", "11", ""}) {
+    setenv(option, disabled, 1);
+    require(EngineMemoryPolicy::hardBudgetBytes(mac, 44 * kGiB) == 43 * kGiB,
+            "a non-exact opt-in enabled the local override");
+  }
+  setenv(option, "1", 1);
+  for (unsigned variant = 0; variant < 5; ++variant) {
+    auto other = mac;
+    if (variant == 0) other.deviceName = "Apple M3 Max";
+    if (variant == 1) other.gpuCoreCount = 32;
+    if (variant == 2) other.physicalMemoryBytes = 64 * kGiB;
+    if (variant == 3) other.recommendedMaxWorkingSetBytes = 42 * kGiB;
+    if (variant == 4) other.appleGpuFamily = 10;
+    require(EngineMemoryPolicy::hardBudgetBytes(other, 44 * kGiB) ==
+                EngineMemoryPolicy::hardBudgetBytes(other.recommendedMaxWorkingSetBytes, 44 * kGiB),
+            "the local override changed another device's budget");
+  }
+  require(EngineMemoryPolicy::hostAvailableReserveBytes(mac.physicalMemoryBytes) == 2 * kGiB &&
+              EngineMemoryPolicy::hostSpareReserveBytes(mac.physicalMemoryBytes) > 3 * kGiB,
+          "the local opt-in changed host reserves");
+}
+
 void testModelProvidedKvGeometry() {
   ModelMemoryProfile compact = model();
   compact.name = "compact-test-model";
@@ -985,6 +1041,7 @@ int main() {
     testStreamedTableIsBudgeted();
     testReservesAreTheModelConstants();
     testHardBudgetBoundaries();
+    testLocalM4Memory44G();
     testModelProvidedKvGeometry();
     testWindowedKvCostsSlimPages();
     testExtentSizeFollowsThePool();

@@ -471,11 +471,16 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // kMaximumStagedPrefillRows rows runs the staged tile's 64-row height,
   // which reads the weights once: 0.48 ms there, and 6-43% less than the
   // prefill tile over the 27B's Q4_K, MLX 4-bit and Q8_0 projections at the
-  // split law's choice (gguf-projection-benchmark prefill=33,48,64). Apple9
-  // is unmeasured and keeps the prefill tile.
+  // split law's choice (gguf-projection-benchmark prefill=33,48,64). On the
+  // local 40-core M4 Max (Apple9), the same 33-64-row policy takes a 27B
+  // 64-token prefill from 440 to 293 ms; 65K-context HTTP tests reduce
+  // affected tail-prefill latency by 26-28%. Other Apple9 core counts keep
+  // the prefill tile until measured.
   if (w.phase == LinearPhase::Prefill) {
+    const bool staged64 = family_ == GpuFamilyClass::Apple10 ||
+                          (family_ == GpuFamilyClass::Apple9 && gpuCores_ == 40);
     const bool staged = w.rows <= kMaximumDecodeTileRows ||
-                        (family_ == GpuFamilyClass::Apple10 && w.rows <= kMaximumStagedPrefillRows);
+                        (staged64 && w.rows <= kMaximumStagedPrefillRows);
     return staged ? stagedDecode(n, k, w.rows, weightBits16(projections, shape), gpuCores_, family_)
                   : LinearConfig{.tile = LinearTile::GgufPrefill};
   }

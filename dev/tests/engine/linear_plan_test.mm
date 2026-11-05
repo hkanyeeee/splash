@@ -310,10 +310,20 @@ void ggufPlans() {
                                             blockProjection(17408, 5120, 1));
   require(registerGateUp.gateScratchBytes() == gateBytes(registerGateUp),
           "Apple9 GGUF gate/up runs a gate pass into the gate scratch");
-  for (const uint32_t rows : {33U, 64U, 100U})
-    require(m3.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::Residual},
-                    blockProjection(5120, 17408, 1)).configuration().tile == LinearTile::GgufPrefill,
-            "Apple9 GGUF prefill chunks past a decode batch take the prefill tile");
+  for (const uint32_t rows : {33U, 48U, 64U, 65U, 100U}) {
+    const LinearPlan plan = m3.plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::Residual},
+                                    blockProjection(5120, 17408, 1));
+    const bool staged = rows <= 64;
+    require(plan.configuration().tile == (staged ? LinearTile::GgufStaged : LinearTile::GgufPrefill) &&
+                plan.storageRows() == (staged ? 64U : 128U) &&
+                plan.configuration().splits == (staged ? 8U : 1U) &&
+                plan.scratchSize().partials == (staged ? splitPartialsBytes(plan) : 0),
+            "40-core Apple9 short prefill uses the measured 64-row tile and its scratch");
+  }
+  for (const uint32_t cores : {16U, 32U, 48U})
+    require(gpu(9, cores).plan({{5120, 17408}, 64, LinearPhase::Prefill, LinearEpilogue::Residual},
+                               blockProjection(5120, 17408, 1)).configuration().tile == LinearTile::GgufPrefill,
+            "unmeasured Apple9 core counts keep the prefill tile");
   require(m3.ggufFloatTile(2048, 256, QuantizedSegment::kFloat32) == FloatTile::Simdgroup,
           "Apple9 float projections take the simdgroup tile");
   const LinearScratchSize bound = m3.decodeScratchSize(downShape);
