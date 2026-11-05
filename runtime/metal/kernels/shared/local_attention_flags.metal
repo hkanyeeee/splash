@@ -85,7 +85,7 @@ kernel void m4_flags_prefill_control(
  device bfloat *queries [[buffer(0)]],device float *partials [[buffer(1)]],
  device float *statistics [[buffer(2)]],device const SplashKvPage *table [[buffer(3)]],
  constant SplashPrefillAttentionParams &params [[buffer(4)]],uint3 group [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
- 
+
  const auto tile=splash_prefill_attention_tile<4,6,256>(params,group.x,group.y);
  if(!tile.active || group.z>=tile.splits)return;
  alignas(16) threadgroup float scores[48*32];
@@ -102,7 +102,7 @@ kernel void m4_flags_prefill_no_initial(
  device bfloat *queries [[buffer(0)]],device float *partials [[buffer(1)]],
  device float *statistics [[buffer(2)]],device const SplashKvPage *table [[buffer(3)]],
  constant SplashPrefillAttentionParams &params [[buffer(4)]],uint3 group [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
- 
+
  const auto tile=splash_prefill_attention_tile<4,6,256>(params,group.x,group.y);
  if(!tile.active || group.z>=tile.splits)return;
  alignas(16) threadgroup float scores[48*32];
@@ -119,7 +119,7 @@ kernel void m4_flags_prefill_double(
  device bfloat *queries [[buffer(0)]],device float *partials [[buffer(1)]],
  device float *statistics [[buffer(2)]],device const SplashKvPage *table [[buffer(3)]],
  constant SplashPrefillAttentionParams &params [[buffer(4)]],uint3 group [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
- 
+
  const auto tile=splash_prefill_attention_tile<4,6,256>(params,group.x,group.y);
  if(!tile.active || group.z>=tile.splits)return;
  alignas(16) threadgroup float scores[48*32];
@@ -136,7 +136,7 @@ kernel void m4_flags_prefill_double_no_initial(
  device bfloat *queries [[buffer(0)]],device float *partials [[buffer(1)]],
  device float *statistics [[buffer(2)]],device const SplashKvPage *table [[buffer(3)]],
  constant SplashPrefillAttentionParams &params [[buffer(4)]],uint3 group [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
- 
+
  const auto tile=splash_prefill_attention_tile<4,6,256>(params,group.x,group.y);
  if(!tile.active || group.z>=tile.splits)return;
  alignas(16) threadgroup float scores[48*32];

@@ -113,4 +113,3 @@ inline void m4_flags_attention(
     statistics[(slot * M + thread_index) * 2 + 1] = row_sum[thread_index];
   }
 }
-
