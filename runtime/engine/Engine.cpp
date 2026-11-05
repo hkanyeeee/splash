@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "engine/Engine.hpp"
 
 #include <algorithm>
@@ -1487,9 +1488,23 @@ void Engine::publishReachedStateBoundaries(
       // cache the state's class may take.
       if (fromLane) {
         state = model_.snapshot(active.request.id);
-        if (!state && replay && resident && !checkpointShared(active) &&
-            retireCheckpoint(active))
-          state = model_.snapshot(active.request.id);
+        if (!state && replay && resident && !checkpointShared(active)) {
+          const char *option = std::getenv("SPLASH_LOCAL_KEEP_MESSAGE_OFFLOAD");
+          const uint32_t message = option && std::string_view(option) == "1"
+              ? localMessageBoundary(std::span(active.exactTokens).first(active.promptTokens),
+                                     config_.vocabularySize)
+              : 0;
+          bool writeStarted = false;
+          const bool kept = message && message <= objective.tokens &&
+              cache_.blockAt(active.request.id, message) == active.latestCheckpoint.kvBlock &&
+              cache_.recycleMessageCheckpoint(active.latestCheckpoint, writeStarted);
+          if (kept && std::getenv("SPLASH_LOCAL_OPTIMIZATION_TRACE"))
+            std::fprintf(stderr, "LOCAL_KEEP_MESSAGE_OFFLOAD request=%llu tokens=%u block=%llu write_started=%u\n",
+                (unsigned long long)active.request.id, message,
+                (unsigned long long)active.latestCheckpoint.kvBlock, unsigned(writeStarted));
+          if (kept || retireCheckpoint(active))
+            state = model_.snapshot(active.request.id);
+        }
         if (!state)
           recycled = makeStateRoom(checkpoint ? StateClass::Checkpoint
                                    : replay   ? StateClass::InUse

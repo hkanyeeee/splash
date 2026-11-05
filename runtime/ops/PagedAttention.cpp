@@ -1,3 +1,24 @@
+#include <cstdio>
+#include <atomic>
+#include <cstdlib>
+#include <string_view>
+namespace {
+std::atomic<unsigned> localFlagsMode{[] {const char *v=std::getenv("SPLASH_LOCAL_ATTENTION_FLAGS");return v&&std::string_view(v)=="1"?1u:0u;}()};
+std::atomic<uint64_t> localFlagsStats[2]{};
+}
+extern "C" void m4_flags_set_mode(unsigned mode){localFlagsMode.store(mode);}
+extern "C" void m4_flags_reset_stats(){for(auto &v:localFlagsStats)v.store(0);}
+extern "C" uint64_t m4_flags_stats(unsigned i){return i<2?localFlagsStats[i].load():0;}
+
+namespace {
+bool localOptimizationTrace() noexcept {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SPLASH_LOCAL_OPTIMIZATION_TRACE");
+    return value && std::string_view(value) == "1";
+  }();
+  return enabled;
+}
+}
 #include "ops/PagedAttention.hpp"
 
 #include "ops/BufferExtent.hpp"
@@ -500,7 +521,12 @@ void PagedAttention::addPrefill(
     reduce.push_back(counts);
   }
   if (plan.sinks) reduce.push_back(std::move(sinks));
-  graph.add(std::string(plan.splitPipeline), std::move(split), params, plan.splitGroups);
+  std::string selected(plan.splitPipeline);
+  if(localFlagsMode.load()&&selected=="prefill_attention_bf16_split"){
+    selected="m4_flags_prefill_double";if (localFlagsStats[1].fetch_add(1) % 16 == 0 && localOptimizationTrace())
+      std::fprintf(stderr, "LOCAL_ATTENTION_FLAGS phase=prefill\n");
+  }
+  graph.add(selected, std::move(split), params, plan.splitGroups);
   graph.add(std::string(plan.reducePipeline), std::move(reduce), params, plan.reduceGroups,
             reduceThreads(plan.layout));
 }
@@ -561,8 +587,12 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
     reduce.push_back(counts);
   }
   if (plan.sinks) reduce.push_back(buffers.sinks);
-  graph.add(std::string(blocks.locations ? plan.locatedSplitPipeline_ : plan.splitPipeline), std::move(split),
-            attention, plan.splitGroups);
+  std::string selected(blocks.locations ? plan.locatedSplitPipeline_ : plan.splitPipeline);
+  if(localFlagsMode.load()&&plan.lanes==1&&selected=="verify_attention_bf16_split"){
+    selected="m4_flags_verify_double";if (localFlagsStats[0].fetch_add(1) % 16 == 0 && localOptimizationTrace())
+      std::fprintf(stderr, "LOCAL_ATTENTION_FLAGS phase=verify\n");
+  }
+  graph.add(selected, std::move(split), attention, plan.splitGroups);
   graph.add(std::string(plan.reducePipeline), std::move(reduce), attention, plan.reduceGroups,
             reduceThreads(plan.layout));
 }

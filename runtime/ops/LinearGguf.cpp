@@ -1,3 +1,24 @@
+#include <cstdio>
+#include <atomic>
+#include <cstdlib>
+#include <string_view>
+namespace {
+std::atomic<unsigned> localPairMode{[] {const char *v=std::getenv("SPLASH_LOCAL_PARALLEL_GATEUP");return v&&std::string_view(v)=="1"?1u:0u;}()};
+std::atomic<uint64_t> localPairStats[5]{};
+}
+extern "C" void m4_pair_set_mode(unsigned mode){localPairMode.store(mode);}
+extern "C" void m4_pair_reset_stats(){for(auto &v:localPairStats)v.store(0);}
+extern "C" uint64_t m4_pair_stats(unsigned i){return i<5?localPairStats[i].load():0;}
+
+namespace {
+bool localOptimizationTrace() noexcept {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SPLASH_LOCAL_OPTIMIZATION_TRACE");
+    return value && std::string_view(value) == "1";
+  }();
+  return enabled;
+}
+}
 // GGUF projections: plan policy and dispatch (kernels/shared/gguf_linear.metal,
 // kernels/decode/linear_gguf_sgmatrix.metal).
 #include "Linear.hpp"
@@ -436,9 +457,12 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   // lane.
   if (config_.tile == LinearTile::GgufRegister) {
     const uint64_t rows = workload_.rows;
+    // Private experiment: both modes reserve the same alias extent and counters.
+    // The widest existing projection already bounds these partials for lanes1/2.
+    const bool pair=n==17408&&k==5120&&rows<=16&&config_.splits==4&&workload_.epilogue==LinearEpilogue::GateUp;
     return {tableBytes(k, rows), tableSumsBytes(LinearInput::Table16, k, rows),
-            config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : 0,
-            config_.splits > 1 ? uint64_t{n / GGUF_TILE_COLUMNS} * sizeof(uint32_t) : 0};
+            config_.splits > 1 ? config_.splits * rows * n * sizeof(float) * (pair?2:1) : 0,
+            config_.splits > 1 ? uint64_t{n / (pair?16:GGUF_TILE_COLUMNS)} * sizeof(uint32_t) : 0};
   }
   // Staged split-K: [split][row][column] fp32 partials over the tile's rows,
   // a one-pass gate/up's of both tensors, and one counter per column tile (a
@@ -795,6 +819,29 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
     graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
+    return;
+  }
+  if(localPairMode.load()&&family_==GpuFamilyClass::Apple9&&gpuCores_==40&&n==17408&&k==5120&&lanes<=2&&
+     config.splits==4&&w.epilogue==LinearEpilogue::GateUp&&plan.destination()==FloatOutput::BFloat16&&gate){
+    const auto &gates=gate->blocks().segments;
+    if(segments.size()!=1||gates.size()!=1)throw std::runtime_error("parallel pair unexpected segments");
+    const auto &u=segments.front(),&g=gates.front();const std::string key=std::string(g.name())+"_"+u.name();
+    const std::array<std::string_view,10> supported={"iq4xs_q6k","q5k_q5k","q6k_q80","q5k_q6k","q6k_q5k","iq4nl_q5k","iq4xs_q5k","q6k_q6k","q80_q80","af4g64_af4g64"};
+    if(std::find(supported.begin(),supported.end(),key)==supported.end()||g.columnOffset||u.columnOffset||g.outputSize!=n||u.outputSize!=n){
+      localPairStats[2].fetch_add(1);throw std::runtime_error("parallel pair unsupported format/extent");
+    }
+    const uint64_t need=2*uint64_t(w.rows)*config.splits*n*sizeof(float);
+    if(partials.sizeBytes()<need||counters.sizeBytes()<uint64_t(n/16)*4)throw std::runtime_error("parallel pair scratch underplanned");
+    const auto count = localPairStats[g.formatId==GGUF_FMT_AF4G64?1:0].fetch_add(1);
+    if (localOptimizationTrace() && count % (g.formatId==GGUF_FMT_AF4G64 ? 5 : 64) == 0)
+      std::fprintf(stderr, "LOCAL_PARALLEL_GATEUP lanes=%u splits=%u partial_bytes=%llu counter_bytes=%llu\n",
+          lanes, config.splits, (unsigned long long)partials.sizeBytes(),
+          (unsigned long long)counters.sizeBytes());
+    localPairStats[3].store(partials.sizeBytes());
+    localPairStats[4].store(counters.sizeBytes());
+    graph.add("m4_borrow_pair_"+key+suffix+"_g1",
+      {b.scratch.input,b.scratch.sums,u.plane0,u.plane1Slot(),u.meta,g.plane0,g.plane1Slot(),g.meta,b.output,b.gateScratch,partials,counters,partials},
+      GgufDecodeParams{k,config.splits,n,0,0},{n/16,config.splits,1},{64,1,1});
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,

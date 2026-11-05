@@ -499,6 +499,21 @@ bool Cache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   return states_.retireCheckpointState(checkpoint);
 }
 
+bool Cache::recycleMessageCheckpoint(StateCheckpoint checkpoint, bool &writeStarted) {
+  writeStarted = false;
+  const uint64_t block = checkpoint.kvBlock;
+  if (!checkpoint || !states_.contains(block) ||
+      states_.checkpointState(block).publication != checkpoint.publication ||
+      states_.checkpointPinned(checkpoint) || !states_.stateResident(block))
+    return false;
+  const bool hadDisk = states_.onDisk(block);
+  if (hadDisk && states_.persist(block) != PersistStatus::Durable)
+    return false;
+  const bool recycled = states_.reclaim(block, StateCache::Unwritten::Keep).evicted;
+  writeStarted = recycled && !hadDisk && states_.onDisk(block);
+  return recycled;
+}
+
 // Page admission: pages come from the pool, which grows by an extent when
 // the governor admits one. Making room is the caller's reclaim; a page that
 // must be written first comes back when its copy lands.

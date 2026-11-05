@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "engine/StateCache.hpp"
 
 #include "engine/DiskLabels.hpp"
@@ -498,6 +500,9 @@ bool StateCache::pollOffload() {
   PendingOffload done = std::move(*pending_);
   pending_.reset();
   const bool written = done.transfer->finish();
+  if (std::getenv("SPLASH_LOCAL_OPTIMIZATION_TRACE"))
+    std::fprintf(stderr, "LOCAL_STATE_OFFLOAD_FINISHED block=%llu success=%u\n",
+      (unsigned long long)done.kvBlock, unsigned(written));
   // A failure counts even when its entry left or changed meanwhile.
   if (!written)
     ++offloadFailures_;

@@ -605,6 +605,12 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // Recycle this exact unpinned RAM checkpoint while retaining its backing:
+  // an already-durable disk copy, or a new offload through the existing
+  // staging buffer and disk quota. A busy/unavailable tier leaves the RAM
+  // checkpoint for the caller's original retirement fallback. Existing
+  // in-flight copies are never treated as durable.
+  [[nodiscard]] bool recycleMessageCheckpoint(StateCheckpoint checkpoint, bool &writeStarted);
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {
