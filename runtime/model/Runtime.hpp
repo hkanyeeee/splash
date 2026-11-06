@@ -50,6 +50,8 @@ public:
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<StateReservation>
   reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) override;
+  [[nodiscard]] std::optional<uint32_t>
+  generationStateBoundary(uint64_t requestId, uint64_t logicalPosition) const override;
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
   [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;

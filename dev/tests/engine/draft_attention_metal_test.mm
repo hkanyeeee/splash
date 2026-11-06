@@ -689,6 +689,37 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
   require(invalid.empty(), "an invalid context window transfer encoded a dispatch");
 }
 
+// A decode commits only its accepted prefix. Compare the complete window,
+// including rejected and untouched slots, against the existing prefill store.
+void contextWindowCommit(MetalBackend &backend, uint32_t width) {
+  const uint64_t bytes = DraftAttention::contextWindowBytes(width);
+  Random random(0xc0de3000ULL + width);
+  const MetalBuffer context = randomBfloat(backend, uint64_t{kRows} * width,
+                                          random, "decode context rows");
+  const MetalBuffer actual = backend.allocateBuffer(bytes, BufferStorage::Shared,
+                                                    "committed window");
+  const MetalBuffer expected = backend.allocateBuffer(bytes, BufferStorage::Shared,
+                                                      "reference window");
+  const MetalBuffer retained = backend.allocateBuffer(sizeof(uint32_t),
+      BufferStorage::Shared, "retained context rows");
+  for (uint32_t position : {0U, 2043U, 2047U, 65535U}) {
+    for (uint32_t count = 0; count <= kRows; ++count) {
+      std::memset(actual.contents(), 0xA5, bytes);
+      std::memset(expected.contents(), 0xA5, bytes);
+      *static_cast<uint32_t *>(retained.contents()) = count;
+      CommandGraph graph;
+      if (count)
+        DraftAttention::addWindowStore(graph, context, expected, count,
+                                       position, width);
+      DraftAttention::addWindowCommit(graph, context, actual, retained,
+                                      position, width);
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      require(std::memcmp(actual.contents(), expected.contents(), bytes) == 0,
+              "decode context commit changed rejected or older rows");
+    }
+  }
+}
+
 // A state captured at s inside a command over [a, b) starts from the lane's
 // window as the command finds it, copied, and stores the command's rows
 // [a, s) into it as the lane's window takes them: the slots of its positions
@@ -872,6 +903,7 @@ int main(int argc, char **argv) {
         surroundingPhases(backend, shape, lanes);
       contextWriters(backend, shape);
       contextWindow(backend, shape.hiddenSize);
+      contextWindowCommit(backend, shape.hiddenSize);
       contextWindowCapturedInside(backend, shape.hiddenSize);
       runCase(backend, 1, shape, {0, 0, 0, 0});
       runCase(backend, 2, shape, {2048, 2047, 0, 0});

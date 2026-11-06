@@ -441,6 +441,13 @@ public:
         ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
+        if (item.generationStateCapture) {
+          const auto &capture = *item.generationStateCapture;
+          auto *reservation = dynamic_cast<Reservation *>(capture.reservation.get());
+          if (!reservation || generationStateBoundary(item.requestId, item.logicalPosition) != capture.tokens)
+            throw std::logic_error("invalid generated checkpoint reservation");
+          step.generationCheckpoint = GenerationCheckpoint{capture.tokens, seal(*reservation)};
+        }
         if (speculative != speculativeCounts.end()) {
           step.draftedTokens = speculative->second.first;
           step.acceptedDraftTokens = speculative->second.second;
@@ -599,6 +606,11 @@ public:
     commandEnd_.reset();
     if (const std::function<void()> completion = std::exchange(timedCompletion_, {}))
       completion();
+  }
+  std::optional<uint32_t> generationStateBoundary(uint64_t id, uint64_t logicalPosition) const override {
+    if (captureGenerationState && requests.at(id).generated >= 64 && logicalPosition % 32 == 0)
+      return static_cast<uint32_t>(logicalPosition);
+    return std::nullopt;
   }
   // A state's buffers for a resident lane's page boundary, or nullptr with the
   // cause: refused for the next `deniedReservations` calls, at
@@ -823,6 +835,7 @@ public:
   uint32_t restored = 0;
   // State reservations granted, and asked for.
   uint32_t reservations = 0;
+  bool captureGenerationState = false;
   uint32_t reservationAttempts = 0;
   // Each state a prefill step captured: its request, its boundary and the
   // step's end, past the boundary for one inside the step.

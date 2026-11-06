@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -381,10 +382,13 @@ struct Runtime::Impl {
     // the prompt (with any replayed generation) and the emitted output, which
     // the target may read (QwenTargetRequest).
     std::vector<uint32_t> tokens;
+    uint64_t generationCheckpointTokens = 0;
   };
 
   struct DecodeLaneResult final {
     Request *request = nullptr;
+    std::shared_ptr<QwenStateReservation> generationSnapshot;
+    QwenLogicalLengths generationLengths;
     uint32_t retained = 0;
     uint32_t accepted = 0;
     uint32_t currentAnchor = 0;
@@ -1197,8 +1201,8 @@ struct Runtime::Impl {
   // The lengths after the draft ring takes rows [begin, end) at target
   // length targetTokens. Unless `reset` starts a new window there, the rows
   // continue the ring, which must hold rows ending at `begin`. A prefill
-  // capture also keeps the rows' context in the window (`windowed`), which
-  // stays current if it was; decode commits leave it behind.
+  // capture or enabled generation cache also keeps the rows' context in the
+  // window (`windowed`), which stays current if it was.
   static QwenLogicalLengths
   advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
                       uint64_t begin, uint64_t end, bool reset, bool windowed) {
@@ -2256,6 +2260,21 @@ struct Runtime::Impl {
                        {penaltyTable, std::span(stateLanes).first(lanes)});
   }
 
+  // Natural decode-boundary snapshots copy the state as stored, including
+  // BF16. Keep this opt-in scoped to the validated dense model; auxiliary
+  // state needs its own capture before other model layouts can use it.
+  bool keepsGenerationWindow(const Request &entry) const {
+    static const bool enabled = [] {
+      const char *value = std::getenv("SPLASH_LOCAL_GENERATION_CACHE");
+      return value && std::string_view(value) == "1";
+    }();
+    return enabled && entry.id < (uint64_t{1} << 63) &&
+           geometry.target.vocabularySize == 248320 &&
+           geometry.target.hiddenSize == 5120 &&
+           states.layout().target.layers == 48 &&
+           !states.layout().target.auxiliaryBytes;
+  }
+
   void encodeDraftStateCommitBatch(CommandGraph &graph,
                                    std::span<Request *const> entries,
                                    std::span<const ModelBatchItem> items) {
@@ -2284,6 +2303,18 @@ struct Runtime::Impl {
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addContextCommit(graph, std::move(buffers),
                                 std::span(startPositions).first(lanes));
+    // Rejected proposals must not overwrite older slots that a snapshot
+    // may need. The accepted context rows are already computed by DFlash.
+    const uint32_t width = states.layout().draft.contextWidth;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const Request &entry = *entries[lane];
+      if (keepsGenerationWindow(entry))
+        ops::DraftAttention::addWindowCommit(
+            graph, decodeArena->get(lane, DecodeTensor::ContextHidden),
+            states.window(entry.stateLane),
+            decodeArena->get(lane, DecodeTensor::RetainedCount),
+            startPositions[lane], width);
+    }
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,
@@ -2465,6 +2496,20 @@ struct Runtime::Impl {
       output.insert(output.end(), targetTokens,
                     targetTokens + (laneResult.retained - 1));
 
+      std::shared_ptr<const CompositeState> generationState;
+      if (laneResult.generationSnapshot) {
+        // The new cell has folded the previous pending tape, but not this
+        // cycle's rows: exactly the state at the captured start boundary.
+        // Its old draft window was copied before this cycle committed.
+        const MetalBuffer &source = states.next(entry.stateLane).stateBase;
+        const MetalBuffer &destination =
+            laneResult.generationSnapshot->buffers().gdn->buffers().stateBase;
+        if (source.sizeBytes() != destination.sizeBytes())
+          throw std::logic_error("generation snapshot extent mismatch");
+        std::memcpy(destination.contents(), source.contents(), source.sizeBytes());
+        generationState = states.seal(*laneResult.generationSnapshot, laneResult.generationLengths);
+        entry.generationCheckpointTokens = laneResult.generationLengths.targetTokens;
+      }
       states.swapDecodeParity(entry.stateLane, laneResult.retained);
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
@@ -2472,7 +2517,7 @@ struct Runtime::Impl {
           entry.stateLane,
           advanceDraftContext(states.metadata(entry.stateLane).lengths,
                               nextLength, items[lane].logicalPosition,
-                              nextLength, false, false));
+                              nextLength, false, keepsGenerationWindow(entry)));
       entry.generatedTokens += laneResult.retained;
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
@@ -2491,6 +2536,9 @@ struct Runtime::Impl {
                          verified - std::min(verified, laneResult.endDrafts),
                          accepted - std::min(accepted, laneResult.endDrafts)});
       ModelStepResult &result = results.back();
+      if (generationState)
+        result.generationCheckpoint = GenerationCheckpoint{
+            static_cast<uint32_t>(laneResult.generationLengths.targetTokens), std::move(generationState)};
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
     }
@@ -3229,6 +3277,17 @@ Runtime::decodeAsync(const BatchPlan &plan,
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
 
+    if (item.generationStateCapture) {
+      const StateCapture &capture = *item.generationStateCapture;
+      if (generationStateBoundary(item.requestId, item.logicalPosition) != capture.tokens)
+        throw std::invalid_argument("invalid generated state boundary");
+      laneResult.generationSnapshot = std::dynamic_pointer_cast<QwenStateReservation>(capture.reservation);
+      if (!laneResult.generationSnapshot)
+        throw std::invalid_argument("invalid generated state reservation");
+      laneResult.generationLengths = impl_->states.metadata(entry.stateLane).lengths;
+      impl_->states.validateLengths(laneResult.generationLengths, true);
+      impl_->states.copyWindow(entry.stateLane, *laneResult.generationSnapshot);
+    }
     impl_->prepareDecodeLane(entry, item, lane);
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;
@@ -3282,6 +3341,17 @@ uint32_t Runtime::residentLane(uint64_t requestId) const {
   if (!entry.resident)
     throw std::logic_error("request is not resident");
   return entry.stateLane;
+}
+
+std::optional<uint32_t> Runtime::generationStateBoundary(uint64_t requestId, uint64_t logicalPosition) const {
+  const Impl::Request &entry = impl_->request(requestId);
+  if (entry.decodeStage != DecodeStage::Regular || !entry.pendingToken ||
+      isStopToken(impl_->geometry, *entry.pendingToken) || entry.generatedTokens + 1 >= entry.maxNewTokens)
+    return std::nullopt;
+  if (impl_->keepsGenerationWindow(entry) && entry.generatedTokens >= 64 &&
+      logicalPosition % kv::kPageTokens == 0 && logicalPosition >= entry.generationCheckpointTokens + 128)
+    return static_cast<uint32_t>(logicalPosition);
+  return std::nullopt;
 }
 
 std::shared_ptr<StateReservation> Runtime::reserveState(uint64_t requestId, uint32_t tokens,

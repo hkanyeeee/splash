@@ -284,6 +284,19 @@ void DraftAttention::addWindowStore(metal::CommandGraph &graph,
             DraftContextWindowParams{rows, startPosition, width}, groups, {kWindowThreads, 1, 1});
 }
 
+void DraftAttention::addWindowCommit(metal::CommandGraph &graph,
+                                     metal::MetalBuffer context,
+                                     metal::MetalBuffer window,
+                                     metal::MetalBuffer retainedCount,
+                                     uint32_t startPosition, uint32_t width) {
+  constexpr uint32_t rows = SPLASH_TARGET_VERIFY_ROWS;
+  const metal::DispatchSize groups = windowGroups(context, window, rows, width);
+  requireBytes(retainedCount, sizeof(uint32_t), "draft window retained count");
+  graph.add("decode_draft_context_store",
+            {std::move(context), std::move(window), std::move(retainedCount)},
+            DraftContextWindowParams{rows, startPosition, width}, groups, {kWindowThreads, 1, 1});
+}
+
 void DraftAttention::addWindowLoad(metal::CommandGraph &graph,
                                    metal::MetalBuffer window,
                                    metal::MetalBuffer context, uint32_t rows,

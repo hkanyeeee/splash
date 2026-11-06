@@ -80,6 +80,45 @@ prefill_draft_context_store(device const bfloat *context [[buffer(0)]],
   }
 }
 
+// Preserve the old ring slots of every rejected decode row.
+kernel void
+decode_draft_context_store(device const bfloat *context [[buffer(0)]],
+                            device uchar *window [[buffer(1)]],
+                            device const uint *retained [[buffer(2)]],
+                            constant DraftContextWindowParams &params
+                            [[buffer(3)]],
+                            uint threadgroup_index
+                            [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint simd_group
+                            [[simdgroup_index_in_threadgroup]]) {
+  DraftContextGroup at;
+  if (!draft_context_group(params, threadgroup_index, simd_group, at) ||
+      at.row >= *retained)
+    return;
+  device const bfloat *values = context + ulong(at.row) * params.width +
+                                at.group * SPLASH_DRAFT_CONTEXT_GROUP + 2 * lane;
+  const float2 x = float2(float(values[0]), float(values[1]));
+  const float low = simd_min(min(x.x, x.y));
+  const float high = simd_max(max(x.x, x.y));
+  const half scale = half(precise::divide(high - low, 15.0f));
+  const half minimum = half(low);
+  uint2 code = uint2(0);
+  if (scale > half(0)) {
+    const float2 steps = float2(precise::divide(x.x - float(minimum), float(scale)),
+                                precise::divide(x.y - float(minimum), float(scale)));
+    code = uint2(clamp(rint(steps), 0.0f, 15.0f));
+  }
+  device uchar *codes = window + ulong(at.slot) * (params.width / 2);
+  codes[at.group * (SPLASH_DRAFT_CONTEXT_GROUP / 2) + lane] =
+      uchar(code.x | (code.y << 4));
+  if (lane == 0) {
+    device half2 *groups = reinterpret_cast<device half2 *>(
+        window + draft_context_codes_bytes(params.width));
+    groups[ulong(at.slot) * at.groups + at.group] = half2(scale, minimum);
+  }
+}
+
 kernel void
 prefill_draft_context_load(device const uchar *window [[buffer(0)]],
                            device bfloat *context [[buffer(1)]],

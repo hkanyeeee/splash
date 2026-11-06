@@ -27,6 +27,8 @@ uses the prepared local files offline. No copy of the target weights is needed.
 - The Apple7/8 kernels use main's current projection and expert buffer layouts.
 - Host steps use the plain path on Apple7/8, where the GPU spin can race ahead
   of earlier work.
+- The local launcher enables generated-prefix checkpoints at natural decode
+  boundaries, with optional state allocation admitted by the memory governor.
 
 `dev/local/run-server.sh` holds the local arguments. Its default is port 1234,
 bound to all IPv4 interfaces as the previous llama-server was. It accepts the
@@ -359,3 +361,96 @@ the 24 GiB limit. Benchmark complete long-answer/follow-up pairs against the
 current build, including capture overhead and memory pressure, before deployment.
 This audit changes documentation only; the serving implementation stays at
 `36edabdc` and its existing measured kernel policy.
+
+## Natural-boundary generation cache (2026-11-06)
+
+Ported the natural decode-boundary cache and pre-submission state admission
+from `origin/local/m4max-q6k` at `7b4f28f5`. The local launcher enables it with
+`SPLASH_LOCAL_GENERATION_CACHE=1`; set it to `0` for isolated comparisons.
+Other launchers retain the disabled default. This path keeps BF16 KV and
+recurrent state, the 24 GiB memory limit, one runtime lane, 512-row prefill and
+ANE offload. It retains this checkout's M2 kernel choices and template-derived
+message checkpoint.
+
+The opt-in is scoped to the validated dense model geometry (248,320 vocabulary,
+5,120 hidden width, 48 recurrent layers, no auxiliary state). Accepted draft
+rows update the existing compressed context window; rejected proposals do not
+overwrite older slots. This uses main's existing draft-window representation;
+it does not introduce KV or recurrent-state quantization. At a natural 32-token
+page boundary, after at least 64 generated tokens and 128 tokens since the
+previous capture, the engine may reserve a new snapshot. The model copies the
+old window before submission and seals the corresponding recurrent state after
+the GPU completes. Rolling publication replaces an unpinned previous generated
+checkpoint. Admission refusal skips the optional capture and allows decoding
+to continue. No aligned within-cycle reconstruction or FP32 conversion is used.
+
+Validation before deployment:
+
+- Full default-profile CPU suite: engine 397 passed, zero failed; engine
+  simulation and the other CPU suites also passed. Added lifecycle coverage
+  checks bounded rolling publication, deduplication, follow-up restoration and
+  cancellation. The real governor with a fake allocator checks admitted and
+  refused captures produce the same complete output.
+- Metal draft-attention suite passed with `MTL_SHADER_VALIDATION=1`. The added
+  oracle compares the entire context window against prefill storage for every
+  accepted count from 0 through 8, including rejected slots and wraparound at
+  positions 0, 2,043, 2,047 and 65,535, across the supported test shapes.
+- Architecture check, whitespace check and lint for the reproducible
+  `dev/local/generation_cache_probe.py` passed.
+- Real API checks also passed for a 128-integer JSON-schema-constrained answer
+  (four generated checkpoints; follow-up restored 1,024 tokens), and a streamed
+  answer disconnected after a checkpoint. The cancelled request drained;
+  its follow-up restored 1,664 tokens and returned the expected answer, with
+  no failed requests.
+
+The same candidate binary was tested in OFF / ON / ON / OFF order, restarting
+and warming the server each time. Each round used an uncached 4,072-token prompt,
+a 1,171-token answer copying an explicit integer array, then a 5,276-token
+follow-up retrieving three codes from the prompt. Temperature was zero and
+there were no other submitted requests. All answer and follow-up bytes matched
+across the four rounds; draft proposal and acceptance counts also matched.
+
+| Mode | Long answer (s) | Follow-up (s) | Pair (s) | Follow-up cached tokens |
+| --- | ---: | ---: | ---: | ---: |
+| OFF, round 1 | 38.712 | 7.879 | 46.591 | 4,064 |
+| ON, round 2 | 38.745 | 1.591 | 40.336 | 5,184 |
+| ON, round 3 | 38.737 | 1.590 | 40.327 | 5,184 |
+| OFF, round 4 | 38.710 | 7.887 | 46.596 | 4,064 |
+
+Mean pair latency fell from 46.594 to 40.331 seconds (13.4%); follow-up latency
+fell 79.8%. The long answer added 0.030 seconds (0.08%), too small for a broad
+throughput claim from these four rounds. Each enabled long answer published
+nine generated checkpoints. This workload demonstrates reuse of a long answer;
+short outputs or decode cycles that miss aligned page boundaries may benefit
+less or not at all.
+
+The near-limit run used a 99,481-token cold prompt and produced the same
+1,171-token answer byte for byte in 897.359 seconds (873.254 seconds prefill,
+24.094 seconds decode). Under host memory pressure, the governor reclaimed
+the cached states before the follow-up. That follow-up therefore re-prefilled
+its 100,685-token prompt, taking 889.175 seconds with zero cached tokens. All
+three retrieved codes were correct, and the answer bytes matched the short
+fixture. Across both requests, 5-second samples recorded peaks of 23.945 GiB
+governed memory and 23.518 GiB native physical footprint, with host available
+memory as low as 1.862 GiB. Pressure reached `warning`; there were 37 refused
+reservations but no request failures. Swap stayed at 243.88 MiB. ANE remained
+active without reruns. This is a limitation of caching at near-capacity host
+pressure: the 24 GiB budget permits the request, but does not promise that its
+reusable states remain resident. The 4K measurements above must not be read as
+a near-limit speedup claim.
+
+The final build (`src-6bebb4632dad68b23e48d32c05e551939b988e94c3eeaac2ec1ff037ebcd947b`)
+was deployed through the existing LaunchAgent on port 1234. Its 4K production
+smoke test published nine generated checkpoints and restored 5,184 tokens for
+the correct follow-up in 1.591 seconds. BF16 KV/state, 24 GiB, ANE split prefill,
+the 102,265-token plan and ten-minute idle release remain configured. A smaller
+1,023-token prompt with a 531-token answer also returned correct results but
+published no generated checkpoint, illustrating the natural-boundary limitation.
+
+After validation, removed approximately 317 MiB of duplicate candidate/CPU
+builds, raw test requests and responses, temporary scripts and logs, unused ANE
+calibration programs/records, shader-validation cache and Python bytecode.
+The deployed build and its incremental inputs, current ANE program/calibration,
+model files, Python environment and active service records remain. This is the
+sum of allocated file sizes, not an APFS physical-space measurement. The probe,
+regression tests and numerical results are retained in Git.

@@ -1653,6 +1653,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   if (cut)
     return Prepared::Replan;
   std::vector<std::vector<StateCapture>> states(plan.items.size());
+  std::vector<std::optional<StateCapture>> generatedStates(plan.items.size());
   captures.assign(plan.items.size(), {});
   std::vector<uint32_t> ends(plan.items.size());
   for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
@@ -1672,6 +1673,25 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
       ends[index] = item.promptOffset + rows;
       ++counters_.captureCuts;
       cut = true;
+    }
+  }
+  // Generated checkpoints are optional too. Admit their buffers under the
+  // lane's claim before submission, taking only what is available now. A
+  // refused capture leaves decoding and the previous recovery point alone.
+  for (size_t index = 0; !prefill && plan.decodeStage == DecodeStage::Regular &&
+                         index < plan.items.size(); ++index) {
+    Request &active = request(plan.items[index].requestId);
+    if (const auto boundary = model_.generationStateBoundary(active.request.id, active.exactTokens.size())) {
+      std::shared_ptr<StateReservation> buffers;
+      const auto attempt = [&] {
+        metal::AllocationFailure refusal = metal::AllocationFailure::None;
+        buffers = model_.reserveState(active.request.id, *boundary, refusal);
+        return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
+      };
+      static_cast<void>(allocate(attempt, stateClaim(active, StateClass::Checkpoint, supersedes),
+                                 Refusal::SettledOnce));
+      if (buffers)
+        generatedStates[index] = StateCapture{*boundary, std::move(buffers)};
     }
   }
   // Sent back, each lane keeps what it took for its rows, which a plan made
@@ -1694,6 +1714,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     item.requestId = active.request.id;
     item.logicalPosition = prefill ? scheduled.promptOffset : active.exactTokens.size();
     item.tokenCount = scheduled.tokenCount;
+    item.generationStateCapture = std::move(generatedStates[index]);
     setPageTable(item, cache_.cutPageTable(active.request.id));
     if (prefill) {
       item.inputTokens =
@@ -1909,6 +1930,26 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
           static_cast<uint32_t>(active.exactTokens.size()) -
           result.outputTokensWithoutKv;
       publishCommittedBlocks(active, storedTokens);
+      if (result.generationCheckpoint) {
+        const GenerationCheckpoint &checkpoint = *result.generationCheckpoint;
+        const uint32_t boundary = checkpoint.tokens;
+        if (!checkpoint.state || boundary % KvCache::pageTokens ||
+            boundary <= active.promptTokens ||
+            boundary < active.exactTokens.size() - result.outputTokens.size() ||
+            boundary > storedTokens)
+          throw std::logic_error("invalid generation checkpoint");
+        const uint64_t block = cache_.blockAt(active.request.id, boundary);
+        if (cache_.stateTailFull(block) &&
+            (!active.latestCheckpoint || retireCheckpoint(active))) {
+          if (cache_.reuseStoredState(block, true)) {
+            ++counters_.deduplicatedStatePublications;
+          } else {
+            cache_.publishCompositeState(block, checkpoint.state, true);
+            ++counters_.checkpointPublications;
+          }
+          active.latestCheckpoint = cache_.checkpointState(block);
+        }
+      }
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;

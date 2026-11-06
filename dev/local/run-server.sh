@@ -5,6 +5,8 @@ checkout=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 # Passed through the source launcher's make invocation as well as manual builds.
 export SPLASH_RUNTIME_LANES=1
 export SPLASH_PREFILL_ROWS="${SPLASH_PREFILL_ROWS:-512}"
+# Validated natural-boundary snapshots retain BF16 state; 0 disables the cache.
+export SPLASH_LOCAL_GENERATION_CACHE="${SPLASH_LOCAL_GENERATION_CACHE:-1}"
 case "${SPLASH_LOCAL_ANE:-auto}" in
   off) set -- --disable-ane "$@" ;;
   auto) ;;

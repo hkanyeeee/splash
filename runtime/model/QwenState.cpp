@@ -653,7 +653,7 @@ void QwenStateStorage::validateLengths(const QwenLogicalLengths &lengths,
     throw std::invalid_argument(
         "composite snapshot requires equal page-aligned committed lengths");
   }
-  // States are published in prefill, which keeps the window with the rings.
+  // A published state must keep its context window current with the rings.
   if (cacheSnapshot && !lengths.hasCurrentContextWindow())
     throw std::logic_error("a composite snapshot needs the context window of its draft rings");
 }
