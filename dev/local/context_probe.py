@@ -35,6 +35,8 @@ def main():
     parser.add_argument('--tokens', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--pids', type=int, nargs='*', default=[])
+    parser.add_argument('--message-boundary', action='store_true',
+                        help='Put the final question in a separate chat message to exercise its checkpoint')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     model = request(args.port, '/v1/models')['data'][0]['id']
@@ -50,7 +52,11 @@ def main():
                 'Secret A: ' + expected[0] + '\n' + ''.join(rows[:mid]) +
                 'Secret B: ' + expected[1] + '\n' + ''.join(rows[mid:n]) +
                 'Secret C: ' + expected[2] + '\nWhat are secret codes A, B and C?')
-        return [{'role': 'user', 'content': text}]
+        result = [{'role': 'user', 'content': text}]
+        if args.message_boundary:
+            result += [{'role': 'assistant', 'content': 'Archive received.'},
+                       {'role': 'user', 'content': 'Return the three secret codes A, B and C as a JSON array.'}]
+        return result
 
     def count(msgs):
         return request(args.port, '/v1/chat/completions/count_tokens',

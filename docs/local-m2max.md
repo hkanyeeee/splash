@@ -157,3 +157,114 @@ launchctl disable gui/$(id -u)/com.user.splashserver
 launchctl enable gui/$(id -u)/com.user.llamaserver
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.llamaserver.plist
 ```
+
+## M4 Max branch review
+
+The follow-up review compares `origin/local/m4max-q6k` (`79a42fdd`) against
+its base `031a25a6`. It is a selective port onto main. Device guards in that
+branch describe where an experiment was enabled; they do not establish that
+an earlier GPU cannot execute it. The standalone probes below bypass those
+policy guards and execute the kernels on this M2 Max.
+
+| M4 change | Outcome on this M2 deployment |
+| --- | --- |
+| Final-message checkpoint | Adapted to main's rolling checkpoint and memory governor; template-derived metadata replaces hardcoded vocabulary/token IDs. |
+| Keep a message checkpoint on disk under pressure | Not enabled: this deployment has zero disk-cache quota. Main's normal disposable-state reclamation remains in use. |
+| Generated-prefix checkpoint and GDN prefix kernel | Not ported: the validated M4 kernel requires FP32 recurrent state and fixed geometry. This service keeps BF16 state; a BF16 implementation would need separate numerical validation. |
+| Parallel gate/up kernels | Run correctly on M2 in the tested formats, but the M4 BF16-table implementation loses to the current FP32-table path. Retain the current path. |
+| Page32 attention rescale flags | All four M4 variants run correctly on M2; the current register-attention path is faster in every measured case. Retain it. |
+| Short-prefill staged64 tuning | Runs on M2, but at 33/48/64 rows the measured Q4_K gate/up takes about 4.77 ms at its best split, versus 1.71 ms on the current prefill tile. Keep the 32-row crossover. |
+| 44 GiB override | Not ported: it was for a 48 GiB M4 Max. Current main already honors this machine's explicit 24 GiB budget. |
+
+For text chat prompts of at least 4096 tokens, the frontend renders the history
+before the final message without a generation prompt. It sends a hint only
+after verifying that both the rendered text and token IDs match the complete
+prompt's prefix. Unsupported partial templates and image requests use the
+existing policy. The internal protocol is version 13; frontend and native
+binary must be upgraded or rolled back together.
+
+The engine rounds the hint down to a KV page. When it is ahead of the last
+planned progress checkpoint and at least a draft window beyond the restored
+state, it moves that last point to the message boundary. It keeps the existing
+rolling state lifetime, pin handling and pressure reclamation. It does not
+retain an additional checkpoint beside the usual last checkpoint and replay
+state. If a long final message already has later progress checkpoints, the
+hint does not replace them. This preserves recovery granularity and the
+24 GiB allocation policy.
+
+`dev/local/message_cache_probe.py` records paired cold chats and edits of their
+final message. Each pair uses a fresh cache salt, identical prompt content and
+generation settings across builds. The unchanged target and draft weights,
+BF16 formats, 512-row prefill, single lane and ANE calibration are held fixed.
+Raw responses and status snapshots are in `build/local-validation/m4-port/`.
+
+The two paired 7,785-token trials produced identical answers across builds:
+
+| Request | Baseline mean | Message-checkpoint mean | Cached tokens |
+| --- | ---: | ---: | ---: |
+| Cold conversation | 43.664 s | 43.541 s | 0 in both |
+| Replace the final message | 21.462 s | 1.623 s | 4,096 → 7,616 |
+
+The edit reused 3,520 additional tokens. Its latency fell 92.4% in this fixture;
+the complete cold-plus-edit pair fell 30.65%. This is avoided prefill work on a
+specific edit pattern, not a 13× increase in general model inference speed.
+The initial control with only a single differing token at the very end already
+hit the baseline replay state; its roughly 0.47-second result is kept separately
+as `baseline-probe`, and is not credited as a benefit of the new feature.
+
+The updated service also passed a 101,993-token cold request and its
+102,045-token follow-up, retrieving all three codes from the archive's start,
+middle and end. Cold prefill was 112.88 tokens/s; the follow-up reused 101,984
+tokens and completed in 1.73 seconds. Five-second samples peaked at 23.940 GiB
+charged and 23.512 GiB native footprint, with no capacity failure, Metal
+failure, native restart or ANE rerun. Host pressure reached warning and minimum
+available memory was 1.71 GiB; swap fell from 380.38 to 372.38 MiB. These results
+support the tested single-lane 24 GiB setup, including its existing reclamation
+policy, rather than a claim of unlimited host-memory headroom.
+
+### M2 execution of the M4 kernels
+
+Probe sources and full logs are under
+`build/local-validation/m4-port/kernel-probe/`. The old M4 sources compile
+against the current ABI without algorithm changes, with Metal 4 and the same
+macOS 26.4 deployment target as production. An initial attention build that
+omitted that target hit a pipeline stack-space error; rebuilding with the
+production target made all four variants executable. This was a build-setting
+issue, not evidence of a missing M2 hardware feature.
+
+Gate/up probes use eight rows, four K splits, 512×2048 for an FP64 reference
+check and 17408×5120 for a model-sized check and timing. Original Q5_K/Q5_K,
+Q6_K/Q6_K and Q8_0/Q8_0 M4 kernels produce bitwise-identical output to the BF16-table
+two-pass reference at both sizes. Probe-only Q4_K/Q4_K and IQ4_XS/IQ4_XS
+instantiations of the same template do too. The latter is this model's most
+common gate/up format pair (20 of 64 layers). Timings include table preparation and use six distinct
+weight pairs, 20 alternating-order rounds, and GPU command timestamps. These
+are operator measurements, not whole-model generation speeds.
+
+| Format | M4 parallel, BF16 table | Current M2, FP32 table | Existing M2 one-pass candidate |
+| --- | ---: | ---: | ---: |
+| IQ4_XS | 0.550 ms | 0.481 ms | 0.457 ms |
+| Q4_K | 0.609 ms | 0.523 ms | 0.504 ms |
+| Q5_K | 0.758 ms | 0.625 ms | 0.593 ms |
+| Q6_K | 0.764 ms | 0.642 ms | 0.622 ms |
+| Q8_0 | 0.717 ms | 0.611 ms | 0.580 ms |
+
+The existing FP32 one-pass implementation also matches the M2 two-pass output
+bitwise. Its small operator-level gains do not yet establish an end-to-end
+benefit across this model's mixed gate/up formats; this review does not change
+its calibration policy.
+
+Attention probes exercise BF16 KV, 24 query heads, four KV heads and dimension
+256, with eight verify rows or 33 prefill rows, at histories of 511, 4096 and
+32768 tokens. All four M4 variants and both baselines pass the FP64 error bounds
+(36 cases). At 32768 tokens, the fastest M4 variant takes 4.099 ms for verify
+versus 1.357 ms on the current M2 path, and 16.469 ms for prefill versus 5.264 ms.
+At shorter histories the current M2 path also wins. The result distinguishes
+hardware capability, numerical correctness and performance: the tested M4
+kernels are supported, but are not the best kernels for this M2 deployment.
+
+Validation of the message-checkpoint change includes all 1,064 server tests,
+the native CPU suites (including protocol interoperability and checkpoint
+resume tests), the paired edit benchmark, and the near-limit retrieval test
+above. The kernel probes do not modify the deployed metallib or its selection
+policy.

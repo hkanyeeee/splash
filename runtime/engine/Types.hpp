@@ -71,6 +71,9 @@ struct EngineRequest final {
   // reusable state is kept before them. Zero when unknown; it must leave at
   // least one prompt token.
   uint32_t generationPromptTokens = 0;
+  // Optional frontend-verified prefix before the last chat message. The
+  // engine rounds it down to a KV page and treats it as a disposable hint.
+  uint32_t messagePrefixTokens = 0;
   std::vector<ImageSpan> images;
   std::vector<uint8_t> imagePixels;
   uint32_t maxNewTokens = 0;

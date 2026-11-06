@@ -1206,8 +1206,18 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state, the point the lane resumes from does. Progress
   // points remain disposable after restoration.
-  for (const uint32_t checkpoint : plannedCheckpoints(
-           stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
+  auto checkpoints = plannedCheckpoints(stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens);
+  // Move the last progress point to the final message's prefix when that
+  // saves more replay on an edit. Keep the rolling checkpoint lifecycle and
+  // its memory policy: this adds no second retained checkpoint per lane.
+  const uint32_t message = active.request.messagePrefixTokens / KvCache::pageTokens * KvCache::pageTokens;
+  if (config_.prefillCheckpointTokens && message < latestReplayBoundary &&
+      message >= uint64_t{stateBoundary} + kMinimumJunctionGain &&
+      (checkpoints.empty() || message > checkpoints.back())) {
+    if (checkpoints.empty()) checkpoints.push_back(message);
+    else checkpoints.back() = message;
+  }
+  for (const uint32_t checkpoint : checkpoints) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
   }
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)

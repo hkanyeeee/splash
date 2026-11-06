@@ -147,6 +147,8 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+    # Verified token prefix before the final message; zero when unavailable.
+    message_prefix_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -779,8 +781,41 @@ class Frontend:
             thinking, generation_prompt_tokens = _generation_prompt(
                 chat_template.generation_prompt(template), rendered, tokens
             )
+        message_prefix = 0
+        if (
+            add_generation_prompt
+            and not images
+            and len(tokens) >= 4096
+            and len(prompt.messages) > 1
+        ):
+            # Templates may rewrite earlier messages when the final one changes
+            # (reasoning removal, grouped tool replies). Only an exact rendered
+            # prefix is a useful hint. Verify token identity too: BPE can merge
+            # the final prefix token with the following message's first bytes.
+            try:
+                prefix = self._apply_chat_template(
+                    prompt.messages[:-1], {**template, "add_generation_prompt": False}
+                )
+                if prefix and rendered.startswith(prefix):
+                    prefix_tokens = self.prompt_tokenizer.encode(prefix)
+                    for previous, current in zip(prefix_tokens, tokens):
+                        if previous != current:
+                            break
+                        message_prefix += 1
+            except (TemplateError, ValueError, TypeError, IndexError):
+                # Some valid templates cannot render this partial conversation.
+                # Caching is optional; the complete prompt already rendered.
+                message_prefix = 0
+        if message_prefix >= len(tokens) - generation_prompt_tokens:
+            message_prefix = 0
         return RenderedPrompt(
-            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+            rendered,
+            tokens,
+            images,
+            positions,
+            thinking,
+            generation_prompt_tokens,
+            message_prefix,
         )
 
     def chat_job(
@@ -910,6 +945,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            message_prefix_tokens=rendered.message_prefix_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
 

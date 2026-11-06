@@ -39,6 +39,7 @@ REQUEST_FIELDS = (
     "thinking_tokens",
     "thinking_end_count",
     "thinking_also_ends",
+    "message_prefix_tokens",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -517,6 +518,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.thinking_budget.tokens,
                 len(request.thinking_budget.end),
                 request.thinking_budget.also_ends,
+                request.message_prefix_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
@@ -826,6 +828,19 @@ class ProtocolPythonTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(issue.request_id, request.request_id)
+
+    def test_message_prefix_is_bounded_and_round_trips(self):
+        request = replace(example_request(), message_prefix_tokens=1)
+        self.assertEqual(decode_client(p.serialize_message(request)), request)
+        for boundary in (-1, 3, 0xFFFFFFFF, 0x100000000):
+            with self.subTest(boundary=boundary):
+                self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    p.IssueCode.INVALID_COUNT,
+                    lambda: p.serialize_message(
+                        replace(request, message_prefix_tokens=boundary)
+                    ),
+                )
 
     def test_request_flags_follow_the_generation_prompt(self):
         request = example_ignore_eos_request()

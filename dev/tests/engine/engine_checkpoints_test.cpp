@@ -1191,10 +1191,38 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
           "a request checkpointed within a chunk of the state it resumed from");
 }
 
+// Editing the final message should reuse its exact page-aligned prefix.
+// The hint moves the last rolling point; it does not accumulate checkpoints
+// or turn a disposable recovery state into an ordinary pinned state.
+void testMessagePrefixMovesLastCheckpoint() {
+  for (uint32_t hint : {0u, 3072u, 7607u, 7776u}) {
+    test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
+    std::vector<uint32_t> prompt(7801, 17);
+    auto initial = request(1, prompt);
+    initial.messagePrefixTokens = hint;
+    h.engine.submit(std::move(initial));
+    h.runUntilIdle();
+    const auto states = h.cache.snapshot().stateCache;
+    require(states.checkpointEntries == 1 && states.entries == 2,
+            "message hint retained an extra checkpoint or lost the replay state");
+    std::fill(prompt.begin() + 7607, prompt.end(), 19);
+    const uint32_t expected = hint == 7607 ? 7584 : 4096;
+    require(h.cache.lookup(prompt, {}).resumeBoundary() == expected,
+            "editing the last message did not find the hinted checkpoint");
+    auto edited = request(2, prompt);
+    edited.messagePrefixTokens = hint;
+    h.engine.submit(std::move(edited));
+    h.runUntilIdle();
+    require(h.events.starts.back() == expected && h.events.completedCount == 2,
+            "edited message failed to resume from its checkpoint");
+  }
+}
+
 } // namespace
 
 std::span<const test::TestCase> checkpointsTests() {
   static constexpr test::TestCase kTests[] = {
+      {"testMessagePrefixMovesLastCheckpoint", testMessagePrefixMovesLastCheckpoint},
       {"testConcurrentProgressRetainsAtMostOnePointPerLane", testConcurrentProgressRetainsAtMostOnePointPerLane},
       {"testSharedCheckpointSurvivesPeerRollingReplacement", testSharedCheckpointSurvivesPeerRollingReplacement},
       {"testRepeatedRetriesRollTheRestoredCheckpoint", testRepeatedRetriesRollTheRestoredCheckpoint},

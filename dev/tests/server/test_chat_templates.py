@@ -636,6 +636,59 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         self.assertIn("<|image_pad|>", rendered)
         self.assertEqual(harness.tokenizer.renderer.chat_template, source("qwen36"))
 
+    def test_message_checkpoint_uses_verified_template_prefix(self):
+        app = fixtures.make_frontend(
+            chat_tokenizer(source("qwen38_gguf"), "<|im_start|>", "<|im_end|>"),
+            None,
+            "test-model",
+            65536,
+            10,
+            2,
+            vision=False,
+        )
+        messages = [
+            {"role": "user", "content": "archive record " * 1000},
+            {"role": "assistant", "content": "Received."},
+            {"role": "user", "content": "Find the first record."},
+        ]
+        body = {"model": "test-model", "messages": messages, "reasoning_effort": "none"}
+        job = app.prepare(body, deadline=fixtures.FOREVER)
+        self.assertGreater(job.message_prefix_tokens, 4096)
+        history = app.apply_template(
+            {**body, "messages": messages[:-1], "add_generation_prompt": False},
+            deadline=fixtures.FOREVER,
+        )
+        ids = app.tokenizer(history, add_special_tokens=False)["input_ids"]
+        self.assertEqual(
+            job.prompt_tokens[: job.message_prefix_tokens],
+            ids[: job.message_prefix_tokens],
+        )
+        original = app._apply_chat_template
+
+        def changed_prefix(msgs, template):
+            return "unrelated prefix" if len(msgs) == 2 else original(msgs, template)
+
+        with mock.patch.object(app, "_apply_chat_template", side_effect=changed_prefix):
+            self.assertEqual(
+                app.prepare(body, deadline=fixtures.FOREVER).message_prefix_tokens, 0
+            )
+
+        def refused_prefix(msgs, template):
+            if len(msgs) == 2:
+                raise TemplateError("partial conversation")
+            return original(msgs, template)
+
+        with mock.patch.object(app, "_apply_chat_template", side_effect=refused_prefix):
+            self.assertEqual(
+                app.prepare(body, deadline=fixtures.FOREVER).message_prefix_tokens, 0
+            )
+        self.assertEqual(
+            app.prepare(
+                {**body, "messages": messages[:1]}, deadline=fixtures.FOREVER
+            ).message_prefix_tokens,
+            0,
+        )
+
     def test_requests_carry_the_length_of_their_generation_prompt(self):
         messages = [
             {"role": "user", "content": "Hi"},
