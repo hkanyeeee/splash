@@ -441,17 +441,13 @@ public:
         ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
-        if (captureAlignedGenerationState) {
-          const uint32_t boundary = static_cast<uint32_t>(
-              (item.logicalPosition + tokens.size() - step.outputTokensWithoutKv) / 32 * 32);
-          if (boundary > item.logicalPosition &&
-              boundary >= item.logicalPosition - state.generated + 32)
-            step.generationCheckpoint = GenerationCheckpoint{boundary, std::make_shared<State>()};
+        if (item.generationStateCapture) {
+          const auto &capture = *item.generationStateCapture;
+          auto *reservation = dynamic_cast<Reservation *>(capture.reservation.get());
+          if (!reservation || generationStateBoundary(item.requestId, item.logicalPosition) != capture.tokens)
+            throw std::logic_error("invalid generated checkpoint reservation");
+          step.generationCheckpoint = GenerationCheckpoint{capture.tokens, seal(*reservation)};
         }
-        if (captureGenerationState && state.generated >= 64 &&
-            item.logicalPosition % 32 == 0)
-          step.generationCheckpoint = GenerationCheckpoint{
-              static_cast<uint32_t>(item.logicalPosition), std::make_shared<State>()};
         if (speculative != speculativeCounts.end()) {
           step.draftedTokens = speculative->second.first;
           step.acceptedDraftTokens = speculative->second.second;
@@ -610,6 +606,19 @@ public:
     commandEnd_.reset();
     if (const std::function<void()> completion = std::exchange(timedCompletion_, {}))
       completion();
+  }
+  std::optional<uint32_t> generationStateBoundary(uint64_t id, uint64_t logicalPosition) const override {
+    const Request &state = requests.at(id);
+    if (captureAlignedGenerationState) {
+      const auto found = speculativeCounts.find(id);
+      const uint32_t emitted = found == speculativeCounts.end() ? decodeTokens : found->second.second + 1;
+      const uint32_t boundary = static_cast<uint32_t>((logicalPosition + emitted - decodeTokensWithoutKv) / 32 * 32);
+      if (boundary > logicalPosition && boundary >= logicalPosition - state.generated + 32)
+        return boundary;
+    }
+    if (captureGenerationState && state.generated >= 64 && logicalPosition % 32 == 0)
+      return static_cast<uint32_t>(logicalPosition);
+    return std::nullopt;
   }
   // A state's buffers for a resident lane's page boundary, or nullptr with the
   // cause: refused for the next `deniedReservations` calls, at

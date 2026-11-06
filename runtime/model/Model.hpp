@@ -359,8 +359,8 @@ struct StateAdmission final {
   [[nodiscard]] bool granted() const noexcept { return lane.has_value(); }
 };
 
-// The buffers of one cached state, taken for a state boundary that a prefill
-// command reaches (Model::reserveState). The command's completion seals them
+// The buffers of one cached state, taken before a command that may reach its
+// boundary (Model::reserveState). The command's completion seals them
 // into the state of that boundary; whatever it still holds goes back to the
 // model's pool when the last handle goes, which the command's ticket keeps
 // until the GPU is done with them.
@@ -397,6 +397,9 @@ struct ModelBatchItem final {
   // (logicalPosition, logicalPosition + tokenCount], each one where the
   // request's draft context plan leaves a whole draft window.
   std::vector<StateCapture> stateCaptures{};
+  // An optional generated-prefix checkpoint. Its buffers are admitted before
+  // submission; a decode command never allocates them while it runs.
+  std::optional<StateCapture> generationStateCapture{};
 };
 
 // Exact generated-prefix state at a page boundary inside the returned
@@ -822,12 +825,17 @@ public:
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
          std::function<void()> completion) = 0;
   // Takes the buffers of one cached state for the request's state boundary
-  // at `tokens`, which the prefill command reaching it fills
-  // (ModelBatchItem::stateCaptures): from the pool, or one admission for
+  // at `tokens`, which the command reaching it fills
+  // (ModelBatchItem::stateCaptures or generationStateCapture): from the pool, or one admission for
   // what the pool lacks. Null when the governor refuses, which sets
   // `refusal` to the cause; the caller may release a cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<StateReservation>
   reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) = 0;
+  // A page boundary the next regular decode may retain, including its start.
+  // Planning only: the engine may reserve its optional state or omit it when
+  // memory refuses, without delaying the request or changing its output.
+  [[nodiscard]] virtual std::optional<uint32_t>
+  generationStateBoundary(uint64_t, uint64_t) const { return std::nullopt; }
   // Copies the request's committed state at its current page-aligned
   // boundary into the buffers of a cached state, taken as reserveState()
   // takes them: the state of a boundary its prefill command ended at without

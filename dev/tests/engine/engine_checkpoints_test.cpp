@@ -1311,6 +1311,32 @@ void testAlignedGenerationCheckpointLifecycle() {
           "cancelled decode published its captured state");
 }
 
+void testGeneratedCaptureUsesClaimAndSurvivesRefusal() {
+  for (const bool refuse : {false, true}) {
+    test::EngineHarness h({.pages = 128, .memory = test::FakeMemory::Config{},
+                           .shape = [](Executor &model) {
+                             model.maximumLanes = 1;
+                             model.decodeFinishes = false;
+                             model.decodeTokens = 7;
+                             model.captureAlignedGenerationState = true;
+                           }});
+    // Actual fake allocations use the real governor. A reservation during
+    // submit(), without a claim, fails just as the real model did. Refusing
+    // generated captures must leave the same complete output and no wait.
+    if (refuse)
+      h.model.reservationRoom = [&] { return h.model.requests.at(1).generated == 0; };
+    auto input = h.request(1, std::vector<uint32_t>(64, 7));
+    input.maxNewTokens = 224;
+    h.engine.submit(input);
+    h.runUntilIdle();
+    require(h.events.outputs[1].size() == 224 && h.events.completedCount == 1 && h.events.failedCount == 0,
+            "optional generated capture changed output or stalled on refusal");
+    require(h.model.reservationAttempts > 1, "generated state admission was not exercised");
+    require((h.engine.snapshot().checkpointPublications != 0) == !refuse,
+            "generated state was published without admitted buffers, or was never captured");
+  }
+}
+
 void testMessageCheckpointRetainsRecoveryPoint() {
   struct Environment final {
     std::optional<std::string> previous;
@@ -1502,6 +1528,7 @@ std::span<const test::TestCase> checkpointsTests() {
       {"testMessageOffloadLifecycle", testMessageOffloadLifecycle},
       {"testGenerationCheckpointLifecycle", testGenerationCheckpointLifecycle},
       {"testAlignedGenerationCheckpointLifecycle", testAlignedGenerationCheckpointLifecycle},
+      {"testGeneratedCaptureUsesClaimAndSurvivesRefusal", testGeneratedCaptureUsesClaimAndSurvivesRefusal},
       {"testMessageCheckpointRetainsRecoveryPoint", testMessageCheckpointRetainsRecoveryPoint},
 
       {"testConcurrentProgressRetainsAtMostOnePointPerLane", testConcurrentProgressRetainsAtMostOnePointPerLane},

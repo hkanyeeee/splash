@@ -3326,37 +3326,22 @@ Runtime::decodeAsync(const BatchPlan &plan,
     if (const auto cutoff = Impl::samplingPolicy(entry).thinkingCutoff)
       laneResult.endDrafts = cutoff->replacedProposals();
 
-    if (impl_->usesAlignedGeneration(entry)) {
-      const uint64_t boundary =
-          (item.logicalPosition / kv::kPageTokens + 1) * kv::kPageTokens;
-      if (boundary <= item.logicalPosition + laneResult.maximumRetained &&
-          boundary >= entry.promptTokens + 32 &&
-          boundary >= entry.generationCheckpointTokens + 32) {
-        const auto lengths = Impl::advanceDraftContext(
-            impl_->states.metadata(entry.stateLane).lengths, boundary,
-            item.logicalPosition, boundary, false, true);
-        impl_->states.validateLengths(lengths, true);
-        metal::AllocationFailure refusal;
-        laneResult.generationSnapshot = impl_->states.reserve(refusal);
-        if (laneResult.generationSnapshot) {
-          laneResult.generationLengths = lengths;
-          laneResult.generationPrefix = static_cast<uint32_t>(boundary - item.logicalPosition);
-          impl_->states.copyWindow(entry.stateLane, *laneResult.generationSnapshot);
-        }
-      }
-    } else if (impl_->keepsGenerationWindow(entry) && entry.generatedTokens >= 64 &&
-        item.logicalPosition % kv::kPageTokens == 0 &&
-        item.logicalPosition >= entry.generationCheckpointTokens + 128) {
-      const QwenLogicalLengths lengths =
-          impl_->states.metadata(entry.stateLane).lengths;
-      impl_->states.validateLengths(lengths, true);
-      metal::AllocationFailure refusal;
-      laneResult.generationSnapshot = impl_->states.reserve(refusal);
-      if (laneResult.generationSnapshot) {
-        laneResult.generationLengths = lengths;
-        // Copy the old window before this cycle appends its accepted rows.
-        impl_->states.copyWindow(entry.stateLane, *laneResult.generationSnapshot);
-      }
+    if (item.generationStateCapture) {
+      const StateCapture &capture = *item.generationStateCapture;
+      if (generationStateBoundary(item.requestId, item.logicalPosition) != capture.tokens)
+        throw std::invalid_argument("invalid generated state boundary");
+      laneResult.generationSnapshot =
+          std::dynamic_pointer_cast<QwenStateReservation>(capture.reservation);
+      if (!laneResult.generationSnapshot)
+        throw std::invalid_argument("invalid generated state reservation");
+      laneResult.generationPrefix = static_cast<uint32_t>(capture.tokens - item.logicalPosition);
+      laneResult.generationLengths = impl_->usesAlignedGeneration(entry)
+          ? Impl::advanceDraftContext(impl_->states.metadata(entry.stateLane).lengths,
+                                      capture.tokens, item.logicalPosition, capture.tokens, false, true)
+          : impl_->states.metadata(entry.stateLane).lengths;
+      impl_->states.validateLengths(laneResult.generationLengths, true);
+      // Preserve the old window before this cycle appends its accepted rows.
+      impl_->states.copyWindow(entry.stateLane, *laneResult.generationSnapshot);
     }
     impl_->prepareDecodeLane(entry, item, lane);
     requests[lane] = &entry;
@@ -3412,6 +3397,24 @@ uint32_t Runtime::residentLane(uint64_t requestId) const {
   if (!entry.resident)
     throw std::logic_error("request is not resident");
   return entry.stateLane;
+}
+
+std::optional<uint32_t> Runtime::generationStateBoundary(uint64_t requestId, uint64_t logicalPosition) const {
+  const Impl::Request &entry = impl_->request(requestId);
+  if (!entry.pendingToken || entry.decodeStage != DecodeStage::Regular ||
+      isStopToken(impl_->geometry, *entry.pendingToken) || entry.generatedTokens + 1 >= entry.maxNewTokens)
+    return std::nullopt;
+  if (impl_->usesAlignedGeneration(entry)) {
+    const uint64_t boundary = (logicalPosition / kv::kPageTokens + 1) * kv::kPageTokens;
+    const uint32_t retained = std::min(entry.maxNewTokens - entry.generatedTokens, kDecodeRows);
+    if (boundary <= logicalPosition + retained && boundary >= entry.promptTokens + 32 &&
+        boundary >= entry.generationCheckpointTokens + 32)
+      return static_cast<uint32_t>(boundary);
+  } else if (impl_->keepsGenerationWindow(entry) && entry.generatedTokens >= 64 &&
+             logicalPosition % kv::kPageTokens == 0 && logicalPosition >= entry.generationCheckpointTokens + 128) {
+    return static_cast<uint32_t>(logicalPosition);
+  }
+  return std::nullopt;
 }
 
 std::shared_ptr<StateReservation> Runtime::reserveState(uint64_t requestId, uint32_t tokens,
