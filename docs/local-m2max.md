@@ -171,7 +171,7 @@ policy guards and execute the kernels on this M2 Max.
 | --- | --- |
 | Final-message checkpoint | Adapted to main's rolling checkpoint and memory governor; template-derived metadata replaces hardcoded vocabulary/token IDs. |
 | Keep a message checkpoint on disk under pressure | Not enabled: this deployment has zero disk-cache quota. Main's normal disposable-state reclamation remains in use. |
-| Generated-prefix checkpoint and GDN prefix kernel | Not ported: the validated M4 kernel requires FP32 recurrent state and fixed geometry. This service keeps BF16 state; a BF16 implementation would need separate numerical validation. |
+| Generated-prefix checkpoint and GDN prefix kernel | Not ported. The within-cycle GDN prefix kernel requires FP32 recurrent state and fixed geometry. The separate natural decode-boundary checkpoint has no FP32 guard and is a candidate for BF16 validation; the original review conflated these two paths. See the updated-branch review below. |
 | Parallel gate/up kernels | Run correctly on M2 in the tested formats, but the M4 BF16-table implementation loses to the current FP32-table path. Retain the current path. |
 | Page32 attention rescale flags | All four M4 variants run correctly on M2; the current register-attention path is faster in every measured case. Retain it. |
 | Short-prefill staged64 tuning | Runs on M2, but at 33/48/64 rows the measured Q4_K gate/up takes about 4.77 ms at its best split, versus 1.71 ms on the current prefill tile. Keep the 32-row crossover. |
@@ -291,3 +291,71 @@ and logs. Shared system Metal caches that predate this work were left intact.
 The figures above are rounded allocated file sizes, rather than a measurement
 of APFS physical space reclaimed. Numerical results and implementation tests
 remain in Git; the uncommitted raw experiment artifacts have been deleted.
+
+## Updated M4 branch review (2026-11-06)
+
+Fetched `origin/local/m4max-q6k` from `79a42fdd` to `7b4f28f5`. Its common
+main ancestor with this checkout is `9124ff2c`; the main code introduced by
+the M4 merge is already present here. The three new branch-specific commits
+are `6654c3c2` (main adaptation), `2bbbdcf6` (generated-state admission) and
+`7b4f28f5` (long-prefix attention reduction). This review reads the implementation
+and regression tests; it does not establish new M2 runtime measurements.
+
+The most useful unported feature is **natural-boundary generation caching**.
+In `runtime/model/Runtime.cpp`, `keepsGenerationWindow()` checks the dense
+model geometry and absence of auxiliary state, without requiring FP32. It
+maintains the draft window using only accepted rows, then captures state when
+a decode cycle starts on a 32-token boundary, after at least 64 generated
+tokens and with at least 128 tokens since its previous generated checkpoint.
+This can let a follow-up reuse part of a long assistant answer. Our existing
+message-prefix checkpoint instead helps edits to the final input message;
+it does not implement generated-prefix publication.
+
+Only `usesAlignedGeneration()` requires FP32: it reconstructs a page boundary
+inside a decode cycle with `verify_gdn_prefix_f32`. The natural-boundary path
+already existed in `79a42fdd`; overlooking its distinction from the aligned
+path was an error in the earlier review, not a newly removed precision guard.
+Lack of a guard is not proof of BF16 numerical correctness. A port should first
+validate accepted/rejected rows and window wraparound, cancellation, duplicate
+publication, restoration, long answers and follow-ups on this M2.
+
+The generated-cache port must include **pre-submission state admission** from
+`2bbbdcf6`: `Engine::prepare()` reserves optional checkpoint buffers under the
+request's memory claim and passes them to the model. If memory refuses, decoding
+continues without the checkpoint. Its regression test uses the real governor
+through the fake allocator and checks both acceptance and refusal. This matters
+at our 24 GiB limit; copying the earlier allocation inside `decodeAsync()` would
+miss main's new allocation contract. Our current prefill capture already uses
+engine admission, and we have no generated-cache path exposing that earlier bug.
+
+The attention fix records a **full-model long-prefix regression** when a
+288-row tail after 65,536 tokens changed from one to seven reduction splits.
+It restores the accepted policy for 40-core Apple9. Our Apple8 register kernels
+also have a separate occupancy rule, so copying that device's split constant
+would not reproduce its execution. The useful lesson is to require fixed-prompt
+full-model output/logit or task-quality comparisons, including these tail shapes,
+alongside kernel speed and numerical tests. Our successful 102K retrieval test
+is useful coverage but does not establish full-model parity for every split rule.
+
+Other reviewed differences:
+
+- The M4 gate/up and attention kernel files, GDN prefix kernel and
+  `LOCAL_OPTIMIZATION.txt` are byte-identical to `79a42fdd`. The old measurements
+  do not constitute new-main measurements; the earlier M2 operator comparison
+  still applies to these unchanged kernels.
+- M4 keeps both an earlier recovery checkpoint and a message checkpoint. Our
+  version moves the last progress checkpoint to bound memory, derives its hint
+  from the actual template and token prefix, and avoids hardcoded token IDs.
+  Retaining both is a memory/coverage tradeoff, not an automatic upgrade at 24 GiB.
+- Disk rescue requires a disk tier; this deployment has a zero disk-cache quota.
+  The 44 GiB override and staged64 crossover are specific measured policies for
+  that deployment. Neither supplies a missing requirement for our current setup.
+- The Swift test changes isolate locale, asynchronous page loading and reduced
+  motion preferences. They improve test stability, without changing inference.
+
+Recommended next implementation: natural-boundary generated-prefix caching,
+with pre-submission admission and graceful refusal, retaining BF16 KV/state and
+the 24 GiB limit. Benchmark complete long-answer/follow-up pairs against the
+current build, including capture overhead and memory pressure, before deployment.
+This audit changes documentation only; the serving implementation stays at
+`36edabdc` and its existing measured kernel policy.
