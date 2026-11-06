@@ -17,6 +17,22 @@ The DFlash2 draft is `incoai/Qwen3.8-27B-DFlash2`, revision
 `015e795645c74b1a0eeef3b570031fb62e769bc5`, in the Hugging Face cache. Startup
 uses the prepared local files offline. No copy of the target weights is needed.
 
+## Current deployment
+
+The production launcher now uses a 26 GiB governed memory budget, BF16 KV/state,
+two runtime lanes and the local `mmproj-F16.gguf` vision projector. Image and PDF
+input are enabled. At this configuration the live auto-planner reports 119705
+tokens of total context and a shared KV capacity of 119712 tokens. The native
+vision weights account for 930250752 bytes. Default reasoning effort remains
+`xhigh`; ANE prefill and the M2 Max kernel optimizations are unchanged.
+
+Text, image and inline-PDF requests passed through the production port 1234.
+An over-window 119706-token prompt returned `400 context_length_exceeded`
+without submitting inference. This is a planner and smoke/boundary validation,
+not a new full-window or maximum-image/concurrency stress test. `--max-memory`
+is the governed budget, not an OS-wide cap or a guarantee of zero swap under
+other workloads. Earlier measurements below describe their dated configurations.
+
 ## Runtime changes
 
 - Apple7/8 get simdgroup matrix kernels and FP32 activation tables; Apple9/10
