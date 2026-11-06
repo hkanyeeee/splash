@@ -231,14 +231,20 @@ void ggufMoePlans() {
 void prefillSplitsFollowTheDeviceRow() {
   const kv::Layout layout{1, 2, 256};
   struct Expected final {
-    uint32_t rows, history, small, other;
+    uint32_t rows, history, small, other, fortyCoreApple9;
   };
-  for (const auto [rows, history, small, other] : {Expected{512, 4096, 2, 4}, Expected{64, 32768, 16, 32}})
-    for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 1U}, {9U, 11U}, {9U, 40U}, {10U, 12U}, {10U, 32U}}) {
+  // The 288-row tail after 64K exposed a full-model numerical regression
+  // when the accepted 40-core Apple9 reduction changed from one to seven splits.
+  for (const auto [rows, history, small, other, fortyCoreApple9] :
+       {Expected{512, 4096, 2, 4, 1}, Expected{64, 32768, 16, 32, 4}, Expected{288, 65536, 7, 7, 1}})
+    for (const auto [family, cores] :
+         {std::pair{9U, 10U}, {9U, 1U}, {9U, 11U}, {9U, 40U}, {10U, 12U}, {10U, 32U}, {10U, 40U}}) {
       DeviceCapabilities capabilities = device(family);
       capabilities.gpuCoreCount = cores;
       const uint32_t splits = ExecutionPlans(capabilities).prefillAttention(rows, history, 16, layout).splits;
-      require(splits == (family == 9 && cores <= 10 ? small : other),
+      const uint32_t expected = family == 9 ? (cores == 40 ? fortyCoreApple9 : cores <= 10 ? small : other)
+                                             : other;
+      require(splits == expected,
               "a prefill attention plan of family " + std::to_string(family) + ", " + std::to_string(cores) +
                   " cores took " + std::to_string(splits) + " splits");
     }

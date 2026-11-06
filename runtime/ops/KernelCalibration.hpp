@@ -96,7 +96,8 @@ struct FloatTileCalibration final {
 
 struct AttentionCalibration final {
   // A dense prefill tile takes one history split per this many pages its
-  // rows read (PagedAttention.cpp).
+  // rows read (PagedAttention.cpp). UINT32_MAX retains the shared split
+  // count independent of history, preserving the prior reduction order.
   uint32_t prefillPagesPerSplit;
 };
 
@@ -270,6 +271,11 @@ inline constexpr AttentionCalibration kAttention{32};
 // after 4K tokens. Larger Apple9 GPUs, unmeasured, keep 32.
 inline constexpr AttentionCalibration kApple9SmallAttention{64};
 
+// Keep the accepted reduction order on the local 40-core Apple9 deployment.
+// History-scaled splits must also pass full-model long-prefix parity before
+// their isolated attention speedup can qualify them for this device.
+inline constexpr AttentionCalibration kApple9FortyCoreAttention{UINT32_MAX};
+
 // ---- The device's row ------------------------------------------------------
 
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
@@ -282,7 +288,8 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   // 440 ms on the prefill tile; keep the validated choice after policy moves.
   if (cores == 40) projection.stagedPrefillRows = 64;
   return {cores, projection, kApple9FloatTile,
-          small ? kApple9SmallMoe : kApple9Moe, small ? kApple9SmallAttention : kAttention};
+          small ? kApple9SmallMoe : kApple9Moe,
+          cores == 40 ? kApple9FortyCoreAttention : small ? kApple9SmallAttention : kAttention};
 }
 
 } // namespace splash::ops
