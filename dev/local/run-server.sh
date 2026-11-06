@@ -3,7 +3,7 @@
 set -eu
 checkout=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 # Passed through the source launcher's make invocation as well as manual builds.
-export SPLASH_RUNTIME_LANES=1
+export SPLASH_RUNTIME_LANES=2
 export SPLASH_PREFILL_ROWS="${SPLASH_PREFILL_ROWS:-512}"
 # Validated natural-boundary snapshots retain BF16 state; 0 disables the cache.
 export SPLASH_LOCAL_GENERATION_CACHE="${SPLASH_LOCAL_GENERATION_CACHE:-1}"
@@ -24,7 +24,7 @@ exec "$checkout/splash" serve \
   --max-memory "${SPLASH_LOCAL_MEMORY:-24G}" \
   --max-context "${SPLASH_LOCAL_CONTEXT:-auto}" \
   --kv-format bf16 --state-format bf16 \
-  --queue-size 1 \
+  --queue-size 2 \
   --max-cache-disk 0 \
   --idle-release "${SPLASH_LOCAL_IDLE:-10m}" \
   --default-reasoning-effort medium \
