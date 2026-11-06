@@ -108,8 +108,9 @@ make architecture-check
 
 The focused Metal checks include `gguf-projection`, `norm-table`, `gdn-decode`,
 `q8-flash-attention`, `q8-chunked-prefill` and the backend command-buffer tests.
-Run them with `MTL_SHADER_VALIDATION=1`. Local results are retained in
-`build/local-validation/`; these artifacts are not committed.
+Run them with `MTL_SHADER_VALIDATION=1`. Local checks write temporary artifacts
+under `build/local-validation/`; these artifacts are not committed. The recorded
+results below survive the 2026-11-06 cleanup of those generated files.
 The full CPU suite and architecture check passed. Metal validation passed all
 44 projection formats, dense/sparse attention including 131,072-token histories,
 chunked prefill and 47 backend checks. Modern-GPU selection remained unchanged
@@ -196,7 +197,8 @@ hint does not replace them. This preserves recovery granularity and the
 final message. Each pair uses a fresh cache salt, identical prompt content and
 generation settings across builds. The unchanged target and draft weights,
 BF16 formats, 512-row prefill, single lane and ANE calibration are held fixed.
-Raw responses and status snapshots are in `build/local-validation/m4-port/`.
+Raw responses and status snapshots were written under
+`build/local-validation/m4-port/` and removed during the cleanup below.
 
 The two paired 7,785-token trials produced identical answers across builds:
 
@@ -209,8 +211,8 @@ The edit reused 3,520 additional tokens. Its latency fell 92.4% in this fixture;
 the complete cold-plus-edit pair fell 30.65%. This is avoided prefill work on a
 specific edit pattern, not a 13× increase in general model inference speed.
 The initial control with only a single differing token at the very end already
-hit the baseline replay state; its roughly 0.47-second result is kept separately
-as `baseline-probe`, and is not credited as a benefit of the new feature.
+hit the baseline replay state; its roughly 0.47-second result was recorded
+separately as `baseline-probe`, and is not credited as a benefit of the new feature.
 
 The updated service also passed a 101,993-token cold request and its
 102,045-token follow-up, retrieving all three codes from the archive's start,
@@ -224,8 +226,9 @@ policy, rather than a claim of unlimited host-memory headroom.
 
 ### M2 execution of the M4 kernels
 
-Probe sources and full logs are under
-`build/local-validation/m4-port/kernel-probe/`. The old M4 sources compile
+Temporary probe sources and full logs were generated under
+`build/local-validation/m4-port/kernel-probe/` and removed during cleanup.
+The M4 kernels remain available in commit `79a42fdd`. The old M4 sources compile
 against the current ABI without algorithm changes, with Metal 4 and the same
 macOS 26.4 deployment target as production. An initial attention build that
 omitted that target hit a pipeline stack-space error; rebuilding with the
@@ -268,3 +271,23 @@ the native CPU suites (including protocol interoperability and checkpoint
 resume tests), the paired edit benchmark, and the near-limit retrieval test
 above. The kernel probes do not modify the deployed metallib or its selection
 policy.
+
+## Disk cleanup (2026-11-06)
+
+After deployment, removed approximately 661 MiB of generated files:
+
+- Duplicate default-profile builds, test executables, benchmark binaries,
+  baseline copies, raw prompts and responses, and status samples (463 MiB).
+- This session's pip download cache (67 MiB), Metal shader-validation cache
+  (105 MiB), and unused ANE calibration programs and old calibration records
+  (21 MiB).
+- Temporary scripts, patches, stack samples and logs, Python/linter caches,
+  and the stopped port-8000 test server's records (5 MiB).
+
+Kept the deployed executable and metallibs with their incremental build inputs,
+the Python environment, prepared model/tokenizer metadata, target and DFlash2
+weights, the active ANE program and calibration, and the current service records
+and logs. Shared system Metal caches that predate this work were left intact.
+The figures above are rounded allocated file sizes, rather than a measurement
+of APFS physical space reclaimed. Numerical results and implementation tests
+remain in Git; the uncommitted raw experiment artifacts have been deleted.
