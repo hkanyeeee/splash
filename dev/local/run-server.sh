@@ -27,5 +27,5 @@ exec "$checkout/splash" serve \
   --queue-size 2 \
   --max-cache-disk 0 \
   --idle-release "${SPLASH_LOCAL_IDLE:-10m}" \
-  --default-reasoning-effort medium \
+  --default-reasoning-effort xhigh \
   "$@"
