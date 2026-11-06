@@ -101,7 +101,7 @@ Projection Projection::leadingInputs(uint32_t inputs) const {
 
 // Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
 uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
-  return layout == LinearInput::Table16
+  return isTable16(layout)
              ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
              : 0;
 }
@@ -109,17 +109,18 @@ uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexc
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
   if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64)
     throw std::invalid_argument("invalid linear table geometry");
-  requireBytes(scratch.input, tableBytes(width, rows), "linear table");
+  requireBytes(scratch.input, tableBytes(width, rows, layout), "linear table");
   requireBytes(scratch.sums, tableSumsBytes(layout, width, rows), "linear table sums");
 }
 
 const char *tableSuffix(LinearInput layout) noexcept {
-  return layout == LinearInput::Table16 ? "_table16" : "";
+  return layout == LinearInput::Table16F ? "_table16f" : layout == LinearInput::Table16 ? "_table16" : "";
 }
 
-LinearInput LinearPlan::input() const noexcept {
-  if (rotated_) return LinearInput::Plain;
-  return config_.tile == LinearTile::GgufRegister ? LinearInput::Table16 : LinearInput::Plain;
+LinearInput LinearPlan::input() const noexcept { return rotated_ ? LinearInput::Plain : table(); }
+LinearInput LinearPlan::table() const noexcept {
+  if (config_.tile != LinearTile::GgufRegister) return LinearInput::Plain;
+  return config_.fp32Table ? LinearInput::Table16F : LinearInput::Table16;
 }
 uint64_t LinearPlan::gateScratchBytes() const noexcept {
   // Gate/up runs as a gate pass into the gate scratch and an up-with-gate
@@ -139,7 +140,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device) noexcept : calibration_(KernelCalibration::of(device)) {}
+Linear::Linear(const DeviceCapabilities &device) noexcept : family_(device.gpuClass()), calibration_(KernelCalibration::of(device)) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format

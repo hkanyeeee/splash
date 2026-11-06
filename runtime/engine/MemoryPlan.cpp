@@ -100,6 +100,7 @@ void writeModel(json::Writer &w, const ModelMemoryProfile &model) {
           .field("draft_weights_bytes", footprint.draftWeightsBytes)
           .field("vision_weights_bytes", footprint.visionWeightsBytes)
           .field("lane_state_bytes", footprint.runtime.laneStatePlannedAllocatedBytes)
+          .field("continuation_state_bytes", footprint.runtime.continuationStatePlannedAllocatedBytes)
           .field("shared_prefill_bytes", footprint.runtime.sharedPrefillPlannedAllocatedBytes)
           .field("shared_decode_bytes", footprint.runtime.sharedDecodePlannedAllocatedBytes)
           .field("pipeline_reserve_bytes", model::kPipelineReserveBytes)
@@ -123,6 +124,7 @@ void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
         .field("vision_weights_bytes", budget.visionWeightsBytes)
         .field("maximum_batch_width", budget.maximumBatchWidth)
         .field("lane_state_bytes", budget.laneStateBytes)
+        .field("continuation_state_bytes", budget.continuationStateBytes)
         .field("shared_prefill_bytes", budget.sharedPrefillBytes)
         .field("shared_decode_bytes", budget.sharedDecodeBytes)
         .field("pipeline_reserve_bytes", budget.pipelineReserveBytes)
@@ -368,6 +370,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.visionWeightsBytes = model.footprint.visionWeightsBytes;
   breakdown.laneStateBytes =
       model.footprint.runtime.laneStatePlannedAllocatedBytes;
+  breakdown.continuationStateBytes = model.footprint.runtime.continuationStatePlannedAllocatedBytes;
   breakdown.sharedPrefillBytes =
       model.footprint.runtime.sharedPrefillPlannedAllocatedBytes;
   breakdown.sharedDecodeBytes =
@@ -408,9 +411,13 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       breakdown.hardBudgetBytes > breakdown.fixedRuntimeBytes
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
+  uint64_t requestStateBytes = 0;
+  if (!checkedAdd(breakdown.laneStateBytes, breakdown.continuationStateBytes, requestStateBytes))
+    return {std::nullopt, failure(BudgetErrorCode::ArithmeticOverflow,
+                                  "request state footprint overflows uint64", std::move(breakdown))};
   const std::optional<uint64_t> required =
       minimumRequiredBytes(breakdown.fixedRuntimeBytes,
-                           breakdown.laneStateBytes, model.targetKvLayout);
+                           requestStateBytes, model.targetKvLayout);
   if (!required) {
     return {std::nullopt,
             failure(BudgetErrorCode::ArithmeticOverflow,
@@ -432,8 +439,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   // unused; a windowed layout's Full and Slim pages take extents of their
   // own (kvPagesWithin).
   const uint64_t availableForOneRequestKv =
-      breakdown.dynamicBudgetBytes > breakdown.laneStateBytes
-          ? breakdown.dynamicBudgetBytes - breakdown.laneStateBytes
+      breakdown.dynamicBudgetBytes > requestStateBytes
+          ? breakdown.dynamicBudgetBytes - requestStateBytes
           : 0;
   const auto pagesWithin = [&](uint32_t extentPages) {
     return std::min<uint64_t>(

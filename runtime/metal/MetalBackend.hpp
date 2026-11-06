@@ -238,7 +238,10 @@ enum class HostStepGpu : uint8_t {
 // command may have completed by then, so `then` must not throw: one that does
 // marks the backend unhealthy.
 struct EventStep {
-  enum class Kind : uint8_t { Signal, Wait, Host };
+  // Break ends the Metal command buffer without an event, so that macOS can
+  // schedule other work between a long command's parts: it takes no event
+  // and no value.
+  enum class Kind : uint8_t { Signal, Wait, Host, Break };
 
   size_t before = 0;
   SharedEvent event;

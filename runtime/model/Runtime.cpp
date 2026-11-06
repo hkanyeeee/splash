@@ -647,15 +647,16 @@ struct Runtime::Impl {
         .thinkingCutoff = ops::ThinkingCutoff{.end = end}};
     const std::array<ops::SamplingPolicy, 2> policies{sampled, {}};
     const std::array<uint32_t, 2> stateLanes{0, 1};
-    const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
-    sampling.addInitial(graph, policies, samplingBuffers(2), 0,
-                        geometry.target.stopTokens, penalties);
-    sampling.addThinkingDrafts(
-        graph, policies,
-        decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2));
-    sampling.addVerify(graph, policies, samplingBuffers(2),
-                       geometry.target.stopTokens, penalties);
+    for (uint32_t first = 0; first < policies.size(); first += kLaneCount) {
+      const uint32_t width = std::min(kLaneCount, static_cast<uint32_t>(policies.size()) - first);
+      const auto batch = std::span(policies).subspan(first, width);
+      const ops::PenaltyTable penalties{penaltyTable, std::span(stateLanes).first(width)};
+      sampling.addInitial(graph, batch, samplingBuffers(width), 0,
+                          geometry.target.stopTokens, penalties);
+      sampling.addThinkingDrafts(graph, batch, decodeArena->batchSlice(DecodeTensor::ProposedTokens, width));
+      sampling.addVerify(graph, batch, samplingBuffers(width), geometry.target.stopTokens, penalties);
+    }
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -1771,11 +1772,17 @@ struct Runtime::Impl {
   void addDraftRebuild(CommandGraph &graph, uint32_t lane,
                        const Request::DraftRebuild &rebuild) const {
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
-    ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
-                                   p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
-                                   rebuild.rows, rebuild.begin, kPrefillRows);
-    draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
-                                 states.draft(lane), rebuild.rows, rebuild.begin);
+    // Preserve the draft's trained 2048-token window even when a local
+    // memory profile uses smaller prefill scratch. Each piece loads and
+    // projects disjoint positions into the same persistent rings.
+    for (uint32_t offset = 0; offset < rebuild.rows; offset += kPrefillRows) {
+      const uint32_t rows = std::min(kPrefillRows, rebuild.rows - offset), begin = rebuild.begin + offset;
+      ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
+                                     p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
+                                     rows, begin, kPrefillRows);
+      draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
+                                   states.draft(lane), rows, begin);
+    }
   }
 
   // The draft's context of chunk `index` of a command's chunks: the rows its
@@ -3468,6 +3475,13 @@ void Runtime::prepareWarmupDecode(uint64_t requestId, uint32_t anchor) {
 WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   if (!rows || rows > kPrefillRows)
     throw std::invalid_argument("invalid prefill warmup row count");
+  // Apple7/8 use distinct MMA kernels for short prompts. The maximum-row
+  // warmup and the one-row decode setup miss M16 and M32; compiling their
+  // fused projections in the first request can exceed the loop watchdog.
+  double shortWarmupSeconds = 0.0;
+  if (rows == kPrefillRows && impl_->backend.capabilities().appleGpuFamily < 9)
+    for (uint32_t shortRows : {16u, 32u})
+      shortWarmupSeconds += warmupPrefill(shortRows).wallSeconds;
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 100;
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
@@ -3502,8 +3516,9 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     throw;
   }
   return {"real " + std::to_string(rows) +
-              "-row KV target+draft prefill [M32]",
-          wallSeconds, std::move(lanes)};
+              "-row KV target+draft prefill [M32]" +
+              (shortWarmupSeconds > 0.0 ? "; M16/M32 short-prompt kernels warmed" : ""),
+          wallSeconds + shortWarmupSeconds, std::move(lanes)};
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
@@ -3527,7 +3542,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       request.prompt = warmupPrompt;
       request.maxNewTokens = 16;
       beginColdRequest(request, stateLane(lane));
-      pages[lane] = {5 + lane};
+      pages[lane] = {ExecutionLimits::warmupKvPages - 1 - lane};
       requireRunwayPages(impl_->kvPages, pages[lane]);
       BatchPlan prefillPlan{.kind = WorkKind::Prefill,
                             .items = {{request.id, 1}},
@@ -3584,6 +3599,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   constexpr uint32_t prefixTokens = 2 * kv::kPageTokens;
   constexpr uint32_t suffixTokens = kDecodeRows;
   constexpr uint32_t promptTokens = prefixTokens + suffixTokens;
+  constexpr uint32_t restoredLane = std::min(1u, kLaneCount - 1);
   std::vector<uint32_t> warmupPrompt(promptTokens, 2);
   ModelRequest request;
   request.id = id;
@@ -3594,7 +3610,8 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   beginColdRequest(request, 0);
   try {
     // Deliberately non-contiguous physical ids exercise page-table lookup.
-    const std::vector<uint32_t> pages{12, 10, 11};
+    constexpr uint32_t lastPage = ExecutionLimits::warmupKvPages - 1;
+    const std::vector<uint32_t> pages{lastPage, lastPage - 2, lastPage - 1};
     requireRunwayPages(impl_->kvPages, pages);
     BatchPlan plan{.kind = WorkKind::Prefill,
                    .items = {{id, prefixTokens}},
@@ -3608,11 +3625,11 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     if (!cachedState)
       throw metal::MetalAllocationError("prefix warmup state allocation failed");
     end(id);
-    beginColdRequest(request, 1);
+    beginColdRequest(request, restoredLane);
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
       throw std::logic_error("a resident state restore returned a read");
     setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}));
-    const auto &restored = impl_->states.metadata(1).lengths;
+    const auto &restored = impl_->states.metadata(restoredLane).lengths;
     if (restored.targetTokens != prefixTokens ||
         !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
       throw std::runtime_error("prefix restore length mismatch");
@@ -3643,7 +3660,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     const double historicalDecodeWallSeconds =
         impl_->counters.lastDecodeWallSeconds;
     wallSeconds += historicalDecodeWallSeconds;
-    const auto &continued = impl_->states.metadata(1).lengths;
+    const auto &continued = impl_->states.metadata(restoredLane).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
         !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
         continued.targetTokens <= promptTokens ||
@@ -3658,7 +3675,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     end(id);
     throw;
   }
-  return {"real paged-KV state restore, arbitrary page table, lane move, "
+  return {"real paged-KV state restore, arbitrary page table, "
           "bounded restore continuation, and decode",
           wallSeconds, {}};
 }
@@ -3718,7 +3735,8 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
   const RuntimeGeometry geometry = RuntimeGeometry::from(model, kvFormat, stateFormat, parts);
   return {model.stateLayout(stateFormat).laneBytes(),
           plannedPrefillBytes(geometry, operators),
-          plannedDecodeBytes(geometry, operators)};
+          plannedDecodeBytes(geometry, operators),
+          model.stateLayout(stateFormat).cachedBytes()};
 }
 
 bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept {

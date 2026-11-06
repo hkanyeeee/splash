@@ -1,4 +1,5 @@
 #include "metal/kernels/common/lane_bindings.h"
+#include "metal/kernels/common/sparse_attention_sgf.h"
 #include "metal/kernels/common/sparse_attention_tile.h"
 
 // Sparse attention (metal/abi/PagedAttention.h): the block lists a tile's rows'
@@ -186,6 +187,75 @@ SPARSE_VERIFY_LOCATED_SPLIT(verify_attention_bf16_sparse_located_kv2_g12, 2, 12,
 #undef SPARSE_VERIFY_SPLIT
 #undef SPARSE_VERIFY_SPLIT_BODY
 
+// Apple7/8 register tile (sparse_attention_sgf.h): the bindings and grid of
+// the splits above with 32 x G threads, one simdgroup per eight fused rows.
+#define SGF_SPARSE_VERIFY_SPLIT_BODY(Heads, Group, CacheElement, Located,      \
+                                     Locations, LocationPages)                 \
+    threadgroup q8sgf::SparseScratch<CacheElement> scratch;                    \
+    constant SplashVerifyAttentionParams &lane = params[group.z];              \
+    const uint kv_head = group.x % Heads, split = group.x / Heads;             \
+    const SplashAttentionTile tile =                                           \
+        splash_verify_attention_tile<Heads, Group, SPLASH_KV_HEAD_DIMENSION>(lane, kv_head, group.z); \
+    if (!tile.active || split >= tile.splits)                                  \
+      return;                                                                  \
+    const SplashSparseList list = splash_sparse_list(                          \
+        lists, counts, lane.block_stride, lane.block_list,                     \
+        tile.first_position, tile.active_rows, Locations);                     \
+    q8sgf::sparse_tile<Heads, Group, CacheElement, Located>(                   \
+        queries + tile.offset,                                                 \
+        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
+                            page_table3),                                      \
+        lane.kv, kv_head, tile.first_position, tile.active_rows, list.entries, \
+        list.count, list.locations, LocationPages, tile.splits, split,         \
+        partials, statistics, tile.first_slot + split, scratch, sg, simd_lane);
+
+#define SGF_SPARSE_VERIFY_SPLIT(Name, Heads, Group, CacheElement)              \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const SplashKvPage *page_table0 [[buffer(3)]],                    \
+      device const SplashKvPage *page_table1 [[buffer(4)]],                    \
+      device const SplashKvPage *page_table2 [[buffer(5)]],                    \
+      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
+      device const uint *lists [[buffer(7)]],                                  \
+      device const uint *counts [[buffer(8)]],                                 \
+      constant SplashVerifyAttentionParams *params [[buffer(9)]],              \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint sg [[simdgroup_index_in_threadgroup]],                              \
+      uint simd_lane [[thread_index_in_simdgroup]]) {                          \
+    SGF_SPARSE_VERIFY_SPLIT_BODY(Heads, Group, CacheElement, false, nullptr,   \
+                                 nullptr)                                      \
+  }
+
+#define SGF_SPARSE_VERIFY_LOCATED_SPLIT(Name, Heads, Group, CacheElement)      \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const SplashKvPage *page_table0 [[buffer(3)]],                    \
+      device const SplashKvPage *page_table1 [[buffer(4)]],                    \
+      device const SplashKvPage *page_table2 [[buffer(5)]],                    \
+      device const SplashKvPage *page_table3 [[buffer(6)]],                    \
+      device const uint *lists [[buffer(7)]],                                  \
+      device const uint *counts [[buffer(8)]],                                 \
+      device const uint *locations [[buffer(9)]],                              \
+      device const SplashKvPage *location_pages [[buffer(10)]],                \
+      constant SplashVerifyAttentionParams *params [[buffer(11)]],             \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint sg [[simdgroup_index_in_threadgroup]],                              \
+      uint simd_lane [[thread_index_in_simdgroup]]) {                          \
+    SGF_SPARSE_VERIFY_SPLIT_BODY(Heads, Group, CacheElement, true, locations,  \
+                                 location_pages)                               \
+  }
+SGF_SPARSE_VERIFY_SPLIT(verify_attention_q8_sparse_sgf_kv2_g12, 2, 12, int8_t)
+SGF_SPARSE_VERIFY_SPLIT(verify_attention_bf16_sparse_sgf_kv2_g12, 2, 12, bfloat)
+SGF_SPARSE_VERIFY_LOCATED_SPLIT(verify_attention_q8_sparse_located_sgf_kv2_g12, 2, 12, int8_t)
+SGF_SPARSE_VERIFY_LOCATED_SPLIT(verify_attention_bf16_sparse_located_sgf_kv2_g12, 2, 12, bfloat)
+#undef SGF_SPARSE_VERIFY_LOCATED_SPLIT
+#undef SGF_SPARSE_VERIFY_SPLIT
+#undef SGF_SPARSE_VERIFY_SPLIT_BODY
+
 // Combines the splits that took entries of the lane's list.
 #define SPARSE_VERIFY_REDUCE(Name, Heads, Group, HeadDim)                      \
   kernel void Name(                                                            \
@@ -250,6 +320,37 @@ SPARSE_VERIFY_REDUCE(verify_attention_sparse_reduce_kv2_g12, 2, 12, 256)
 SPARSE_PREFILL_SPLIT(prefill_attention_q8_sparse_kv2_g12, 2, 12, 256, int8_t)
 SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_kv2_g12, 2, 12, 256, bfloat)
 #undef SPARSE_PREFILL_SPLIT
+
+// Apple7/8 register tile of the prefill split above, 32 x G threads.
+#define SGF_SPARSE_PREFILL_SPLIT(Name, Heads, Group, CacheElement)             \
+  kernel void Name(                                                            \
+      device bfloat *queries [[buffer(0)]],                                    \
+      device float *partials [[buffer(1)]],                                    \
+      device float *statistics [[buffer(2)]],                                  \
+      device const SplashKvPage *page_table [[buffer(3)]],                     \
+      device const uint *lists [[buffer(4)]],                                  \
+      device const uint *counts [[buffer(5)]],                                 \
+      constant SplashPrefillAttentionParams &params [[buffer(6)]],             \
+      uint3 group [[threadgroup_position_in_grid]],                            \
+      uint sg [[simdgroup_index_in_threadgroup]],                              \
+      uint simd_lane [[thread_index_in_simdgroup]]) {                          \
+    threadgroup q8sgf::SparseScratch<CacheElement> scratch;                    \
+    const SplashAttentionTile tile =                                           \
+        splash_prefill_attention_tile<Heads, Group, SPLASH_KV_HEAD_DIMENSION>(params, group.x, group.y); \
+    if (!tile.active || group.z >= tile.splits)                                \
+      return;                                                                  \
+    const SplashSparseList list = splash_sparse_list(                          \
+        lists, counts, params.block_stride, params.block_list + group.y,       \
+        tile.first_position, tile.active_rows);                                \
+    q8sgf::sparse_tile<Heads, Group, CacheElement>(                            \
+        queries + tile.offset, page_table, params.kv, group.x,                 \
+        tile.first_position, tile.active_rows, list.entries, list.count,       \
+        nullptr, nullptr, tile.splits, group.z, partials, statistics,          \
+        tile.first_slot + group.z, scratch, sg, simd_lane);                    \
+  }
+SGF_SPARSE_PREFILL_SPLIT(prefill_attention_q8_sparse_sgf_kv2_g12, 2, 12, int8_t)
+SGF_SPARSE_PREFILL_SPLIT(prefill_attention_bf16_sparse_sgf_kv2_g12, 2, 12, bfloat)
+#undef SGF_SPARSE_PREFILL_SPLIT
 
 #define SPARSE_PREFILL_REDUCE(Name, Heads, Group, HeadDim)                     \
   kernel void Name(                                                            \

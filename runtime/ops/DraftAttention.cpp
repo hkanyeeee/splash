@@ -173,8 +173,8 @@ void DraftAttention::addDecode(
   const auto workspace = plan.workspace();
   const uint32_t lanes = plan.lanes();
   if (cacheLengths.size() != lanes ||
-      buffers.persistentKeys.size() != kMaximumLanes ||
-      buffers.persistentValues.size() != kMaximumLanes)
+      buffers.persistentKeys.size() < lanes || buffers.persistentKeys.size() > kMaximumLanes ||
+      buffers.persistentValues.size() != buffers.persistentKeys.size())
     throw std::invalid_argument("invalid draft attention geometry");
   requireBytes(buffers.groupedQueries, workspace.groupedQueriesBytes, "draft grouped queries");
   requireBytes(buffers.queryKeys, workspace.queryKeysBytes, "draft query keys");
@@ -244,8 +244,8 @@ void DraftAttention::addContextCommit(
   const auto lanes = static_cast<uint32_t>(startPositions.size());
   requireLanes(lanes);
   requireCompiledShape(shape);
-  if (persistentKeys.size() != kMaximumLanes ||
-      persistentValues.size() != kMaximumLanes)
+  if (persistentKeys.size() < lanes || persistentKeys.size() > kMaximumLanes ||
+      persistentValues.size() != persistentKeys.size())
     throw std::invalid_argument("invalid draft context commit geometry");
   // Each lane commits up to its eight verify rows.
   requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin,

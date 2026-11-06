@@ -71,7 +71,7 @@ inline GdnTape gdn_tape(device uchar *tape, ulong offset) {
 // convolution inputs, k, v and gates go to this step's tape, from which the
 // lane's next step folds in the rows the lane retains.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint PackedWidth>
+          uint PackedWidth, bool TapRows>
 inline void gdn_decode_prologue(
     device const bfloat *packed, device const bfloat *conv_weights,
     GdnConvHistory history, device bfloat *conv_state_out,
@@ -117,21 +117,39 @@ inline void gdn_decode_prologue(
     }
   }
 
+  // With TapRows (Apple7/8) the row each tap reads, the same for all of
+  // the row's channels, is chosen once instead of per load: on an M2 Max
+  // that takes 30% off the 27B's GDN verify at one lane, 20% at two and 32%
+  // at four.
+  constexpr uint Taps = SPLASH_GDN_CONVOLUTION_TAPS, Carried = Taps - 1;
+  device const bfloat *tap_rows[Taps];
+  for (uint tap = 0; tap < Taps; ++tap)
+    tap_rows[tap] = token + tap < Carried ? history.row(token + tap)
+                                          : packed + (token + tap - Carried) * PackedWidth;
+  device const bfloat *carry_row = history.row(carrier ? simd_group : 0);
+  // gdn_conv_silu over tap_rows.
+  const auto conv_silu = [&](uint channel) {
+    if (!TapRows)
+      return gdn_conv_silu(packed, history, conv_weights, PackedWidth, token, channel);
+    float value = 0.0f;
+    for (uint tap = 0; tap < Taps; ++tap)
+      value += float(tap_rows[tap][channel]) * float(conv_weights[channel * Taps + tap]);
+    value = float(bfloat(value));
+    return bfloat(splash_silu(value));
+  };
+  const auto carried = [&](uint channel) {
+    return TapRows ? carry_row[channel] : history.at(simd_group, channel);
+  };
   float q[Groups], k[Groups];
   bfloat v[Groups], carry_v[Groups], carry_q[Groups], carry_k[Groups];
   for (uint g = 0; g < Groups; ++g) {
-    q[g] = float(gdn_conv_silu(packed, history, conv_weights, PackedWidth,
-                               token, q_channel + 32 * g));
-    k[g] = float(gdn_conv_silu(packed, history, conv_weights, PackedWidth,
-                               token, k_channel + 32 * g));
-    v[g] = gdn_conv_silu(packed, history, conv_weights, PackedWidth, token,
-                         v_channel + 32 * g);
+    q[g] = float(conv_silu(q_channel + 32 * g));
+    k[g] = float(conv_silu(k_channel + 32 * g));
+    v[g] = conv_silu(v_channel + 32 * g);
     if (carrier) {
-      carry_v[g] = history.at(simd_group, v_channel + 32 * g);
-      carry_q[g] = shared_writer ? history.at(simd_group, q_channel + 32 * g)
-                                 : bfloat(0.0f);
-      carry_k[g] = shared_writer ? history.at(simd_group, k_channel + 32 * g)
-                                 : bfloat(0.0f);
+      carry_v[g] = carried(v_channel + 32 * g);
+      carry_q[g] = shared_writer ? carried(q_channel + 32 * g) : bfloat(0.0f);
+      carry_k[g] = shared_writer ? carried(k_channel + 32 * g) : bfloat(0.0f);
     }
   }
   GdnGates gates{};
@@ -192,7 +210,7 @@ inline void gdn_decode_prologue(
 // next rows' state is loaded before these rows' state is stored. State is the
 // stored element: float, or bfloat, widened as it is loaded and rounded to
 // nearest even as it is stored; the arithmetic is fp32 with either.
-template <uint HeadDim, uint RowsInFlight, class State>
+template <uint HeadDim, uint RowsInFlight, class State, bool LaneOutputs>
 inline void gdn_decode_scan(device const State *state_in,
                             device State *state_out,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
@@ -245,6 +263,10 @@ inline void gdn_decode_scan(device const State *state_in,
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i)
         state_out[base(batch, r) + i] = State(state[r][i]);
+    // With LaneOutputs (Apple7/8) lane t keeps token t's outputs and stores
+    // them after the tokens, one branch per batch instead of one per token:
+    // 5-6% less time at one to four lanes on an M2 Max.
+    float outputs[RowsInFlight] = {};
     for (uint token = 0; token < Tokens; ++token) {
       const float d = shared.decay[token];
       const float b = float(shared.beta[token]);
@@ -273,10 +295,17 @@ inline void gdn_decode_scan(device const State *state_in,
         }
         result[r] = simd_sum(result[r]);
       }
-      if (lane == 0) {
+      if (LaneOutputs) {
+        for (uint r = 0; r < RowsInFlight; ++r)
+          outputs[r] = lane == token ? result[r] : outputs[r];
+      } else if (lane == 0) {
         for (uint r = 0; r < RowsInFlight; ++r)
           shared.rows[token * HeadDim + value_dim[r]] = bfloat(result[r]);
       }
+    }
+    if (LaneOutputs && lane < Tokens) {
+      for (uint r = 0; r < RowsInFlight; ++r)
+        shared.rows[lane * HeadDim + value_dim[r]] = bfloat(outputs[r]);
     }
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i)
@@ -346,7 +375,7 @@ inline void gdn_decode_batch_phase(
     constant GDNDecodeBatchParams &params,
     uint2 group, uint lane, uint simd_group,
     threadgroup GdnDecodeShared<HeadDim> &shared,
-    device bfloat *table, device float *sums) {
+    device typename Table::Elem *table, device float *sums) {
   constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
@@ -374,11 +403,12 @@ inline void gdn_decode_batch_phase(
                                ConvDim, pending};
 
   device bfloat *lane_hidden = gdn_hidden + ulong(batch) * Rows * ValueWidth;
-  gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
+  constexpr bool Apple7 = metal::is_same_v<Table, gguf_sg::Table16F>;
+  gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Apple7>(
       packed, conv_weights, history, conv_state_out, pending_tape, pending,
       step_tape, a_scale, dt_bias, shared, group.x, lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  gdn_decode_scan<HeadDim, RowsInFlight, State>(state_in, state_out, shared,
+  gdn_decode_scan<HeadDim, RowsInFlight, State, Apple7>(state_in, state_out, shared,
                                                 pending, group.x, lane,
                                                 simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -402,6 +432,13 @@ inline void gdn_decode_batch_phase(
 }
 
 // W: the norm weights' stored type (float: a GGUF's F32 norms, _f32).
+// State rows a simdgroup advances at a time. Two overlap reductions and arithmetic without the register cost of
+// four, but Apple7/8 (Table16F), whose 48 heads leave a core about twelve simdgroups, run four: 10-12% less time at
+// one to four lanes on an M1 Max (eight: 5-7%).
+template <class Layout> constexpr uint gdn_rows_in_flight() {
+  return metal::is_same_v<Layout, gguf_sg::Table16F> ? 4 : 2;
+}
+
 #define GDN_DECODE_BUFFERS(W) \
     device const bfloat *packed [[buffer(0)]], \
     device const bfloat *conv_weights [[buffer(1)]], \
@@ -417,7 +454,8 @@ inline void gdn_decode_batch_phase(
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
 #define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
     threadgroup GdnDecodeShared<HeadDim> shared; \
-    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout, W, State>( \
+    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, \
+                           gdn_rows_in_flight<Layout>(), Layout, W, State>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, tape, a_scale, dt_bias, \
         gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
@@ -431,7 +469,7 @@ inline void gdn_decode_batch_phase(
 // The out-projection's table (Layout: gguf_sg::Table16).
 #define GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
-      device bfloat *table [[buffer(15)]], device float *sums [[buffer(16)]], \
+      device Layout::Elem *table [[buffer(15)]], device float *sums [[buffer(16)]], \
       constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, State) \
   }
@@ -443,7 +481,6 @@ inline void gdn_decode_batch_phase(
   GDN_DECODE_TABLE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, float) \
   GDN_DECODE_TABLE_KERNEL(Name##_bf16_state, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, bfloat)
 
-// Two rows overlap reductions and arithmetic without the register cost of four.
 GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240, 16640, bfloat)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192, 12544, bfloat)
 // Table16 feeds the register tile, after norms that are F32 (a GGUF's) or bf16 (an MLX target's).
@@ -453,15 +490,24 @@ GDN_DECODE_ENTRY(verify_gdn_fused_f32, 16, 48, 128, 10240, 16640, float)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh32_f32, 16, 32, 128, 8192, 12544, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_f32, 16, 48, 128, 10240, 16640, gguf_sg::Table16, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, float)
+// Table16F: the fp32 table of Apple7/8's register tile.
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16f, 16, 48, 128, 10240, 16640, gguf_sg::Table16F, bfloat)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16f_vh32, 16, 32, 128, 8192, 12544, gguf_sg::Table16F, bfloat)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16f_f32, 16, 48, 128, 10240, 16640, gguf_sg::Table16F, float)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16f_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16F, float)
 // Qwen3.5-122B-A10B (64 value heads).
 GDN_DECODE_ENTRY(verify_gdn_fused_vh64, 16, 64, 128, 12288, 20736, bfloat)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh64_f32, 16, 64, 128, 12288, 20736, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh64, 16, 64, 128, 12288, 20736, gguf_sg::Table16, bfloat)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh64_f32, 16, 64, 128, 12288, 20736, gguf_sg::Table16, float)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16f_vh64, 16, 64, 128, 12288, 20736, gguf_sg::Table16F, bfloat)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16f_vh64_f32, 16, 64, 128, 12288, 20736, gguf_sg::Table16F, float)
 // Qwen3.8-Flash-Next (16512-column rows), which loads from GGUFs only, whose
 // norms are F32.
 GDN_DECODE_ENTRY(verify_gdn_fused_p16512_f32, 16, 48, 128, 10240, 16512, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512_f32, 16, 48, 128, 10240, 16512, gguf_sg::Table16, float)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16f_p16512, 16, 48, 128, 10240, 16512, gguf_sg::Table16F, bfloat)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16f_p16512_f32, 16, 48, 128, 10240, 16512, gguf_sg::Table16F, float)
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY
 #undef GDN_DECODE_KERNEL

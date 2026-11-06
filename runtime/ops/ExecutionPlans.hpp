@@ -17,6 +17,10 @@ public:
   explicit ExecutionPlans(const DeviceCapabilities &device);
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
+  [[nodiscard]] AttentionTile attentionTile() const noexcept { return attentionTile_; }
+  // Whether an injecting hyper-connection norm of `rows` rows runs the staged
+  // kernel (ops::HyperConnection::addNorm).
+  [[nodiscard]] bool hyperNormStaged(uint32_t rows) const noexcept;
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
       uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
@@ -47,6 +51,11 @@ public:
 
 private:
   Linear linear_;
+  GpuClass family_;
+  uint32_t gpuCores_ = 0;
+  // Apple7/8 have no bfloat arithmetic: their prefill and verify attention
+  // run the register kernels.
+  AttentionTile attentionTile_ = AttentionTile::Mpp;
 };
 
 } // namespace splash::ops

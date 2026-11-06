@@ -22,19 +22,32 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device) : linear_(device) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
+    : linear_(device), family_(device.gpuClass()),
+      gpuCores_(device.plannedGpuCores()),
+      attentionTile_(family_ == GpuClass::Apple7 ? AttentionTile::Register : AttentionTile::Mpp) {}
+
+bool ExecutionPlans::hyperNormStaged(uint32_t rows) const noexcept {
+  // Apple7/8 only, and only while the rows' threadgroups have the cores to
+  // themselves: past that the staged kernel runs a second wave where the
+  // quarters kernel doesn't slow down. Its 96 norms of a Flash-Next Q2_0 step
+  // on an M2 Max (38 cores), quarters -> staged ms: 16 rows 2.73 -> 2.10,
+  // 32 rows 2.80 -> 2.27, 33 rows 2.82 -> 2.24, 34 rows 2.80 -> 3.01, 64 rows
+  // 2.90 -> 3.13. Three quarters of the cores keeps a margin below that edge.
+  return family_ == GpuClass::Apple7 && rows * 4 <= gpuCores_ * 3;
+}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
     AttentionVariant variant) const {
   return PagedAttention::prefillPlan(rows, historyTokens, queryHeads, layout,
-                                     calibration().attention.prefillPagesPerSplit, variant);
+                                     calibration().attention.prefillPagesPerSplit, variant, attentionTile_, gpuCores_);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant);
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant, attentionTile_);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

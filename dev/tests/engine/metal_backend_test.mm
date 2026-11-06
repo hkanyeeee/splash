@@ -1,4 +1,5 @@
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
+#include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -693,8 +694,14 @@ void dispatchProfilingCoversEveryCommand(const std::string &metallibPath) {
     rejects([&] { (void)backend.submitCommandAsync(Command{pair, {&step, 1}}); },
             "does not replay event steps",
             "profiling replayed a command without its event steps");
+    // A Break is only a command boundary, which profiled dispatches have anyway.
+    const EventStep split{1, {}, 0, EventStep::Kind::Break};
+    auto broken = backend.submitCommandAsync(Command{pair, {&split, 1}});
+    require(broken.ready() && BackendInstrumentation::takeDispatchProfile(backend).size() == 2,
+            "a command split by a Break was not profiled");
+    (void)broken.wait();
     BackendInstrumentation::setDispatchProfiling(backend, false);
-    require(*value == 5, "profiling did not run each dispatch exactly once");
+    require(*value == 7, "profiling did not run each dispatch exactly once");
     std::cout << "PASS dispatch profiling covers every command\n";
 }
 
@@ -720,7 +727,7 @@ void preparedPipelinesCompileAhead(const std::string &metallibPath) {
     ComputeDispatch oversized = dispatch;
     oversized.threadsPerThreadgroup = {4096, 1, 1};
     rejects([&] { backend.preparePipelines({&oversized, 1}); },
-            "threadsPerThreadgroup exceeds pipeline capability",
+            "threadsPerThreadgroup 4096 exceeds pipeline 'test_add_u32' capability",
             "a dispatch past its pipeline's thread limit was prepared");
     ComputeDispatch missing = dispatch;
     missing.pipelineName = "does_not_exist";
@@ -1728,6 +1735,47 @@ void malformedEventStepsRefused(const std::string &metallibPath) {
     std::cout << "PASS malformed event steps are refused\n";
 }
 
+// A command split into command buffers by breaks (CommandGraph::split), as
+// prefill ends one at every layer: every buffer runs, and a command of as
+// many buffers as the queue holds completes; a break that names an
+// event, and one buffer more, are refused before anything is submitted.
+void commandBreaksSplitBuffers(const std::string &metallibPath) {
+    using enum EventStep::Kind;
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    CommandGraph graph;
+    std::vector<ComputeDispatch> chain;
+    for (uint32_t index = 0; index < 512; ++index) {
+        graph.add("test_add_u32", {buffer}, {1, 1, 1}, {1, 1, 1});
+        chain.push_back(addition(buffer, count, one));
+        if (index + 1 < 512) graph.split();
+    }
+    const std::vector<EventStep> steps(graph.command().events.begin(), graph.command().events.end());
+    require(steps.size() == 511 && steps.front().kind == Break && steps.front().before == 1 &&
+                steps.back().kind == Break && steps.back().before == 511,
+            "a graph's splits did not become breaks after their dispatches");
+    const std::vector<ComputeDispatch> dispatches(2, addition(buffer, count, one));
+    const SharedEvent event = backend.newSharedEvent();
+    rejects([&] { (void)backend.submitCommandAsync(Command{dispatches, std::vector<EventStep>{{1, event, 1, Break}}}); },
+            "takes no event", "a break naming an event was submitted");
+    std::vector<EventStep> breaks(512, EventStep{1, {}, 0, Break});
+    rejects([&] { (void)backend.submitCommandAsync(Command{dispatches, breaks}); },
+            "more command buffers than its queue holds", "a command of 513 buffers was submitted");
+    require(backend.healthy() && BackendInstrumentation::submittedCommands(backend) == 0,
+            "a refused break marked the backend unhealthy or submitted work");
+    auto submitted =
+        std::async(std::launch::async, [&] { return backend.submitCommandAsync(Command{chain, steps}).wait(); });
+    require(submitted.wait_for(std::chrono::seconds(30)) == std::future_status::ready,
+            "a command of 512 buffers did not finish");
+    const CommandTiming timing = submitted.get();
+    require(*value == 512 && timing.gpuSeconds > 0.0 && backend.healthy(),
+            "a command split by breaks did not run every buffer");
+    std::cout << "PASS command buffer breaks split a command\n";
+}
+
 // A command of 100 signal and wait pairs, more command buffers than a queue
 // holds by default, runs in order against an agent that answers each signal:
 // a signal follows the work before it, and the work after its wait waits for
@@ -1862,6 +1910,10 @@ std::optional<bool> spinCheck(MetalBackend &backend, std::string_view test) {
     return std::nullopt;
 }
 
+// Whether awake host steps spin on this GPU: Apple7/8 run them as plain
+// ones, unchecked (checkHostStepSpin).
+bool spinsOnThisGpu(const MetalBackend &backend) { return backend.capabilities().appleGpuFamily >= 9; }
+
 // How long the GPU work after a host step may take to start: the spin's bound
 // (60 ms or more) is far above both, and a GPU idle through the step only wakes
 // up, at times slowly under the validation layer or other work.
@@ -1880,7 +1932,7 @@ struct HostStepResumes {
 // fifty of them (more command buffers than a queue holds by default) runs
 // them in order, keeping the GPU awake or not, and on the backend's runner,
 // never on the submitting thread; a GPU spin through an awake step sees the
-// CPU end it on this system (host_step.metal).
+// CPU end it on this system (host_step.metal), and Apple7/8 run none.
 // Once the command completed, before its wait returns, each step's round trip
 // reached its `timed`: its work as long as the step took, and pickup and
 // resume within a second. A step without work is refused. Returns the longest
@@ -1896,7 +1948,7 @@ HostStepResumes hostSteps(const std::string &metallibPath) {
     const std::vector<ComputeDispatch> dispatches(kSteps + 1, addition(buffer, count, one));
     const std::thread::id submitter = std::this_thread::get_id();
     const std::optional<bool> spins = spinCheck(backend, "the awake host steps' resume");
-    require(spins.value_or(true), "a GPU spin through an awake host step did not see the CPU end it");
+    require(spinsOnThisGpu(backend) ? spins.value_or(true) : spins == false, "a GPU spin through an awake host step did not see the CPU end it");
     HostStepResumes resumes{.spins = spins.value_or(false)};
     for (const bool awake : {false, true}) {
         const std::string kind = awake ? "awake" : "plain";
@@ -2012,7 +2064,7 @@ std::optional<double> firstCommandWithAnAwakeHostStep(const std::string &metalli
             "an awake host step in a fresh backend's first command did not run between its work");
     // What the check made of the first command, before anything checks again.
     const std::optional<bool> spins = BackendInstrumentation::hostStepSpinDecision(backend);
-    require(spins.value_or(true), "a GPU spin through an awake host step did not see the CPU end it");
+    require(spinsOnThisGpu(backend) ? spins.value_or(true) : spins == false, "a GPU spin through an awake host step did not see the CPU end it");
     if (!spins) {
         std::cout << "SKIP a fresh backend's first awake host step: the GPU stayed too busy for the spin check "
                      "to decide\n";
@@ -2080,6 +2132,19 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
     const fs::path spinLibrary = directory.path() / "host-step.metallib";
     fs::copy_file(metallibPath, library);
     {
+        writeFile(spinLibrary, "not a metallib");
+        MetalBackend backend(library.string());
+        if (!spinsOnThisGpu(backend)) {
+            const std::string warnings = capturedStderr([&] { runAwakeSteps(backend); });
+            require(warnings.find(kNoSpinWarning) == std::string::npos && backend.healthy() &&
+                        BackendInstrumentation::awakeHostStepsSpin(backend) == false,
+                    "awake host steps on Apple7/8 checked their spin, warned or spun: " + warnings);
+            std::cout << "PASS awake host steps run as plain ones on Apple7/8, unchecked\n";
+            return;
+        }
+        fs::remove(spinLibrary);
+    }
+    {
         MetalBackend backend(library.string());
         fallsBack(backend, spinLibrary.string());
     }
@@ -2128,6 +2193,12 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
 // started after their release: a later check spins.
 void hostStepSpinEndedEarlyDecidesNothing(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
+    if (!spinsOnThisGpu(backend)) {
+        require(BackendInstrumentation::awakeHostStepsSpin(backend) == false,
+                "Apple7/8 did not disable the host-step spin");
+        std::cout << "PASS Apple7/8 disables host-step spin checks\n";
+        return;
+    }
     std::optional<bool> decision;
     std::string warnings;
     {
@@ -2178,6 +2249,12 @@ CFTimeInterval recordSpinRun(id command, SEL selector) {
 // once (endedEarly), so the check runs all of them.
 void hostStepCheckSpinsOutlastTheirRelease(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
+    if (!spinsOnThisGpu(backend)) {
+        require(BackendInstrumentation::awakeHostStepsSpin(backend) == false,
+                "Apple7/8 did not disable the host-step spin");
+        std::cout << "PASS Apple7/8 does not issue bounded host-step spins\n";
+        return;
+    }
     checker = std::this_thread::get_id();
     spinBounds.clear();
     spinRuns.clear();
@@ -2636,7 +2713,7 @@ void run(const std::string &metallibPath) {
             "recommended working set capability is missing");
     require(capabilities.maxBufferLengthBytes > 0,
             "maximum buffer length capability is missing");
-    require(capabilities.appleGpuFamily >= 9,
+    require(capabilities.appleGpuFamily >= splash::DeviceCapabilities::kMinimumAppleGpuFamily,
             "Apple GPU family capability is missing");
     require(capabilities.maxThreadgroupMemoryBytes >= 32 * 1024,
             "threadgroup memory capability is insufficient");
@@ -2915,6 +2992,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"wrappedMemory", [] { wrappedMemory(metallib); }},
         {"sharedEventNotifies", [] { sharedEventNotifies(metallib); }},
         {"eventSteps", [] { eventSteps(metallib); }},
+        {"commandBreaksSplitBuffers", [] { commandBreaksSplitBuffers(metallib); }},
         {"eventPairsRunInOrder", [] { eventPairsRunInOrder(metallib); }},
         {"malformedEventStepsRefused", [] { malformedEventStepsRefused(metallib); }},
         {"failedBufferStillSignals", [] { failedBufferStillSignals(metallib); }},

@@ -21,6 +21,13 @@ struct GdnConvHistory {
     return source < Carried ? carried[source * conv_dim + channel]
                             : rows[(source - Carried) * rows_width + channel];
   }
+  // Row `row` itself, for a caller that reads many channels of it.
+  device const bfloat *row(uint row) const {
+    constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
+    const uint source = consumed + row;
+    return source < Carried ? carried + source * conv_dim
+                            : rows + (source - Carried) * rows_width;
+  }
 };
 
 // Causal convolution of one channel at one token of the command, reading the

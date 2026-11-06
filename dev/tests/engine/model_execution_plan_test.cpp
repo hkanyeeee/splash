@@ -202,6 +202,32 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
     }
 }
 
+// A restricted runtime stores only its active lanes on the register path,
+// while a projection needing a wider tile keeps the padding that tile writes.
+void checkRestrictedLaneStorage() {
+  auto geometry = model::RuntimeGeometry::from(loadedModel<model::Qwen3_8Weights>(), kv::Format::BFloat16,
+                                               ops::GdnStateFormat::BFloat16);
+  DeviceCapabilities device;
+  device.appleGpuFamily = 8;
+  device.gpuCoreCount = 30;
+  const ops::ExecutionPlans plans(device);
+  require(model::decodeStorageLaneCount(geometry, plans) == model::kLaneCount,
+          "the Apple8 register path reserved unused runtime lanes");
+  const uint64_t compact = model::decodeArenaBaseBytes(geometry, plans);
+  // Apple10's low-bit vocabulary head uses sixteen rows even for one lane.
+  geometry.target.decodeProjections.push_back({248320, 5120, false, false, ops::FormatClass::UnderFourBits, 32});
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans padded(device);
+  require(model::decodeStorageLaneCount(geometry, padded) >= std::max(2u, model::kLaneCount),
+          "the restricted runtime omitted a staged tile's padding rows");
+  require(model::decodeArenaBaseBytes(geometry, padded) >= compact,
+          "a padded decode arena is smaller than a compact one");
+  if constexpr (model::kLaneCount < SPLASH_MAXIMUM_BATCH_WIDTH)
+    require(model::decodeArenaBaseBytes(geometry, padded) > compact,
+            "restricting the runtime did not save any decode storage");
+}
+
 // A model served with YaRN reaches the runtime's geometry with its scaling
 // and the window it serves, which everything sized by the context follows; a
 // descriptor whose window is not the one its scaling serves is refused.
@@ -389,7 +415,7 @@ void checkPrefillAttentionHistory() {
   device.gpuCoreCount = 20;
   const ops::ExecutionPlans plans(device);
   model::QwenTargetPrefillSequence sequence;
-  sequence.rows = 300;
+  sequence.rows = std::min(300u, model::kPrefillRows / 4);
   const auto splitsAfter = [&](uint32_t history) {
     sequence.chunk.committed_tokens = history;
     return model::prefillAttentionPlan(plans, geometry.target, sequence).splits;
@@ -399,6 +425,7 @@ void checkPrefillAttentionHistory() {
 
 int main() {
   try {
+    checkRestrictedLaneStorage();
     checkPrefillAttentionHistory();
     checkUnsizedProjection();
     checkCaptureLayers();

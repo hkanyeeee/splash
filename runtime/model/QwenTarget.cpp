@@ -279,9 +279,30 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
         step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
                              kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
                              {sequence.pageTable, step.kvLayers[layer]});
-    ops::PagedAttention::addPrefill(step.graph, attended.kv, queries, attentionRows, b.attentionPartials,
-                                    b.attentionStatistics, attended.table, sequence.chunk, plans[index],
-                                    blocks.empty() ? ops::AttentionBlocks{} : blocks[index], mixer.sinks);
+    // At long history the chunk attends in pieces of rows, each a short
+    // dispatch (ops::prefillAttentionPieceRows); a piece's queries and output
+    // start its first row into every KV head's block of the stride. Sparse
+    // attention, whose block lists follow the chunk's tiles, attends whole.
+    const uint32_t pieceRows = blocks.empty() && backend_.capabilities().appleGpuFamily < 9
+                                   ? ops::prefillAttentionPieceRows(sequence.chunk.committed_tokens, sequence.rows)
+                                   : sequence.rows;
+    const uint64_t pieceRowBytes = uint64_t{geometry_.attentionQueryHeads / geometry_.attentionKvHeads} *
+                                   geometry_.attentionHeadDimension * sizeof(uint16_t);
+    for (uint32_t begin = 0; begin < sequence.rows; begin += pieceRows) {
+      kv::ChunkedPrefillParams piece = sequence.chunk;
+      piece.committed_tokens += begin;
+      piece.chunk_tokens = std::min(pieceRows, sequence.rows - begin);
+      const uint64_t offset = begin * pieceRowBytes;
+      ops::PagedAttention::addPrefill(
+          step.graph, attended.kv, begin ? backend_.view(queries, offset, queryBytes - offset) : queries,
+          begin ? backend_.view(attentionRows, offset, queryBytes - offset) : attentionRows, b.attentionPartials,
+          b.attentionStatistics, attended.table, piece,
+          piece.chunk_tokens == sequence.rows
+              ? plans[index]
+              : operators_.prefillAttention(piece.chunk_tokens, piece.committed_tokens, geometry_.attentionQueryHeads, geometry_.kvLayout,
+                                            variant),
+          blocks.empty() ? ops::AttentionBlocks{} : blocks[index], mixer.sinks);
+    }
     ops::PagedAttention::addPrefillGate(
         step.graph, u16Rows(b.fullPacked, sequence, geometry_.packedFullWidth), attentionRows,
         u16Rows(b.attentionHidden, sequence, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,

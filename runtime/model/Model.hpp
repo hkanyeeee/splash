@@ -604,7 +604,7 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 // inspectModelRoot checks a DFlash2 checkpoint's config for. Cache-page and
 // attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
-  static constexpr uint32_t maximumBatchWidth = SPLASH_MAXIMUM_BATCH_WIDTH;
+  static constexpr uint32_t maximumBatchWidth = SPLASH_RUNTIME_MAXIMUM_BATCH_WIDTH;
   // The rows of a prefill chunk. A prefill command's lanes fill its chunks
   // one after another, and the runtime lets at most one lane's rows run past
   // a chunk: a prefill group has one scratch GDN cell for the state between
@@ -692,6 +692,9 @@ struct ModelMemoryPlan final {
   uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
+  // Room beside the active lane for the state its next turn resumes from.
+  // This is elastic state memory, not a permanently charged arena.
+  uint64_t continuationStatePlannedAllocatedBytes = 0;
 };
 
 // Fixed reserves the memory plan carries beside the planned arenas: Metal

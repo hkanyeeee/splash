@@ -16,11 +16,14 @@ using namespace metal;
 // Writes the lane's two values of span `span` of row `row` into the row's
 // 8-row tile of the Table16 table the register-tile projection reading the
 // rows takes (gguf_sg::Table16, as decode_linear_gguf_prepare writes it).
-inline void hyper_table16_write(device bfloat *table, device float *sums, uint width, uint span, uint row,
-                                uint lane, bfloat a, bfloat b) {
-  gguf_sg::Table16::write(table + ulong(row / gguf_sg::kRows) * width * gguf_sg::kRows,
-                          sums + ulong(row / gguf_sg::kRows) * gguf_sg::Table16::sums_per_tile(width), width,
-                          span, row % gguf_sg::kRows, lane, a, b);
+// Table is gguf_sg::Table16, or Table16F on Apple7/8, whose projections read
+// an fp32 table.
+template <class Table>
+inline void hyper_table16_write(device typename Table::Elem *table, device float *sums, uint width, uint span,
+                                uint row, uint lane, bfloat a, bfloat b) {
+  Table::write(table + ulong(row / gguf_sg::kRows) * width * gguf_sg::kRows,
+               sums + ulong(row / gguf_sg::kRows) * Table::sums_per_tile(width), width, span, row % gguf_sg::kRows,
+               lane, a, b);
 }
 
 // The first mix step of a row: each stream's RMS norm times the mix's norm
@@ -82,20 +85,31 @@ inline void hyper_norm_loaded_row(device const float *streams, device const floa
 // loaded row's threadgroup in stream q's sum and in injection weight q's dot:
 // each of its threads sums its values of stream q, then runs injection dot q
 // over every stream's values in order, and writes stream q's normalized
-// values.
+// values. Staged (Apple7/8's, hyper_connection_norm_staged) works out each
+// stream's values once instead of in every quarter: stream s's quarter leaves
+// them in threadgroup memory, kStagedStreams streams at a time (all four would
+// be 40 KB, over the 32 KB a threadgroup has), where each quarter's thread tid
+// reads the values at its own positions. The dots run in the same order, so
+// both kernels' outputs are bit for bit the same.
+constant constexpr uint kStagedStreams = 2;
+template <bool Staged>
 inline void hyper_norm_quarter_row(device const float *streams, device const float *norm,
                                    device const float *inject, device bfloat *normalized,
                                    device float *weights, constant HyperConnectionParams &p, uint row,
                                    uint thread_id, uint lane, uint simdgroup, threadgroup float *scratch,
-                                   threadgroup float *scales) {
+                                   threadgroup float *scales, threadgroup float *staged) {
   if (row >= p.rows) return;
   const uint q = thread_id / kRowThreads, tid = thread_id % kRowThreads;
   const uint width = kStreams * kNormHidden;
   device const float *x = streams + ulong(row) * width;
-  float mine[kNormValues];
-  for (uint i = 0; i < kNormValues; ++i) mine[i] = x[q * kNormHidden + tid + i * kRowThreads];
+  // Values are read again where they are used rather than held across the
+  // barriers: held, they cap the kernel below its threads on Apple7/8 (896 on
+  // an M1 Max). The arithmetic and its order are unchanged.
   float sum = 0.0f;
-  for (uint i = 0; i < kNormValues; ++i) sum += mine[i] * mine[i];
+  for (uint i = 0; i < kNormValues; ++i) {
+    const float value = x[q * kNormHidden + tid + i * kRowThreads];
+    sum += value * value;
+  }
   // The threadgroup's simdgroup `simdgroup` is quarter q's simdgroup
   // simdgroup % kSimdgroups.
   sum = simd_sum(sum);
@@ -112,24 +126,37 @@ inline void hyper_norm_quarter_row(device const float *streams, device const flo
   if (!p.inject) {
     for (uint i = 0; i < kNormValues; ++i) {
       const uint c = q * kNormHidden + tid + i * kRowThreads;
-      out[c] = bfloat(mine[i] * scales[q] * norm[c]);
+      out[c] = bfloat(x[c] * scales[q] * norm[c]);
+    }
+  } else if constexpr (Staged) {
+    device const float *w = inject + ulong(q) * width;
+    for (uint first = 0; first < kStreams; first += kStagedStreams) {
+      if (q - first < kStagedStreams) {
+        threadgroup float *values = staged + (q - first) * kNormHidden;
+        for (uint i = 0; i < kNormValues; ++i) {
+          const uint c = q * kNormHidden + tid + i * kRowThreads;
+          const float v = x[c] * scales[q] * norm[c];
+          out[c] = bfloat(v);
+          values[tid + i * kRowThreads] = v;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint s = first; s < first + kStagedStreams; ++s) {
+        threadgroup const float *values = staged + (s - first) * kNormHidden;
+        for (uint i = 0; i < kNormValues; ++i)
+          dot += w[s * kNormHidden + tid + i * kRowThreads] * values[tid + i * kRowThreads];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   } else {
     device const float *w = inject + ulong(q) * width;
     for (uint s = 0; s < kStreams; ++s) {
       const float scale = scales[s];
-      float xv[kNormValues], ns[kNormValues], ws[kNormValues];
       for (uint i = 0; i < kNormValues; ++i) {
         const uint c = s * kNormHidden + tid + i * kRowThreads;
-        xv[i] = x[c];
-        ns[i] = norm[c];
-        ws[i] = w[c];
-      }
-      for (uint i = 0; i < kNormValues; ++i) {
-        const uint c = s * kNormHidden + tid + i * kRowThreads;
-        const float v = xv[i] * scale * ns[i];
+        const float v = x[c] * scale * norm[c];
         if (s == q) out[c] = bfloat(v);
-        dot += ws[i] * v;
+        dot += w[c] * v;
       }
     }
   }
@@ -158,15 +185,26 @@ kernel void hyper_connection_norm_loaded(HYPER_NORM_ARGUMENTS, constant HyperCon
   hyper_norm_loaded_row(streams, norm, inject, normalized, weights, p, row, tid, lane, sg, scratch);
 }
 
-kernel void hyper_connection_norm_quarters(HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(5)]],
+[[max_total_threads_per_threadgroup(HYPER_CONNECTION_NORM_QUARTER_THREADS)]] kernel void hyper_connection_norm_quarters(HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(5)]],
                                            uint row [[threadgroup_position_in_grid]],
                                            uint thread_id [[thread_index_in_threadgroup]],
                                            uint lane [[thread_index_in_simdgroup]],
                                            uint simdgroup [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kStreams * kSimdgroups];
   threadgroup float scales[kStreams];
-  hyper_norm_quarter_row(streams, norm, inject, normalized, weights, p, row, thread_id, lane, simdgroup, scratch,
-                         scales);
+  hyper_norm_quarter_row<false>(streams, norm, inject, normalized, weights, p, row, thread_id, lane, simdgroup,
+                                scratch, scales, nullptr);
+}
+
+[[max_total_threads_per_threadgroup(HYPER_CONNECTION_NORM_QUARTER_THREADS)]] kernel void hyper_connection_norm_staged(
+    HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(5)]], uint row [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kStreams * kSimdgroups];
+  threadgroup float scales[kStreams];
+  threadgroup float staged[kStagedStreams * kNormHidden];
+  hyper_norm_quarter_row<true>(streams, norm, inject, normalized, weights, p, row, thread_id, lane, simdgroup,
+                               scratch, scales, staged);
 }
 
 #undef HYPER_NORM_ARGUMENTS
@@ -181,21 +219,28 @@ kernel void hyper_connection_low(device bfloat *low [[buffer(0)]],
 
 // The same values into the up projection's table alone (a decode step's
 // rows): a threadgroup per row, a simdgroup per 64-value span.
-kernel void hyper_connection_low_table16(device const bfloat *low [[buffer(0)]],
-                                         device bfloat *table [[buffer(1)]],
-                                         device float *sums [[buffer(2)]],
-                                         constant HyperConnectionParams &p [[buffer(3)]],
-                                         uint row [[threadgroup_position_in_grid]],
-                                         uint lane [[thread_index_in_simdgroup]],
-                                         uint sg [[simdgroup_index_in_threadgroup]]) {
+template <class Table>
+inline void hyper_low_table(device const bfloat *low, device typename Table::Elem *table, device float *sums,
+                            constant HyperConnectionParams &p, uint row, uint lane, uint sg) {
   if (row >= p.rows) return;
   device const bfloat *x = low + ulong(row) * p.rank;
   for (uint g = sg; g < p.rank / 64; g += kSimdgroups) {
     const uint k = g * 64 + 2 * lane;
-    hyper_table16_write(table, sums, p.rank, g, row, lane, bfloat(splash_silu(float(x[k]) / p.streams)),
-                        bfloat(splash_silu(float(x[k + 1]) / p.streams)));
+    hyper_table16_write<Table>(table, sums, p.rank, g, row, lane, bfloat(splash_silu(float(x[k]) / p.streams)),
+                               bfloat(splash_silu(float(x[k + 1]) / p.streams)));
   }
 }
+
+#define HYPER_LOW_TABLE(Name, Table)                                                                             \
+  kernel void Name(device const bfloat *low [[buffer(0)]], device Table::Elem *table [[buffer(1)]],              \
+                   device float *sums [[buffer(2)]], constant HyperConnectionParams &p [[buffer(3)]],             \
+                   uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],           \
+                   uint sg [[simdgroup_index_in_threadgroup]]) {                                                 \
+    hyper_low_table<Table>(low, table, sums, p, row, lane, sg);                                                 \
+  }
+HYPER_LOW_TABLE(hyper_connection_low_table16, gguf_sg::Table16)
+HYPER_LOW_TABLE(hyper_connection_low_table16f, gguf_sg::Table16F)
+#undef HYPER_LOW_TABLE
 
 // The block's input: the mean over the streams of the normalized streams
 // gated by sigmoid of the mix's up projection.
@@ -217,17 +262,11 @@ kernel void hyper_connection_mix(device const bfloat *normalized [[buffer(0)]],
 // The mix with the next projection's table (a decode step's rows, hidden a
 // multiple of the threadgroup): the threadgroup's 256 values are four
 // 64-value spans, which its first four simdgroups write.
-kernel void hyper_connection_mix_table16(device const bfloat *normalized [[buffer(0)]],
-                                         device const bfloat *gate [[buffer(1)]],
-                                         device bfloat *mixed [[buffer(2)]],
-                                         device bfloat *table [[buffer(3)]],
-                                         device float *sums [[buffer(4)]],
-                                         constant HyperConnectionParams &p [[buffer(5)]],
-                                         uint2 group [[threadgroup_position_in_grid]],
-                                         uint tid [[thread_index_in_threadgroup]],
-                                         uint lane [[thread_index_in_simdgroup]],
-                                         uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup bfloat values[kRowThreads];
+template <class Table>
+inline void hyper_mix_table(device const bfloat *normalized, device const bfloat *gate, device bfloat *mixed,
+                            device typename Table::Elem *table, device float *sums,
+                            constant HyperConnectionParams &p, uint2 group, uint tid, uint lane, uint sg,
+                            threadgroup bfloat *values) {
   const uint row = group.x, d = group.y * kRowThreads + tid;
   if (row >= p.rows) return;
   const ulong base = ulong(row) * p.streams * p.hidden + d;
@@ -240,9 +279,22 @@ kernel void hyper_connection_mix_table16(device const bfloat *normalized [[buffe
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (sg >= kRowThreads / 64) return;
   const uint k = sg * 64 + 2 * lane;
-  hyper_table16_write(table, sums, p.hidden, group.y * (kRowThreads / 64) + sg, row, lane, values[k],
-                      values[k + 1]);
+  hyper_table16_write<Table>(table, sums, p.hidden, group.y * (kRowThreads / 64) + sg, row, lane, values[k],
+                             values[k + 1]);
 }
+
+#define HYPER_MIX_TABLE(Name, Table)                                                                             \
+  kernel void Name(device const bfloat *normalized [[buffer(0)]], device const bfloat *gate [[buffer(1)]],       \
+                   device bfloat *mixed [[buffer(2)]], device Table::Elem *table [[buffer(3)]],                  \
+                   device float *sums [[buffer(4)]], constant HyperConnectionParams &p [[buffer(5)]],             \
+                   uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],       \
+                   uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {        \
+    threadgroup bfloat values[kRowThreads];                                                                     \
+    hyper_mix_table<Table>(normalized, gate, mixed, table, sums, p, group, tid, lane, sg, values);              \
+  }
+HYPER_MIX_TABLE(hyper_connection_mix_table16, gguf_sg::Table16)
+HYPER_MIX_TABLE(hyper_connection_mix_table16f, gguf_sg::Table16F)
+#undef HYPER_MIX_TABLE
 
 // Every stream plus the block's output scaled by the stream's injection weight.
 kernel void hyper_connection_combine(device float *streams [[buffer(0)]],

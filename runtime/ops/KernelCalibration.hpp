@@ -114,6 +114,7 @@ struct KernelCalibration final {
   FloatTileCalibration floatTile;
   MoeCalibration moe;
   AttentionCalibration attention;
+  bool legacySimdgroup = false;
 
   [[nodiscard]] static KernelCalibration of(const DeviceCapabilities &device) noexcept;
 };
@@ -213,6 +214,16 @@ inline constexpr ProjectionCalibration kApple9Projection{
     .sixteenRowBelowBits16 = 0,
     .stagedPrefillRows = kApple9StagedPrefillRows,
 };
+// Apple7/8 stage with simdgroup MMA and register with FP32 activation tables.
+// Their staged K partitions keep 512 inputs and seek 24 threadgroups per core.
+inline constexpr SplitTier kApple7StagedTiers[] = {{24, 512}};
+inline constexpr ProjectionCalibration kApple7Projection = [] {
+  ProjectionCalibration row = kApple9Projection;
+  row.stagedSplits = TierLaw{kApple7StagedTiers};
+  for (auto &format : row.decodeRegister.belowQuarters) format.fill(kAlways);
+  row.stagedPrefillRows = 32;
+  return row;
+}();
 inline constexpr ProjectionCalibration kApple9SmallProjection = [] {
   ProjectionCalibration row = kApple9Projection;
   row.stagedPrefillRows = kApple9SmallStagedPrefillRows;
@@ -274,6 +285,8 @@ inline constexpr AttentionCalibration kApple9SmallAttention{64};
 
 inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device) noexcept {
   const uint32_t cores = device.plannedGpuCores();
+  if (device.gpuClass() == GpuClass::Apple7)
+    return {cores, kApple7Projection, kApple9FloatTile, kApple9Moe, kAttention, true};
   if (device.gpuClass() == GpuClass::Apple10)
     return {cores, kApple10Projection, kApple10FloatTile, kApple10Moe, kAttention};
   const bool small = cores <= kApple9SmallGpuCores;

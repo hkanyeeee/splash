@@ -320,29 +320,47 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   return result;
 }
 
+namespace {
+template <class Include>
+void forDecodeProjections(const RuntimeGeometry &geometry, Include include) {
+  const auto &d = geometry.draft;
+  // Includes the vocabulary head shared with the draft.
+  for (const auto &p : geometry.target.decodeProjections) include(p);
+  for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
+       {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
+       {d.hiddenSize, d.attentionSize},
+       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
+       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
+    include(shape);
+}
+} // namespace
+
+uint32_t decodeStorageLaneCount(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
+  if constexpr (kLaneCount == SPLASH_MAXIMUM_BATCH_WIDTH) return kLaneCount;
+  uint32_t rows = kLaneCount * kDecodeRows;
+  forDecodeProjections(geometry, [&](ops::ProjectionShape shape) {
+    for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes)
+      rows = std::max(rows, operators.linear().decodeStorageRows(lanes * kDecodeRows, shape));
+  });
+  return rows / kDecodeRows;
+}
+
 uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                              const ops::ExecutionPlans &operators) {
+  const uint32_t storageLanes = decodeStorageLaneCount(geometry, operators);
   uint64_t bytes = 0;
   for (uint64_t value : decodeTensorBytes(geometry, operators)) {
-    bytes = checkedAdd(
-        bytes, alignUp(checkedMultiply(value, kLaneCount, "decode tensor")),
-        "decode arena");
+    bytes = checkedAdd(bytes, alignUp(checkedMultiply(value, storageLanes, "decode tensor")), "decode arena");
   }
   return bytes;
 }
 
 ops::LinearScratchSize DecodeArena::linearScratchSize(
     const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
-  const auto &d = geometry.draft;
   ops::LinearScratchSize result;
-  // Includes the vocabulary head shared with the draft.
-  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
-  for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
-       {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
-       {d.hiddenSize, d.attentionSize},
-       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
+  forDecodeProjections(geometry, [&](ops::ProjectionShape shape) {
     result.include(operators.linear().decodeScratchSize(shape));
+  });
   return result;
 }
 

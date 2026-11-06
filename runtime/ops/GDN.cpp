@@ -191,7 +191,8 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                              GdnShape shape, uint32_t lanes, uint32_t layer,
                              GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || buffers.tapeLanes.size() < lanes)
+  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || buffers.tapeLanes.size() < lanes ||
+      buffers.currentStates.size() < lanes || buffers.nextStates.size() < lanes)
     throw std::invalid_argument("invalid GDN decode geometry");
   const CompiledGdn &kernel = compiledGdn(shape);
   // Lane l's rows of the packed and hidden rows are rows [8 l, 8 l + 8).

@@ -137,7 +137,11 @@ ChunkTimings Measurement::chunks(AneFfn &split) {
     return static_cast<uint32_t>(std::clamp<size_t>(kCommandRows / chunk, 1, layers_.size() - 1));
   };
   const auto gpu = [&](uint32_t chunk) { return ChunkTimings::Gpu{chunk, layer(layers_, count(chunk), chunk)}; };
-  ChunkTimings timings{{gpu(rows.front()), gpu(rows.back())}, {}};
+  // A 512-row memory profile has one ANE function. Time the GPU alone at
+  // half that height as well, so calibration and the breaker still fit a
+  // line through two distinct row counts without shortening the ANE chunk.
+  const uint32_t leastGpuRows = rows.size() == 1 ? rows.front() / 2 : rows.front();
+  ChunkTimings timings{{gpu(leastGpuRows), gpu(rows.back())}, {}};
   const auto &[low, high] = timings.gpu;
   const double slope = (high.milliseconds - low.milliseconds) / (high.rows - low.rows);
   for (size_t function = rows.size(); function-- > 0;)

@@ -710,7 +710,7 @@ void ggufPlans() {
       [&] {
         (void)Linear::plan(down, {.tile = LinearTile::GgufStaged, .oneGateUpPass = true}, FloatOutput::BFloat16);
       },
-      "only a staged block gate/up decode runs gate and up in one pass", "a residual plan ran gate/up in one pass");
+      "only a staged or F32 register block gate/up decode runs gate and up in one pass", "a residual plan ran gate/up in one pass");
   // The 16-row tile holds one lane's decode rows on the staged tile only.
   for (const auto &[w, config] :
        {std::pair{down, LinearConfig{.tile = LinearTile::GgufRegister, .sixteenRows = true}},

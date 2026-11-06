@@ -42,11 +42,14 @@ inline uint2 klogical(uint k) {
 
 // One simdgroup writes one span of one row; the lane holds elements
 // 2 lane, 2 lane + 1.
-inline void write_input(device bfloat *table, device float *sums, uint width, uint span,
+// T is the table's element: bf16, or fp32 on Apple7/8 (Table16F), which holds every bf16 value and saves the
+// register tile a widening per operand.
+template <class T>
+inline void write_input(device T *table, device float *sums, uint width, uint span,
                         uint row, uint lane, bfloat a, bfloat b) {
   const uint2 l = klogical(2 * lane);
-  table[span * GGUF_TABLE16_SPAN_VALUES + xt_offset(l.x, l.y, row)] = a;
-  table[span * GGUF_TABLE16_SPAN_VALUES + xt_offset(l.x, l.y + 1, row)] = b;
+  table[span * GGUF_TABLE16_SPAN_VALUES + xt_offset(l.x, l.y, row)] = T(a);
+  table[span * GGUF_TABLE16_SPAN_VALUES + xt_offset(l.x, l.y + 1, row)] = T(b);
   float s = float(a) + float(b);
   s += simd_shuffle_xor(s, 1u);
   s += simd_shuffle_xor(s, 2u);
@@ -56,12 +59,15 @@ inline void write_input(device bfloat *table, device float *sums, uint width, ui
   if ((lane & 15) == 0) sums[table16_sums32_offset(width) + (span * (GGUF_TABLE16_SPAN_SUMS / kRows) + lane / 16) * kRows + row] = s32;
 }
 
-struct Table16 {
+template <class T> struct Table16Of {
+  typedef T Elem;
   static ulong sums_per_tile(uint width) { return table16_sums_per_tile(width); }
-  static void write(device bfloat *table, device float *sums, uint width, uint span, uint row,
+  static void write(device T *table, device float *sums, uint width, uint span, uint row,
                     uint lane, bfloat a, bfloat b) {
     write_input(table, sums, width, span, row, lane, a, b);
   }
 };
+typedef Table16Of<bfloat> Table16;
+typedef Table16Of<float> Table16F;
 
 } // namespace gguf_sg

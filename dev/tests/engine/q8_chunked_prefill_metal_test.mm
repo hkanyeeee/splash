@@ -20,6 +20,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace splash::kv;
@@ -322,6 +323,44 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
              threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
 }
 
+// The chunk's attention in pieces of `pieceRows` rows, as QwenTarget encodes
+// it at long history: each piece starts its queries and output its first row
+// into every KV head's block of the stride, after the rows before it.
+void encodeAttentionPieces(id<MTLComputeCommandEncoder> encoder,
+                           const AttentionPipelines &pipelines, const Case &data,
+                           uint32_t pieceRows, uint32_t splitThreads) {
+  const uint64_t rowBytes =
+      uint64_t{kQueryHeads / kKvHeads} * kHeadDimension * sizeof(BFloat16Bits);
+  for (uint32_t begin = 0; begin < data.params.chunk_tokens; begin += pieceRows) {
+    const uint32_t rows = std::min(pieceRows, data.params.chunk_tokens - begin);
+    const auto plan = splash::ops::PagedAttention::prefillPlan(
+        rows, data.params.committed_tokens + begin, kQueryHeads, {1, kKvHeads, kHeadDimension}, kPagesPerSplit);
+    const PrefillAttentionParams params{
+        data.params.committed_tokens + begin, rows, data.params.chunk_stride,
+        data.params.page_table_entries, data.params.kv, plan.splits, 0, 0};
+    [encoder setComputePipelineState:pipelines.split];
+    [encoder setBuffer:data.queries offset:begin * rowBytes atIndex:0];
+    [encoder setBuffer:data.partials offset:0 atIndex:1];
+    [encoder setBuffer:data.statistics offset:0 atIndex:2];
+    [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:3];
+    [encoder setBytes:&params length:sizeof(params) atIndex:4];
+    data.pool->use(encoder, MTLResourceUsageRead);
+    [encoder dispatchThreadgroups:MTLSizeMake(plan.splitGroups.x, plan.splitGroups.y,
+                                             plan.splitGroups.z)
+               threadsPerThreadgroup:MTLSizeMake(splitThreads, 1, 1)];
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [encoder setComputePipelineState:pipelines.reduce];
+    [encoder setBuffer:data.partials offset:0 atIndex:0];
+    [encoder setBuffer:data.statistics offset:0 atIndex:1];
+    [encoder setBuffer:data.output offset:begin * rowBytes atIndex:2];
+    [encoder setBytes:&params length:sizeof(params) atIndex:3];
+    [encoder dispatchThreadgroups:MTLSizeMake(plan.reduceGroups.x, plan.reduceGroups.y,
+                                             plan.reduceGroups.z)
+               threadsPerThreadgroup:MTLSizeMake(kHeadDimension, 1, 1)];
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  }
+}
+
 float loadKey(const Case &data, uint32_t token, uint32_t head,
               uint32_t dimension) {
   uint32_t logicalPage = token / kPageTokens;
@@ -568,6 +607,50 @@ void testAttentionGeometries(id<MTLDevice> device, id<MTLCommandQueue> queue,
     [encoder endEncoding];
     finish(command);
     validateAttention(data);
+  }
+}
+
+// A chunk attended in pieces of rows matches the oracle like a whole chunk,
+// over a long history, ragged last piece and a stride past the chunk, with
+// the tensor tile and the Apple7/8 register tile (one simdgroup per eight
+// fused rows); and the piece size keeps whole chunks at short history and
+// shrinks with history.
+void testAttentionPieces(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                         id<MTLComputePipelineState> store,
+                         const AttentionPipelines &attention,
+                         const AttentionPipelines &registerTile) {
+  using splash::ops::prefillAttentionPieceRows;
+  require(prefillAttentionPieceRows(0, 2048) == 2048 &&
+              prefillAttentionPieceRows(14336, 2048) == 2048 &&
+              prefillAttentionPieceRows(30000, 2048) == 1024 &&
+              prefillAttentionPieceRows(124000, 2048) == 256 &&
+              prefillAttentionPieceRows(124000, 100) == 100 &&
+              prefillAttentionPieceRows(splash::kv::kMaximumLogicalTokens - 2048, 2048) >=
+                  splash::kv::kPrefillAttentionTileRows,
+          "prefill attention piece rows");
+  struct Geometry {
+    uint32_t committed;
+    uint32_t chunk;
+    uint32_t stride;
+    uint32_t piece;
+  };
+  const std::pair<const AttentionPipelines *, uint32_t> tiles[] = {
+      {&attention, 256}, {&registerTile, 32 * kQueryHeadsPerKvHead}};
+  for (const auto &[pipelines, threads] : tiles) {
+    for (const Geometry &geometry : {Geometry{2500, 96, 96, 32}, Geometry{70, 77, 96, 32},
+                                     Geometry{1000, 256, 256, 64}, Geometry{1000, 256, 256, 256}}) {
+      Case data = makeCase(device, geometry.committed, geometry.chunk, geometry.stride);
+      fillHistory(data);
+      fillCurrent(data);
+      id<MTLCommandBuffer> command = [queue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+      encodeStore(encoder, store, data);
+      [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      encodeAttentionPieces(encoder, *pipelines, data, geometry.piece, threads);
+      [encoder endEncoding];
+      finish(command);
+      validateAttention(data);
+    }
   }
 }
 
@@ -922,6 +1005,10 @@ void run(const char *libraryPath) {
   testContract();
   testAttentionAndDirectStore(device, queue, store, attention);
   testAttentionGeometries(device, queue, store, attention);
+  const AttentionPipelines registerTile{
+      makePipeline(device, library, "prefill_attention_q8_split_sgf"),
+      attention.reduce};
+  testAttentionPieces(device, queue, store, attention, registerTile);
   testChunkReference(device, queue, store, attention);
   testInvalidAttentionParams(device, queue, attention);
   testCommitIndexOverwrite(device, queue, store);

@@ -162,6 +162,16 @@ ChunkTimings functions(double ratio, const std::vector<std::pair<uint32_t, doubl
 // A chunk splits while its function's split layer takes at most 2% longer than the GPU alone at the chunk's rows,
 // each row count checked; the least chunk is the one from which every larger one splits.
 void testMinimumRows() {
+  // A 512-row memory profile has only that ANE function. The GPU's second
+  // measurement may be below the ANE's minimum and still bounds the split.
+  const ChunkTimings single{{{{256, 3.0}, {512, 5.0}}}, {{512, 512, 4.0}}};
+  require(minimumRows(single) == 512u, "a single-function ANE profile did not calibrate");
+  const Calibration singleCalibration{8, 512, single.gpu};
+  require(Calibration::parse(singleCalibration.text()).has_value(),
+          "a single-function calibration did not round-trip");
+  Breaker singleBreaker(single.gpu);
+  for (uint32_t command = 0; command < 2 * Breaker::kWindow; ++command)
+    require(singleBreaker.add(512, 64, 64 * 4.0).empty(), "a faster single-function split tripped its breaker");
   require(minimumRows(functions(0.5)) == 512u, "a split of every function twice as fast held back a chunk");
   require(!minimumRows(functions(0.8, {{2048, 21.0}})), "a split slower at the most rows split a chunk");
   // Function 640 at 5.5 ms: a batch of a 512-row chunk and another lane's row, 513 rows, runs it slower than the GPU

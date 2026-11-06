@@ -47,6 +47,10 @@ static_assert(sizeof(VisionQkvParams) == 8,
 // static_assert in shared/vision.metal ties the two literals together.
 #define SPLASH_VISION_ATTENTION_ROWS 32u
 #define SPLASH_VISION_ATTENTION_THREADS 128u
+// The same for vision_attention_mma (shared/vision_mma.metal, Apple7/8): eight
+// simdgroups of eight rows.
+#define SPLASH_VISION_ATTENTION_MMA_ROWS 64u
+#define SPLASH_VISION_ATTENTION_MMA_THREADS 256u
 
 struct VisionAttentionParams {
   uint32_t tokens;

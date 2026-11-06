@@ -256,6 +256,7 @@ struct EngineMemoryBreakdown {
   uint64_t visionWeightsBytes = 0;
   uint32_t maximumBatchWidth = model::ExecutionLimits::maximumBatchWidth;
   uint64_t laneStateBytes = 0;
+  uint64_t continuationStateBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;

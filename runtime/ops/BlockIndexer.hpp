@@ -8,6 +8,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/BlockIndexer.h"
 #include "ops/Normalization.hpp"
+#include "ops/PagedAttention.hpp"
 
 #include <cstdint>
 #include <span>
@@ -37,6 +38,9 @@ struct IndexerRows final {
   uint32_t topBlocks = 0;
   uint32_t maskWords = 0;
   uint32_t scoreStride = 0;
+  // The tile of the score's product: Apple7/8 take the register tile, as
+  // their attention does (ExecutionPlans::attentionTile).
+  AttentionTile scoreTile = AttentionTile::Mpp;
 };
 
 // The blocks a dispatch's lanes' rows complete, which the pool pools: lane

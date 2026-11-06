@@ -326,7 +326,7 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the grouped
 // rows (8-row tiles only). The device's MoeCalibration picks one
 // (KernelCalibration.hpp, selectMoe).
-enum class MoeGgufTile : uint8_t { Staged, Register };
+enum class MoeGgufTile : uint8_t { Staged, Register, Mma };
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {

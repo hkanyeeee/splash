@@ -118,7 +118,8 @@ void BlockIndexer::addSelect(metal::CommandGraph &graph, metal::MetalBuffer quer
   for (uint32_t offset = 0; offset < rows.rows; offset += batchRows) {
     params.row_offset = offset;
     params.rows = std::min(batchRows, rows.rows - offset);
-    graph.add("block_indexer_score", {queries, tables[0], tables[1], tables[2], tables[3], scores}, params,
+    graph.add(rows.scoreTile == AttentionTile::Register ? "block_indexer_score_sgf" : "block_indexer_score",
+              {queries, tables[0], tables[1], tables[2], tables[3], scores}, params,
               {(blocks + BLOCK_INDEXER_SCORE_BLOCKS - 1) / BLOCK_INDEXER_SCORE_BLOCKS,
                (params.rows + BLOCK_INDEXER_SCORE_ROWS - 1) / BLOCK_INDEXER_SCORE_ROWS, params.lanes},
               {BLOCK_INDEXER_SCORE_THREADS, 1, 1});

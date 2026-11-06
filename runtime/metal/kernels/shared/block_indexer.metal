@@ -3,6 +3,7 @@
 #include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
+#include "metal/kernels/common/sgmatrix.h"
 #include "metal/kernels/common/target_rope.h"
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -208,12 +209,71 @@ kernel void block_indexer_commit(device const bfloat *keys [[buffer(0)]],
 // Threadgroup per tile of kScoreRows rows of a lane by kScoreBlocks blocks:
 // the rows' query heads and the blocks' pooled keys, gathered from the
 // index into threadgroup memory, make every head's dot product of the tile
-// in one MPP product, and each row's score of a block sums its heads' relu
+// in one product, and each row's score of a block sums its heads' relu
 // over sqrt(dimension). The scratch holds the dispatch's rows, lane after
 // lane.
 constant constexpr uint kScoreRows = BLOCK_INDEXER_SCORE_ROWS;
 constant constexpr uint kScoreBlocks = BLOCK_INDEXER_SCORE_BLOCKS;
 constant constexpr uint kScoreThreads = BLOCK_INDEXER_SCORE_THREADS;
+constant constexpr uint kScoreHeadRows = kScoreRows * kHeads;
+
+// A score tile's rows, blocks and lane, and its lane's complete blocks.
+struct IndexerScoreTile {
+  uint row0;
+  uint block0;
+  uint batch;
+  uint complete;
+};
+
+// The tile of threadgroup `group`, or none (complete == 0) where its rows
+// attend causally or its blocks are past their complete ones.
+inline IndexerScoreTile indexer_score_tile(uint3 group, constant BlockIndexerParams &p) {
+  IndexerScoreTile tile{group.y * kScoreRows, group.x * kScoreBlocks, group.z, 0};
+  if (!indexer_lane(tile.batch, p)) return tile;
+  const uint last = min(p.rows, tile.row0 + kScoreRows);
+  // Rows attend sparsely past top_blocks complete blocks; complete blocks
+  // grow with the row.
+  const uint complete = (p.first_position[tile.batch] + p.row_offset + last) / kBlock;
+  if (tile.block0 < complete && complete > p.top_blocks) tile.complete = complete;
+  return tile;
+}
+
+// Gathers the tile's query heads [row][head][dimension] and the blocks'
+// pooled keys [block][dimension] into q and k: zero past the rows and past
+// the complete blocks.
+inline void indexer_score_stage(device const bfloat *queries, device const SplashKvPage *index_table,
+                                const IndexerScoreTile tile, constant BlockIndexerParams &p,
+                                threadgroup bfloat *q, threadgroup bfloat *k, uint tid) {
+  // 16-byte chunks of a head's (or a key's) row.
+  constexpr uint Chunks = kDimension * sizeof(bfloat) / sizeof(uint4);
+  device const uint4 *tile_queries = reinterpret_cast<device const uint4 *>(
+      queries + (ulong(tile.batch) * p.rows + p.row_offset + tile.row0) * kHeads * kDimension);
+  for (uint chunk = tid; chunk < kScoreHeadRows * Chunks; chunk += kScoreThreads)
+    reinterpret_cast<threadgroup uint4 *>(q)[chunk] =
+        tile.row0 + chunk / (kHeads * Chunks) < p.rows ? tile_queries[chunk] : uint4(0);
+  for (uint chunk = tid; chunk < kScoreBlocks * Chunks; chunk += kScoreThreads) {
+    const uint block = tile.block0 + chunk / Chunks;
+    uint4 data = 0;
+    if (block < tile.complete)
+      data = reinterpret_cast<device const uint4 *>(indexer_index_keys(index_table[block / kPageBlocks], p) +
+                                                    (block % kPageBlocks) * kDimension)[chunk % Chunks];
+    reinterpret_cast<threadgroup uint4 *>(k)[chunk] = data;
+  }
+}
+
+// Each row's score of each block from the heads' products [row][head][block].
+inline void indexer_score_write(threadgroup const float *products, device float *scores,
+                                const IndexerScoreTile tile, constant BlockIndexerParams &p, uint tid) {
+  for (uint index = tid; index < kScoreRows * kScoreBlocks; index += kScoreThreads) {
+    const uint r = index / kScoreBlocks, b = index % kScoreBlocks;
+    if (tile.row0 + r >= p.rows || tile.block0 + b >= tile.complete) continue;
+    float score = 0.0f;
+    for (uint h = 0; h < kHeads; ++h) score += max(products[(r * kHeads + h) * kScoreBlocks + b], 0.0f);
+    scores[(ulong(tile.batch) * p.rows + tile.row0 + r) * p.score_stride + tile.block0 + b] =
+        score / sqrt(float(kDimension));
+  }
+}
+
 kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
                                 device const SplashKvPage *index_table0 [[buffer(1)]],
                                 device const SplashKvPage *index_table1 [[buffer(2)]],
@@ -223,34 +283,15 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
                                 constant BlockIndexerParams &p [[buffer(6)]],
                                 uint3 group [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]]) {
-  constexpr ushort M = kScoreRows * kHeads, N = kScoreBlocks, D = kDimension;
-  // 16-byte chunks of a head's (or a key's) row.
-  constexpr uint Chunks = D * sizeof(bfloat) / sizeof(uint4);
+  constexpr ushort M = kScoreHeadRows, N = kScoreBlocks, D = kDimension;
   alignas(16) threadgroup bfloat q[M * D];
   alignas(16) threadgroup bfloat k[N * D];
   threadgroup float products[M * N];
-  const uint row0 = group.y * kScoreRows, block0 = group.x * N, batch = group.z;
-  if (!indexer_lane(batch, p)) return;
-  const uint last = min(p.rows, row0 + kScoreRows);
-  // Rows attend sparsely past top_blocks complete blocks; complete blocks
-  // grow with the row.
-  const uint complete = (p.first_position[batch] + p.row_offset + last) / kBlock;
-  if (block0 >= complete || complete <= p.top_blocks) return;
-  device const SplashKvPage *index_table =
-      SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
-  device const uint4 *tile_queries = reinterpret_cast<device const uint4 *>(
-      queries + (ulong(batch) * p.rows + p.row_offset + row0) * kHeads * D);
-  for (uint chunk = tid; chunk < M * Chunks; chunk += kScoreThreads)
-    reinterpret_cast<threadgroup uint4 *>(q)[chunk] =
-        row0 + chunk / (kHeads * Chunks) < p.rows ? tile_queries[chunk] : uint4(0);
-  for (uint chunk = tid; chunk < N * Chunks; chunk += kScoreThreads) {
-    const uint block = block0 + chunk / Chunks;
-    uint4 data = 0;
-    if (block < complete)
-      data = reinterpret_cast<device const uint4 *>(indexer_index_keys(index_table[block / kPageBlocks], p) +
-                                                    (block % kPageBlocks) * D)[chunk % Chunks];
-    reinterpret_cast<threadgroup uint4 *>(k)[chunk] = data;
-  }
+  const IndexerScoreTile tile = indexer_score_tile(group, p);
+  if (!tile.complete) return;
+  indexer_score_stage(queries,
+                      SPLASH_LANE_BINDING(tile.batch, index_table0, index_table1, index_table2, index_table3),
+                      tile, p, q, k, tid);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   auto qt = tensor(q, dextents<int, 2>{D, M}, array<int, 2>{1, D});
   auto kt = tensor(k, dextents<int, 2>{D, N}, array<int, 2>{1, D});
@@ -264,13 +305,62 @@ kernel void block_indexer_score(device const bfloat *queries [[buffer(0)]],
   product.run(q0, k0, dots);
   dots.store(pt.template slice<N, M>(0, 0));
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint index = tid; index < kScoreRows * N; index += kScoreThreads) {
-    const uint r = index / N, b = index % N;
-    if (row0 + r >= p.rows || block0 + b >= complete) continue;
-    float score = 0.0f;
-    for (uint h = 0; h < kHeads; ++h) score += max(products[(r * kHeads + h) * N + b], 0.0f);
-    scores[(ulong(batch) * p.rows + row0 + r) * p.score_stride + block0 + b] = score / sqrt(float(D));
+  indexer_score_write(products, scores, tile, p, tid);
+}
+
+// Apple7/8 (M1/M2) register tile of block_indexer_score, which never runs
+// MPP tensor ops there: the same tiles, gather and scores, with the product
+// on 8x8 simdgroup matrices. These GPUs have no bfloat arithmetic, so the
+// bf16 heads and keys widen to exact fp32: every product is exact and only
+// the summation order differs. Simdgroup g takes the 8 head rows 8 (g / 2)
+// on and the 16 blocks 16 (g % 2) on, two 8x8 output tiles.
+inline float indexer_widen(threadgroup const bfloat *value) {
+  return as_type<float>(uint(*reinterpret_cast<threadgroup const ushort *>(value)) << 16);
+}
+
+kernel void block_indexer_score_sgf(device const bfloat *queries [[buffer(0)]],
+                                    device const SplashKvPage *index_table0 [[buffer(1)]],
+                                    device const SplashKvPage *index_table1 [[buffer(2)]],
+                                    device const SplashKvPage *index_table2 [[buffer(3)]],
+                                    device const SplashKvPage *index_table3 [[buffer(4)]],
+                                    device float *scores [[buffer(5)]],
+                                    constant BlockIndexerParams &p [[buffer(6)]],
+                                    uint3 group [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint M = kScoreHeadRows, N = kScoreBlocks, D = kDimension;
+  static_assert(M == 32 && N == 32 && kScoreThreads == 256 && D % 8 == 0,
+                "eight simdgroups of two 8x8 output tiles each");
+  alignas(16) threadgroup bfloat q[M * D];
+  alignas(16) threadgroup bfloat k[N * D];
+  threadgroup float products[M * N];
+  const IndexerScoreTile tile = indexer_score_tile(group, p);
+  if (!tile.complete) return;
+  indexer_score_stage(queries,
+                      SPLASH_LANE_BINDING(tile.batch, index_table0, index_table1, index_table2, index_table3),
+                      tile, p, q, k, tid);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // C[m][n] = sum_d Q[m][d] K[n][d]: A = Q[m0 + fm][d0 + fn, + 1] and B =
+  // K^T[d0 + fm][n0 + fn, + 1].
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint m0 = 8 * (sg / 2), n0 = 16 * (sg % 2);
+  threadgroup const bfloat *a = q + (m0 + l.fm) * D + l.fn;
+  threadgroup const bfloat *b0 = k + (n0 + l.fn) * D + l.fm;
+  threadgroup const bfloat *b1 = b0 + 8 * D;
+  float2 c0(0.0f), c1(0.0f);
+  for (uint d0 = 0; d0 < D; d0 += 8) {
+    const float2 a_pair(indexer_widen(a + d0), indexer_widen(a + d0 + 1));
+    sgmatrix::mma_acc<float>(c0, a_pair, float2(indexer_widen(b0 + d0), indexer_widen(b0 + D + d0)));
+    sgmatrix::mma_acc<float>(c1, a_pair, float2(indexer_widen(b1 + d0), indexer_widen(b1 + D + d0)));
   }
+  threadgroup float *row = products + (m0 + l.fm) * N + n0 + l.fn;
+  row[0] = c0.x;
+  row[1] = c0.y;
+  row[8] = c1.x;
+  row[9] = c1.y;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  indexer_score_write(products, scores, tile, p, tid);
 }
 
 // Threadgroup (row, lane): the row's bitmap of attended blocks. A row with at
@@ -330,7 +420,7 @@ inline void indexer_threshold(threadgroup atomic_uint *histogram, uint bins, uin
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-kernel void block_indexer_select(device const float *scores [[buffer(0)]],
+[[max_total_threads_per_threadgroup(kSelectThreads)]] kernel void block_indexer_select(device const float *scores [[buffer(0)]],
                                  device uint *mask [[buffer(1)]],
                                  constant BlockIndexerParams &p [[buffer(2)]],
                                  uint2 group [[threadgroup_position_in_grid]],

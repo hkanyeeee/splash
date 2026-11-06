@@ -59,10 +59,16 @@ KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 # macOS 26.2 or newer, and MPP chooses its code path by this target.
 MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
+# Optional local memory profiles. The Metal lane ABI stays four-wide; the
+# runtime may admit fewer lanes and size its own arenas for that limit.
+SPLASH_RUNTIME_LANES ?= 4
+SPLASH_PREFILL_ROWS ?= 2048
+EXECUTION_FLAGS := -DSPLASH_RUNTIME_MAXIMUM_BATCH_WIDTH=$(SPLASH_RUNTIME_LANES)u \
+	-DSPLASH_PREFILL_TOKEN_BUDGET=$(SPLASH_PREFILL_ROWS)u
 PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) $(EXECUTION_FLAGS)
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) $(EXECUTION_FLAGS)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
 # The spin of awake host steps reaches a memory scope through Metal's internals

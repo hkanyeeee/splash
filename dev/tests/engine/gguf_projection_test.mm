@@ -425,8 +425,12 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
 
 // The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 64 rows; the
 // staged tile walks K spread or in lockstep.
+// Apple7/8's register tile reads an fp32 table (LinearConfig::fp32Table); main sets it from the device.
+bool fp32RegisterTable = false;
 LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits, bool spread = false) {
-  return {.tile = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile, .splits = splits, .spread = spread};
+  const LinearTile t = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile;
+  return {.tile = t, .splits = splits, .spread = spread,
+          .fp32Table = fp32RegisterTable && t == LinearTile::GgufRegister};
 }
 // The formats whose weights `tile` takes, in id order: the register tile takes those of quant_register_format.
 std::vector<Fmt> tileFormats(LinearTile tile) {
@@ -666,6 +670,42 @@ void oneGateUpPass(MetalBackend &backend, const Linear &linear, bool spread) {
   section(walkName(LinearTile::GgufStaged, spread) + " one-pass gate/up: " + std::to_string(FMT_COUNT) +
           " formats at 768x" + std::to_string(K) + ", 1-4 lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and 4 lanes, "
           "S 1-" + std::to_string(mostSplits) + ", one lane on the 16-row tile too, bitwise the two passes");
+}
+
+// Gate/up in one pass on Apple7/8's register tile (LinearConfig::oneGateUpPass with fp32Table): every format it takes
+// at [768, 2048], 1-4 lanes, and Q4_K and MLX 4-bit at the 27B's [17408, 5120], 1 and 4 lanes, at every K split the
+// tile takes, bitwise the gate and up passes, whatever the partials held before. `linear` is Apple7/8's.
+void registerOneGateUpPass(MetalBackend &backend, const Linear &linear) {
+  uint32_t mostSplits = 1;
+  const auto pairs = [&](Fmt f, uint32_t N, uint32_t K, uint32_t columns, std::span<const uint32_t> lanes) {
+    const Tensor g = tensor(backend, f, N, K), u = tensor(backend, f, N, K);
+    const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
+    const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
+    for (const uint32_t splits : kSplits) {
+      if (K / 256 < splits) continue;
+      mostSplits = std::max(mostSplits, splits);
+      for (const uint32_t l : lanes) {
+        const LinearWorkload wl = decode({columns, K}, l, LinearEpilogue::GateUp);
+        LinearConfig c = config(LinearTile::GgufRegister, wl, splits);
+        const LinearPlan twoPasses = Linear::plan(wl, c, FloatOutput::BFloat16);
+        c.oneGateUpPass = true;
+        const LinearPlan onePass = Linear::plan(wl, c, FloatOutput::BFloat16);
+        const std::string label = std::string(fmtName(f)) + " " + std::to_string(N) + "x" + std::to_string(K) +
+                                  " S=" + std::to_string(splits) + " L=" + std::to_string(l);
+        const std::vector<uint16_t> rows = storageRows(x, K, wl.rows, onePass.storageRows());
+        const Outcome two = run(backend, linear, twoPasses, up, &gate, rows, {}, kPoisonNaN, N, label + " two passes");
+        const Outcome one = run(backend, linear, onePass, up, &gate, rows, {}, kPoisonFinite, N, label);
+        if (!sameRows(one.output, 0, two.output, 0, wl.rows, columns)) fail(label + ": differs from the two passes");
+      }
+    }
+  };
+  constexpr uint32_t kAllLanes[] = {1, 2, 3, 4}, kEndLanes[] = {1, kMaximumLanes};
+  const std::vector<Fmt> formats = tileFormats(LinearTile::GgufRegister);
+  for (const Fmt f : formats) pairs(f, 768, decodeInputs(false), 768 + kPadding, kAllLanes);
+  for (const Fmt f : {Q4K, Fmt(GGUF_FMT_AF4G64)}) pairs(f, 17408, 5120, 17408, kEndLanes);
+  section("register one-pass gate/up (Apple7/8): " + std::to_string(formats.size()) + " formats at 768x" +
+          std::to_string(decodeInputs(false)) + ", 1-4 lanes, and Q4_K and MLX 4-bit at 17408x5120, 1 and 4 lanes, S 1-" +
+          std::to_string(mostSplits) + ", bitwise the two passes");
 }
 
 // ---------------------------------------------------------------- prefill
@@ -1090,6 +1130,8 @@ int main(int argc, char **argv) {
     try {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities());
+      fp32RegisterTable = backend.capabilities().appleGpuFamily < 9;
+      // Apple7/8 run the staged tiles' dispatches on their MMA kernels and the register tile's on its F32 instances.
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
         fusedDecode(backend, linear, tile, false);
@@ -1097,9 +1139,28 @@ int main(int argc, char **argv) {
       }
       decodeTile(backend, linear, LinearTile::GgufStaged, true, decodeInputs(true), tileFormats(LinearTile::GgufStaged));
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);
-      for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
+      // The one-pass gate/up runs on large Apple10 GPUs only (Linear::ggufBaseline); Apple7/8's two passes run their
+      // MMA kernels, whose bits it does not match.
+      if (backend.capabilities().appleGpuFamily >= 9)
+        for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
+      else
+        registerOneGateUpPass(backend, linear);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
       leadingInputs(backend, linear);
+      if (!fp32RegisterTable) {
+        // Apple7/8's register tile instances (gguf_decode_sgf_*: fp32 table, zero points as mins, nibble operands) run
+        // on any later GPU too.
+        DeviceCapabilities apple7 = backend.capabilities();
+        apple7.appleGpuFamily = 7;
+        const Linear m1(apple7);
+        fp32RegisterTable = true;
+        decodeTile(backend, m1, LinearTile::GgufRegister, false, decodeInputs(false),
+                   tileFormats(LinearTile::GgufRegister));
+        gateUpPairs(backend, m1, LinearTile::GgufRegister);
+        registerOneGateUpPass(backend, m1);
+        fp32RegisterTable = false;
+        section("register decode again on Apple7/8's F32 instances");
+      }
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);

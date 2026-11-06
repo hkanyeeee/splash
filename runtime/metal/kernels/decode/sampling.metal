@@ -856,6 +856,10 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
 
 // Where the distribution of each selected row of the sampled lanes ends, one
 // group per row.
+// Dispatched with kVocabularyThreads: the attribute keeps that many
+// available on GPUs whose register budget would otherwise lower the limit
+// (576 for the search kernel on an M1 Max).
+[[max_total_threads_per_threadgroup(kVocabularyThreads)]]
 kernel void decode_sample_vocabulary_search(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
@@ -880,6 +884,10 @@ kernel void decode_sample_vocabulary_search(
 // groups per row: the first token after a prompt, a verify row's draft
 // token's probability and the correction a rejection takes or, for the last
 // verify row, which follows the whole draft, its bonus token.
+// Dispatched with kVocabularyThreads: the attribute keeps that many
+// available on GPUs whose register budget would otherwise lower the limit
+// (576 for the search kernel on an M1 Max).
+[[max_total_threads_per_threadgroup(kVocabularyThreads)]]
 kernel void decode_sample_vocabulary_draw(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],

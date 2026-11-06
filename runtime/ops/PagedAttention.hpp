@@ -108,11 +108,34 @@ chunkedPrefillValidationError(const ChunkedPrefillParams &params) noexcept {
 
 namespace splash::ops {
 
+// The GPU finishes a dispatch before it serves the display, and macOS aborts
+// a command that keeps the display waiting too long (Apple7/8 Macs at long
+// context). A chunk's prefill attention therefore goes in pieces of rows of
+// at most about this many row-history pairs, each its own dispatch.
+inline constexpr uint64_t kPrefillAttentionPieceWork = uint64_t{1} << 25;
+
+// Rows of each prefill attention piece of a chunk of `rows` rows after
+// `committedTokens` of history: the chunk itself while short, else halved
+// down to one tile.
+[[nodiscard]] constexpr uint32_t prefillAttentionPieceRows(uint32_t committedTokens,
+                                                           uint32_t rows) noexcept {
+  uint32_t piece = kv::kChunkedPrefillMaximumRows;
+  while (piece > kv::kPrefillAttentionTileRows &&
+         uint64_t{piece} * (uint64_t{committedTokens} + piece) > kPrefillAttentionPieceWork)
+    piece /= 2;
+  return piece < rows ? piece : rows;
+}
+
 struct AttentionWorkspace final {
   uint64_t partialsBytes = 0;
   uint64_t statisticsBytes = 0;
 };
 
+// Mpp is the shipped tensor-operation tile. Register is the Apple7/8 tile
+// (exact half INT8 or exact fp32 BF16 cache, fp32 queries and probabilities,
+// one simdgroup per eight fused rows) for prefill and verify. The device
+// policy (ExecutionPlans) selects it.
+enum class AttentionTile : uint8_t { Mpp = 0, Register = 1 };
 // How one attention layer attends, of the variants its geometry is compiled
 // for (kCompiledAttention, PagedAttention.cpp): its queries and keys rotated
 // by the geometry's RoPE, or unrotated (NoPE); and each row over its whole
@@ -141,6 +164,7 @@ struct PrefillAttentionPlan final {
   const std::string splitPipeline;
   const std::string reducePipeline;
   const metal::DispatchSize splitGroups;
+  const metal::DispatchSize splitThreads;
   const metal::DispatchSize reduceGroups;
   // Whether the kernels attend through block lists (AttentionBlocks).
   const bool sparse;
@@ -152,12 +176,14 @@ private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string splitPipeline, std::string reducePipeline,
-                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       bool sparse, bool sinks, kv::Layout layout, uint32_t queryHeads)
+                       metal::DispatchSize splitGroups, metal::DispatchSize splitThreads,
+                       metal::DispatchSize reduceGroups, bool sparse, bool sinks, kv::Layout layout,
+                       uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), rows(rows), tiles(kv::prefillAttentionTiles(rows)),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
-        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks) {}
+        splitGroups(splitGroups), splitThreads(splitThreads), reduceGroups(reduceGroups), sparse(sparse),
+        sinks(sinks) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -174,6 +200,7 @@ struct VerifyAttentionPlan final {
   const std::string splitPipeline;
   const std::string reducePipeline;
   const metal::DispatchSize splitGroups;
+  const metal::DispatchSize splitThreads;
   const metal::DispatchSize reduceGroups;
   // Whether the kernels attend through block lists (AttentionBlocks).
   const bool sparse;
@@ -192,15 +219,17 @@ private:
                       std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits,
                       uint32_t splits, AttentionWorkspace workspace,
                       std::string splitPipeline, std::string reducePipeline,
-                      metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                      bool sparse, bool sinks, std::string locatedSplitPipeline, std::string storePipeline,
+                      metal::DispatchSize splitGroups, metal::DispatchSize splitThreads,
+                      metal::DispatchSize reduceGroups, bool sparse, bool sinks, std::string locatedSplitPipeline,
+                      std::string storePipeline,
                       metal::DispatchSize storeGroups, metal::DispatchSize storeThreads, kv::Layout layout,
                       uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
-        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks),
-        locatedSplitPipeline_(std::move(locatedSplitPipeline)), storePipeline_(std::move(storePipeline)),
+        splitGroups(splitGroups), splitThreads(splitThreads), reduceGroups(reduceGroups), sparse(sparse),
+        sinks(sinks), locatedSplitPipeline_(std::move(locatedSplitPipeline)),
+        storePipeline_(std::move(storePipeline)),
         storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 
@@ -260,12 +289,14 @@ public:
   // `pagesPerSplit` (AttentionCalibration).
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-              uint32_t pagesPerSplit, AttentionVariant variant = {});
+              uint32_t pagesPerSplit, AttentionVariant variant = {},
+              AttentionTile tile = AttentionTile::Mpp, uint32_t gpuCores = 0);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens, AttentionVariant variant = {});
+             std::span<const uint32_t> historyTokens, AttentionVariant variant = {},
+             AttentionTile tile = AttentionTile::Mpp);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences

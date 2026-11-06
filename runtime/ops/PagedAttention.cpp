@@ -266,11 +266,26 @@ uint32_t prefillSplits(uint32_t tiles, uint64_t visibleTokens, uint32_t windowTo
   return windowTokens ? std::min(splits, kv::windowAttentionPages(windowTokens)) : splits;
 }
 
+// The register tile runs one simdgroup per eight fused rows of a tile's part
+// (SPLASH_ATTENTION_TILE_PARTS): 32 x G / parts threads.
+metal::DispatchSize splitThreads(AttentionTile tile, uint32_t queryHeads, kv::Layout layout) {
+  if (tile != AttentionTile::Mpp && tile != AttentionTile::Register)
+    throw std::invalid_argument("invalid attention tile");
+  return {tile == AttentionTile::Register
+              ? uint64_t{32} * (queryHeads / layout.kvHeads) / tileParts(queryHeads, layout)
+              : metal::CommandGraph::kDefaultThreads,
+          1, 1};
+}
+
+// The register tile's kernels are the MPP tile's names with "_sgf" before the
+// geometry suffix.
+std::string tileSuffix(AttentionTile tile) { return tile == AttentionTile::Register ? "_sgf" : ""; }
+
 } // namespace
 
 PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads,
                                                  kv::Layout layout, uint32_t pagesPerSplit,
-                                                 AttentionVariant variant) {
+                                                 AttentionVariant variant, AttentionTile tile, uint32_t gpuCores) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
@@ -278,25 +293,34 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t history
   // A sparse tile reads its list's blocks, a few thousand tokens whatever
   // its history, and keeps the shared splits: by its history it ran up to
   // 47% slower (Qwen3.8-Flash-Next's 64-row chunk after 64K tokens).
-  const uint32_t splits =
+  uint32_t splits =
       prefillSplits(tiles, selectsBlocks(layout) ? 0 : uint64_t{historyTokens} + rows, variant.windowTokens,
                     pagesPerSplit);
+  if (tile == AttentionTile::Register && gpuCores) {
+    const uint32_t target = std::min<uint32_t>(kv::prefillAttentionTiles(kv::kChunkedPrefillMaximumRows),
+                                              std::max<uint32_t>(SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS,
+                                                                 32 * gpuCores / layout.kvHeads));
+    splits = std::max(splits, std::clamp(target / tiles, 1U, mostSplits(tiles)));
+    if (variant.windowTokens) splits = std::min(splits, kv::windowAttentionPages(variant.windowTokens));
+  }
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
   return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
-          kernelName("prefill", kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split"),
+          kernelName("prefill",
+                     kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split") + tileSuffix(tile),
                      splitSuffix(kernel, variant)),
           reduceKernel("prefill", kernel, variant),
           {layout.kvHeads * tileParts(queryHeads, layout), tiles, splits},
+          splitThreads(tile, queryHeads, layout),
           {layout.kvHeads, fusedRows, tiles}, selectsBlocks(layout), kernel.sinks,
           layout, queryHeads};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, AttentionVariant variant) {
+    std::span<const uint32_t> historyTokens, AttentionVariant variant, AttentionTile tile) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
@@ -314,7 +338,8 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   }
   return {lanes, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
-          kernelName("verify", kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split"),
+          kernelName("verify",
+                     kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split") + tileSuffix(tile),
                      splitSuffix(kernel, variant)),
           reduceKernel("verify", kernel, variant),
           // A sparse lane's list fills only the first of the plan's splits.
@@ -323,11 +348,14 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           // (x the KV head, y the split) worse, running it up to 1.7x slower
           // on most grids of more than 32 splits.
           selectsBlocks(layout) ? metal::DispatchSize{layout.kvHeads * splits, 1, lanes}
-                                : metal::DispatchSize{layout.kvHeads * tileParts(queryHeads, layout), splits, lanes},
+                                  : metal::DispatchSize{layout.kvHeads * tileParts(queryHeads, layout), splits, lanes},
+          splitThreads(tile, queryHeads, layout),
           {layout.kvHeads,
            kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
           selectsBlocks(layout), kernel.sinks,
-          selectsBlocks(layout) ? kernelName("verify", kernelFormat(layout) + "_sparse_located", kernel.suffix) : "",
+          selectsBlocks(layout)
+              ? kernelName("verify", kernelFormat(layout) + "_sparse_located" + tileSuffix(tile), kernel.suffix)
+              : "",
           kernelName("verify", kernelFormat(layout) + "_store", storeSuffix(layout)),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
           {layout.headDimension, 1, 1}, layout, queryHeads};
@@ -533,7 +561,7 @@ void PagedAttention::addPrefill(
     reduce.push_back(counts);
   }
   if (plan.sinks) reduce.push_back(std::move(sinks));
-  graph.add(std::string(plan.splitPipeline), std::move(split), params, plan.splitGroups);
+  graph.add(std::string(plan.splitPipeline), std::move(split), params, plan.splitGroups, plan.splitThreads);
   graph.add(std::string(plan.reducePipeline), std::move(reduce), params, plan.reduceGroups,
             reduceThreads(plan.layout));
 }
@@ -600,7 +628,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   }
   if (plan.sinks) reduce.push_back(buffers.sinks);
   graph.add(std::string(blocks.locations ? plan.locatedSplitPipeline_ : plan.splitPipeline), std::move(split),
-            attention, plan.splitGroups);
+            attention, plan.splitGroups, plan.splitThreads);
   graph.add(std::string(plan.reducePipeline), std::move(reduce), attention, plan.reduceGroups,
             reduceThreads(plan.layout));
 }

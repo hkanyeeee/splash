@@ -16,10 +16,13 @@ inline void appendLaneBindings(std::vector<metal::MetalBuffer> &bindings,
                                std::span<const metal::MetalBuffer> first,
                                std::span<const metal::MetalBuffer> second) {
   constexpr size_t lanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-  if (first.size() != lanes || second.size() != lanes)
-    throw std::invalid_argument("lane bindings must cover every lane");
-  bindings.insert(bindings.end(), first.begin(), first.end());
-  bindings.insert(bindings.end(), second.begin(), second.end());
+  if (first.empty() || first.size() > lanes || second.size() != first.size())
+    throw std::invalid_argument("lane bindings must name matching nonempty lane sets");
+  // A runtime with fewer lanes still binds every slot of the four-lane ABI.
+  // Unused slots alias lane zero; the dispatch grid never executes them.
+  for (const auto buffers : {first, second})
+    for (size_t lane = 0; lane < lanes; ++lane)
+      bindings.push_back(buffers[lane < buffers.size() ? lane : 0]);
 }
 
 // A per-lane buffer of each lane of `lanes` (at least one), and lane 0's in

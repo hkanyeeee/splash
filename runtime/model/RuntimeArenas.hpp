@@ -471,9 +471,13 @@ constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators);
-// A decode tensor is one M32 allocation.  B1/B2/B3/B4 are prefixes
-// containing 8/16/24/32 rows. Lanes are never separated by arena-alignment
-// holes; only whole tensor boundaries are aligned.
+// Some decode tiles pad one lane to sixteen rows, or three lanes to
+// thirty-two. Keep that storage when the runtime admits fewer requests.
+[[nodiscard]] uint32_t decodeStorageLaneCount(const RuntimeGeometry &geometry,
+                                              const ops::ExecutionPlans &operators);
+// A decode tensor holds the runtime's widest batch and any tile padding.
+// B1/B2/B3/B4 are prefixes containing 8/16/24/32 rows. Lanes are never
+// separated by arena-alignment holes; only whole tensor boundaries align.
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                                             const ops::ExecutionPlans &operators);
 // The arena's base, its gate and linear scratch.
@@ -487,7 +491,8 @@ class DecodeArena final {
 public:
   DecodeArena(metal::MetalBackend &backend, RuntimeGeometry geometry,
                const ops::ExecutionPlans &operators)
-      : backend_(backend), geometry_(std::move(geometry)) {
+      : backend_(backend), geometry_(std::move(geometry)),
+        storageLanes_(decodeStorageLaneCount(geometry_, operators)) {
     const uint64_t baseBytes = decodeArenaBaseBytes(geometry_, operators);
     auto sizes = decodeTensorBytes(geometry_, operators);
     base_ = backend_.allocateBuffer(baseBytes, metal::BufferStorage::Shared,
@@ -505,14 +510,14 @@ public:
         }
       }
       cursor +=
-          alignUp(checkedMultiply(stride, kLaneCount, "decode tensor"));
+          alignUp(checkedMultiply(stride, storageLanes_, "decode tensor"));
     }
     if (cursor != baseBytes)
       throw std::logic_error("decode arena mismatch");
     // Sampled rows' draws return their arrival counts to zero; they start
     // there.
     const metal::MetalBuffer arrivals =
-        batchSlice(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
+        batchSlice(DecodeTensor::TargetVocabularyArrivals, storageLanes_);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
 
     const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);
@@ -549,7 +554,7 @@ public:
   }
 
   [[nodiscard]] metal::MetalBuffer batchSlice(DecodeTensor tensor, uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount)
+    if (!lanes || lanes > storageLanes_)
       throw std::out_of_range("invalid decode batch width");
     if (isLayerMajorTensor(tensor)) {
       throw std::logic_error(
@@ -604,7 +609,7 @@ public:
                                                 uint32_t attentionLayer,
                                                 uint32_t lanes) const {
     const uint32_t layers = geometry_.target.kvLayout.attentionLayers;
-    if (!lanes || lanes > kLaneCount || attentionLayer >= layers ||
+    if (!lanes || lanes > storageLanes_ || attentionLayer >= layers ||
         !isLayerMajorTensor(base)) {
       throw std::out_of_range("invalid batched attention layer");
     }
@@ -621,12 +626,13 @@ private:
                                                    uint32_t layer, uint32_t lanes) const {
     const uint32_t index = static_cast<uint32_t>(base);
     const uint64_t stride = sizes_[index] / layers;
-    return backend_.view(base_, offsets_[index] + uint64_t{layer} * kLaneCount * stride,
+    return backend_.view(base_, offsets_[index] + uint64_t{layer} * storageLanes_ * stride,
                          uint64_t{lanes} * stride);
   }
 
   metal::MetalBackend &backend_;
   RuntimeGeometry geometry_;
+  uint32_t storageLanes_;
   metal::MetalBuffer base_;
   std::array<std::array<metal::MetalBuffer, decodeTensorCount>, kLaneCount> tensors_{};
   std::array<uint64_t, decodeTensorCount> offsets_{};

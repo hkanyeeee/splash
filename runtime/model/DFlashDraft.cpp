@@ -187,10 +187,9 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
                                     const metal::MetalBuffer &window,
                                     std::span<const DFlashDraftRingLayer> ring,
                                     uint32_t rows, uint32_t startPosition) const {
-  static_assert(ExecutionLimits::draftContextTokens <= ExecutionLimits::prefillTokenBudget,
-                "a whole draft window passes through buffers of one prefill chunk's rows");
   const DFlashDraftLayout &layout = weights_.layout;
-  if (!rows || rows > ExecutionLimits::draftContextTokens || ring.size() != layout.layers)
+  if (!rows || rows > ExecutionLimits::draftContextTokens || rows > ExecutionLimits::prefillTokenBudget ||
+      ring.size() != layout.layers)
     throw std::invalid_argument("invalid draft context rebuild");
   ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, rows, startPosition,
                                      layout.hiddenSize);

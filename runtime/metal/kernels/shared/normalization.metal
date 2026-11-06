@@ -20,13 +20,21 @@ constant constexpr uint kNormChunk = kNormThreads * kNormColumns;
 // 35B's MoE-input norms. Both paths give the same bits.
 constant constexpr uint kNormStreamingWidth = kNormThreads * 8;
 
-// Columns begin + tid + 256 i of a row, zero past its end.
-template <class T>
+// Columns begin + tid + 256 i of a row, zero past its end. With Clamped
+// (Apple7/8's Table16F norms) every load is issued, at a column clamped
+// into the row, and the zero is selected after it: on an M2 Max the 27B's
+// decode norms then take 2.4% off a one-lane cycle, 0.8-1.1% at two to four.
+template <class T, bool Clamped = false>
 inline void load_norm_chunk(device const T *row, uint width, uint begin,
                             uint tid, thread T (&x)[kNormColumns]) {
   for (uint i = 0; i < kNormColumns; ++i) {
     const uint column = begin + tid + kNormThreads * i;
-    x[i] = column < width ? row[column] : T(0.0f);
+    if (Clamped) {
+      const T value = row[min(column, width - 1)];
+      x[i] = column < width ? value : T(0.0f);
+    } else {
+      x[i] = column < width ? row[column] : T(0.0f);
+    }
   }
 }
 
@@ -133,7 +141,7 @@ inline void norm_rms_staged_row(device const bfloat4 *input, device const WV *we
     output[row * vectors + column] = bfloat4((float4(stage[column]) * inverse) * float4(weight[column]));
 }
 #define NORM_RMS_STAGED(Name, WV) \
-  kernel void Name(device const bfloat4 *input [[buffer(0)]], \
+  [[max_total_threads_per_threadgroup(SPLASH_STAGED_NORM_THREADS)]] kernel void Name(device const bfloat4 *input [[buffer(0)]], \
       device const WV *weight [[buffer(1)]], device bfloat4 *output [[buffer(2)]], \
       constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
@@ -153,7 +161,7 @@ NORM_RMS_STAGED(norm_rms_staged_f32, packed_float4)
 // weights) alongside the reduction's columns.
 template <class Table, class W>
 inline void norm_rms_table(device const bfloat *input, device const W *weight,
-                           device bfloat *output, device bfloat *table, device float *sums,
+                           device bfloat *output, device typename Table::Elem *table, device float *sums,
                            uint width, uint row, uint tid, uint lane, uint sg,
                            threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
@@ -173,16 +181,26 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
     return;
   }
   constexpr uint Spans = kNormChunk / 64 / 8;  // per simdgroup and chunk
+  constexpr bool Clamped = metal::is_same_v<Table, gguf_sg::Table16F>;
   device const bfloat *row_input = input + row * width;
   bfloat x[kNormColumns];
-  load_norm_chunk(row_input, width, 0, tid, x);
+  load_norm_chunk<bfloat, Clamped>(row_input, width, 0, tid, x);
   bfloat2 in[Spans];
   vec<W, 2> w[Spans];
   const auto load_spans = [&](uint begin) {
     for (uint j = 0; j < Spans; ++j) {
       const uint k = begin + (sg + 8 * j) * 64 + lane * 2;
-      in[j] = k < width ? bfloat2(row_input[k], row_input[k + 1]) : bfloat2(bfloat(0.0f));
-      w[j] = k < width ? vec<W, 2>(weight[k], weight[k + 1]) : vec<W, 2>(W(0.0f));
+      if (Clamped) {
+        // As load_norm_chunk's: the pair is loaded at a clamped column.
+        const uint at = min(k, width - 2);
+        const bfloat2 iv = bfloat2(row_input[at], row_input[at + 1]);
+        const vec<W, 2> wv = vec<W, 2>(weight[at], weight[at + 1]);
+        in[j] = k < width ? iv : bfloat2(bfloat(0.0f));
+        w[j] = k < width ? wv : vec<W, 2>(W(0.0f));
+      } else {
+        in[j] = k < width ? bfloat2(row_input[k], row_input[k + 1]) : bfloat2(bfloat(0.0f));
+        w[j] = k < width ? vec<W, 2>(weight[k], weight[k + 1]) : vec<W, 2>(W(0.0f));
+      }
     }
   };
   load_spans(0);
@@ -207,7 +225,7 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
 #define NORM_RMS_TABLE(Name, Table, W) \
   kernel void Name(device const bfloat *input [[buffer(0)]], \
       device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
-      device bfloat *table [[buffer(3)]], device float *sums [[buffer(4)]], \
+      device Table::Elem *table [[buffer(3)]], device float *sums [[buffer(4)]], \
       constant uint &width [[buffer(5)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
       uint sg [[simdgroup_index_in_threadgroup]]) { \
@@ -218,4 +236,6 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
 // draft's bf16 norms.
 NORM_RMS_TABLE(norm_rms_table16_decode, gguf_sg::Table16, bfloat)
 NORM_RMS_TABLE(norm_rms_table16_decode_f32, gguf_sg::Table16, float)
+NORM_RMS_TABLE(norm_rms_table16f_decode, gguf_sg::Table16F, bfloat)
+NORM_RMS_TABLE(norm_rms_table16f_decode_f32, gguf_sg::Table16F, float)
 #undef NORM_RMS_TABLE

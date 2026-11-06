@@ -194,6 +194,7 @@ NSUInteger addedBuffers(const EventStep &step) noexcept {
     case EventStep::Kind::Signal: return 1;
     case EventStep::Kind::Wait: return 0;
     case EventStep::Kind::Host: return step.gpu == HostStepGpu::Awake ? 2 : 1;
+    case EventStep::Kind::Break: return 1;
     }
     return 0;
 }
@@ -205,10 +206,12 @@ NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches) {
     size_t before = 0;
     NSUInteger buffers = 1;
     for (const EventStep &step : events) {
-        if (step.kind == EventStep::Kind::Host ? !step.work : !step.event || !step.value)
-            throw MetalBackendError(step.kind == EventStep::Kind::Host
-                                        ? "host step needs work"
-                                        : "event step needs an event and a nonzero value");
+        if (step.kind == EventStep::Kind::Host     ? !step.work
+            : step.kind == EventStep::Kind::Break ? step.event || step.value
+                                                  : !step.event || !step.value)
+            throw MetalBackendError(step.kind == EventStep::Kind::Host    ? "host step needs work"
+                                    : step.kind == EventStep::Kind::Break ? "a command buffer break takes no event"
+                                                                          : "event step needs an event and a nonzero value");
         if (step.gpu == HostStepGpu::Awake && step.kind != EventStep::Kind::Host)
             throw MetalBackendError("only a host step keeps the GPU awake");
         if (step.before < before)
@@ -1367,7 +1370,9 @@ struct MetalBackend::Impl {
             if (item.threadCount >
                 item.pipeline.maxTotalThreadsPerThreadgroup) {
                 throw MetalBackendError(
-                    "threadsPerThreadgroup exceeds pipeline capability");
+                    "threadsPerThreadgroup " + std::to_string(item.threadCount) +
+                    " exceeds pipeline '" + item.source->pipelineName + "' capability " +
+                    std::to_string(item.pipeline.maxTotalThreadsPerThreadgroup));
             }
         }
 
@@ -1522,11 +1527,21 @@ struct MetalBackend::Impl {
     // Once a spin ended at its release, awake steps spin. If one ran past its
     // release, or the spin cannot be built or run, awake steps run as plain
     // ones (encodeHostStep), which only gives up the spin's head start, and a
-    // warning says so. If no spin was spinning at its release, the GPU busy
-    // with other work, the check decides nothing: awake steps run as plain
-    // ones for kHostStepSpinRecheck, and the first command with one after
-    // that checks again.
+    // warning says so. If every spin started late, the GPU busy with other
+    // work, the check decides nothing: awake steps run as plain ones for
+    // kHostStepSpinRecheck, and the first command with one after that checks
+    // again. On Apple7/8 awake steps run as plain ones, unchecked and without
+    // a warning: a spin's buffer there starts once committed, before the work
+    // ahead of its step ended, and spins out its bound beside that work: a
+    // decode cycle of 49 streamed expert loads took 0.51-0.98 s instead of
+    // 93-144 ms (M2 Max, Flash-Next Q2_0; served with 24G of experts, 4.6
+    // against 44.6 tok/s). A spin held until the work ahead ended gained
+    // nothing over plain steps there.
     void checkHostStepSpin() {
+        if (capabilities.appleGpuFamily < 9) {
+            nextSpinCheck = AwakeClock::time_point::max();
+            return;
+        }
         @autoreleasepool {
             try {
                 HostStepSpin spin = newHostStepSpin();
@@ -1625,6 +1640,15 @@ struct MetalBackend::Impl {
                         if (step->kind == EventStep::Kind::Host) {
                             command = encodeHostStep(command, leading, ticketState->hostSteps,
                                                      ticketState->sequence, *step, failEncoding);
+                            continue;
+                        }
+                        if (step->kind == EventStep::Kind::Break) {
+                            leading.push_back(command);
+                            [command commit];
+                            command = [queue commandBuffer];
+                            if (!command) {
+                                failEncoding("unable to create Metal command buffer");
+                            }
                             continue;
                         }
                         id<MTLSharedEvent> event =
@@ -1758,18 +1782,22 @@ struct MetalBackend::Impl {
     // for it, then hands back an already-completed ticket with the summed
     // timing, so callers observe the usual asynchronous contract.
     // Host steps run between the dispatches, in order, each `then` after its
-    // work (EventStep::Kind::Host); a command with other event steps is
-    // refused.
+    // work (EventStep::Kind::Host). Profiled dispatches run as commands of
+    // their own, so a Break (a command boundary) needs no replay; a command
+    // with signals or waits is refused.
     CommandTicket submitProfiled(std::span<const ComputeDispatch> dispatches,
                                  std::span<const EventStep> events,
                                  CommandCompletion completion) {
-        if (std::ranges::any_of(events, [](const EventStep &step) { return step.kind != EventStep::Kind::Host; }))
+        if (std::ranges::any_of(events, [](const EventStep &step) {
+                return step.kind != EventStep::Kind::Host && step.kind != EventStep::Kind::Break;
+            }))
             throw MetalBackendError("dispatch profiling does not replay event steps");
         const PreparedCommand command = prepare(dispatches);
         CommandTiming total;
         auto step = events.begin();
         const auto runSteps = [&](size_t before) {
             for (; step != events.end() && step->before == before; ++step) {
+                if (step->kind == EventStep::Kind::Break) continue;
                 step->work();
                 if (step->then) step->then();
             }

@@ -41,4 +41,18 @@ mma_acc(thread float2 &c, vec<T, 2> a, vec<T, 2> b) {
   simdgroup_multiply_accumulate(D, A, B, C);
   c = te(D);
 }
+// The same MMA with operands of two types: Apple7/8 (M1/M2), which have no bf16 arithmetic, take exact half or fp32
+// weights against fp32 activations.
+template <typename TA, typename TB>
+__attribute__((always_inline)) inline void
+mma_mixed(thread float2 &c, vec<TA, 2> a, vec<TB, 2> b) {
+  simdgroup_matrix<TA, 8, 8> A;
+  simdgroup_matrix<TB, 8, 8> B;
+  simdgroup_matrix<float, 8, 8> C, D;
+  te(A) = a;
+  te(B) = b;
+  te(C) = c;
+  simdgroup_multiply_accumulate(D, A, B, C);
+  c = te(D);
+}
 } // namespace sgmatrix

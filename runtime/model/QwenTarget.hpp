@@ -603,6 +603,11 @@ protected:
       if (const ops::BlockMoeWeights *ffn = layers.moe(index); ffn && ffn->stream)
         ffn->stream->addLoad(steps.front().graph, parts, ffn->streamBlock);
       for (Step &step : steps) layers.addPrefillExperts(step, index);
+      // Each layer ends its Metal command buffer, so that macOS can run the
+      // display's work between a long chunk's layers instead of aborting
+      // the command (ImpactingInteractivity); prefillCommandBuffers() tells
+      // the scheduler how far that bounds a buffer.
+      if (backend_.capabilities().appleGpuFamily < 9 && index + 1 < range.end) steps.front().graph.split();
     }
     std::vector<metal::MetalBuffer> outputs;
     if (range.end != geometry_.layers) return outputs;

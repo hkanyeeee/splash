@@ -78,8 +78,8 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // columns, with optional K splits. GgufPrefill: the 128-row shared-stage
 // prefill tile.
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
-// (Apple9), over an activation table, every request lane in one threadgroup,
-// optional K splits.
+// (Apple9; Apple7/8 on half weights and fp32 activations), over an activation
+// table, every request lane in one threadgroup, optional K splits.
 enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister };
 // The decode tiles hold at most a full decode batch.
 inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
@@ -115,8 +115,13 @@ struct LinearConfig final {
   bool spread = false;
   // GgufStaged gate/up decode: gate and up in one dispatch whose simdgroups
   // each stage both tensors' 32 columns (gguf_decode_<format>_m<rows>_gate_up,
-  // gate and up in one format), instead of a gate pass and an up pass.
+  // gate and up in one format), instead of a gate pass and an up pass. With
+  // fp32Table (Apple7/8's register tile): one dispatch of both tensors' K
+  // partitions (gguf_decode_sgf_<format>_l<lanes>_gu).
   bool oneGateUpPass = false;
+  // GgufRegister on Apple7/8: the F32 instances read Table16F, whose fp32
+  // values enter their MMA without the widening a bf16 table costs.
+  bool fp32Table = false;
   // GgufStaged one-lane decode: the 16-row tile over two lanes of storage
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
   // discards, instead of the 8-row tile.
@@ -172,10 +177,15 @@ struct LinearScratchSize final {
 enum class LinearInput : uint8_t {
   Plain,    // bf16 [rows][K]
   Table16,  // the register tile's table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  Table16F, // Table16's layout of fp32 values: Apple7/8's register tile (LinearConfig::fp32Table)
 };
+[[nodiscard]] constexpr bool isTable16(LinearInput layout) noexcept {
+  return layout == LinearInput::Table16 || layout == LinearInput::Table16F;
+}
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
-[[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
-  return uint64_t{width} * rows * 2;
+[[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows,
+                                            LinearInput layout = LinearInput::Table16) noexcept {
+  return uint64_t{width} * rows * (layout == LinearInput::Table16F ? 4 : 2);
 }
 [[nodiscard]] uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept;
 // Throws unless `scratch` holds the `layout` table a producer writes for `rows`
@@ -183,7 +193,7 @@ enum class LinearInput : uint8_t {
 // 64-input spans.
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows);
 // The kernel name suffix of a producer that writes the `layout` table:
-// "_table16", or none for Plain.
+// "_table16", "_table16f", or none for Plain.
 [[nodiscard]] const char *tableSuffix(LinearInput layout) noexcept;
 // The scratch table currently holds `source` in `layout`. Plain means the
 // scratch describes nothing. Producers return it, consumers accept it and
@@ -203,6 +213,9 @@ public:
   // projection prepares its table from the rotated rows itself
   // (LinearGguf.cpp), so its producer writes plain rows.
   [[nodiscard]] LinearInput input() const noexcept;
+  // The table the plan's register tile reads, Plain for the other tiles: the
+  // producer's (input()) or, rotated, the one the plan prepares itself.
+  [[nodiscard]] LinearInput table() const noexcept;
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;
 
@@ -310,6 +323,7 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
+  GpuClass family_;
   KernelCalibration calibration_;
 };
 

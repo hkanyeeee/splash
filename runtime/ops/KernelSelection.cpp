@@ -186,7 +186,8 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
       registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
                 cores))
     return {.tile = LinearTile::GgufRegister,
-            .splits = splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits};
+            .splits = splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits,
+            .fp32Table = calibration.legacySimdgroup};
   LinearConfig config = staged(p, n, k, w.rows, unit.weightBits16, cores, onePass ? Passes::Either : Passes::Two);
   config.spread = cores >= p.spreadFromCores;
   config.sixteenRows =
@@ -272,7 +273,8 @@ MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape,
   config.ggufTile = formats.experts.registerTakes && calibration.moe.registerTile[size_t(formats.experts.formatClass)]
                         ? MoeGgufTile::Register
                         : MoeGgufTile::Staged;
-  config.expertTile = phase == MoePhase::Prefill && config.ggufTile == MoeGgufTile::Staged &&
+  if (calibration.legacySimdgroup) config.ggufTile = MoeGgufTile::Mma;
+  config.expertTile = phase == MoePhase::Prefill && config.ggufTile != MoeGgufTile::Register &&
                               uint64_t{rows} * shape.expertsPerToken > shape.experts
                           ? MoeExpertTile::M32
                           : MoeExpertTile::M8;

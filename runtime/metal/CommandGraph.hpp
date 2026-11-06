@@ -83,6 +83,9 @@ public:
   void wait(SharedEvent event, uint64_t value) {
     step(std::move(event), value, EventStep::Kind::Wait);
   }
+  // Ends the Metal command buffer after the dispatches added so far; the
+  // next one runs them after it on the same queue (EventStep::Kind::Break).
+  void split() { step({}, 0, EventStep::Kind::Break); }
   // A host step after the dispatches added so far (EventStep::Kind::Host):
   // `work` runs on the CPU between the work before and the work after it,
   // `timed` gets its round trip once the command completed, `gpu` says
