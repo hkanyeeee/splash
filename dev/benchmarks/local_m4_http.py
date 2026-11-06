@@ -9,9 +9,9 @@ Example: --prompts build/m4-prompts --output build/m4-results/long-stock
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import time
 import urllib.request
+from pathlib import Path
 
 
 def save(path, value):
@@ -24,7 +24,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--lengths", default="65536,131072,196608")
-    parser.add_argument("--select", help="run only these comma-separated lengths from the frozen prompts")
+    parser.add_argument(
+        "--select",
+        help="run only these comma-separated lengths from the frozen prompts",
+    )
     parser.add_argument("--port", type=int, default=1234)
     parser.add_argument("--status-port", type=int, default=2235)
     parser.add_argument("--model", default="qwen3.8-27b-mtp")
@@ -72,10 +75,16 @@ def main():
             )
             name = f"context-{length}.json"
             save(args.prompts / name, [{"role": "user", "content": content}])
-            manifest["files"][name] = hashlib.sha256((args.prompts / name).read_bytes()).hexdigest()
+            manifest["files"][name] = hashlib.sha256(
+                (args.prompts / name).read_bytes()
+            ).hexdigest()
         save(manifest_path, manifest)
     save(args.output / "prompts-manifest.json", manifest)
-    selected = None if not args.select else {f"context-{int(n)}.json" for n in args.select.split(",")}
+    selected = (
+        None
+        if not args.select
+        else {f"context-{int(n)}.json" for n in args.select.split(",")}
+    )
     if selected is not None and not selected.issubset(manifest["files"]):
         raise ValueError("selected lengths must exist in the frozen prompt manifest")
     results = []
@@ -90,28 +99,51 @@ def main():
             case = f"{Path(name).stem}-{phase}"
             if phase == "append":
                 messages = messages + [
-                    {"role": "assistant", "content": "我会逐项检查内存所有权与取消后的资源释放。"},
-                    {"role": "user", "content": "进一步分析 GPU 异步工作尚未结束时的缓存回收，给出具体的测试程序和预期结果。"},
+                    {
+                        "role": "assistant",
+                        "content": "我会逐项检查内存所有权与取消后的资源释放。",
+                    },
+                    {
+                        "role": "user",
+                        "content": "进一步分析 GPU 异步工作尚未结束时的缓存回收，给出具体的测试程序和预期结果。",
+                    },
                 ]
             before = request("/status")
             if before["active_requests"]:
                 raise RuntimeError("another inference request is active")
-            payload = {"model": args.model, "messages": messages,
-                       "max_tokens": args.max_tokens, "temperature": 0,
-                       "seed": 42, "reasoning_effort": "xhigh"}
+            payload = {
+                "model": args.model,
+                "messages": messages,
+                "max_tokens": args.max_tokens,
+                "temperature": 0,
+                "seed": 42,
+                "reasoning_effort": "xhigh",
+            }
             started = time.perf_counter()
             response = request("/v1/chat/completions", payload)
             wall = time.perf_counter() - started
             after = request("/status")
-            record = {"case": case, "wall_s": wall, "response": response,
-                      "before": before, "after": after,
-                      "other_submissions": after["requests"]["submitted"] - before["requests"]["submitted"] - 1}
+            record = {
+                "case": case,
+                "wall_s": wall,
+                "response": response,
+                "before": before,
+                "after": after,
+                "other_submissions": after["requests"]["submitted"]
+                - before["requests"]["submitted"]
+                - 1,
+            }
             save(args.output / f"{case}.json", record)
             if "choices" not in response:
                 raise RuntimeError(response)
             summary = {k: record[k] for k in ("case", "wall_s", "other_submissions")}
-            summary.update({"timings": response.get("timings"), "usage": response.get("usage"),
-                            "speculation": response.get("metrics", {}).get("speculation")})
+            summary.update(
+                {
+                    "timings": response.get("timings"),
+                    "usage": response.get("usage"),
+                    "speculation": response.get("metrics", {}).get("speculation"),
+                }
+            )
             results.append(summary)
             save(args.output / "summary.json", results)
             print(json.dumps(summary, ensure_ascii=False), flush=True)

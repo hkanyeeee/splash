@@ -27,7 +27,10 @@ static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
 
 // The compiled GDN shapes (kernels/prefill/gdn.metal, kernels/decode/gdn.metal),
 // of either gate, and their kernels' name suffix. The scan reads no packed
-// rows, so shapes of one head layout share its kernel (scanSuffix).
+// rows, so shapes of one head layout share its kernel (scanSuffix). The
+// kernels that read the norm take the norm types the shape's families store
+// (normKernel): F32 and bf16, or F32 alone for Qwen3.8-Flash-Next's, which
+// loads from GGUFs only.
 struct CompiledGdn final {
   GdnShape shape;
   std::string_view suffix;
@@ -256,6 +259,13 @@ uint64_t gdnTapeLayerBytes(const GdnShape &shape) noexcept {
   return gdn_tape_layer_bytes(shape.convolutionDimension,
                               (shape.keyHeads + shape.valueHeads) * shape.headDimension,
                               shape.valueHeads);
+}
+
+void GDN::addGenerationPrefix(metal::CommandGraph &graph, metal::MetalBuffer start,
+                              metal::MetalBuffer tape, metal::MetalBuffer output, uint32_t rows) {
+  if (!rows || rows > SPLASH_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("generation prefix is outside the verify tape");
+  graph.add("verify_gdn_prefix_f32", {start, tape, output}, rows, {48, 48, 1});
 }
 
 } // namespace splash::ops

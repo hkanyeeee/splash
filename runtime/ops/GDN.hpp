@@ -132,6 +132,12 @@ struct GdnDecodeBuffers final {
 
 class GDN final {
 public:
+  // Fold the retained rows of the local 48-layer FP32 tape into a private
+  // snapshot. The caller checks the model geometry before selecting it.
+  static void addGenerationPrefix(metal::CommandGraph &graph, metal::MetalBuffer start,
+                                  metal::MetalBuffer tape, metal::MetalBuffer output,
+                                  uint32_t rows);
+
   // Each capture, ascending inside the rows, ends one run of the prepare and
   // scan dispatches, and the next run starts from the state it stored; the
   // gate then runs once over every row. The scan is sequential, so with an
