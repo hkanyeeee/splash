@@ -21,11 +21,11 @@ exec "$checkout/splash" serve \
   --offline --mmproj /Users/hewenxin/gguf_models/Qwen3.8-27B-GGUF/mmproj-F16.gguf \
   --host "${SPLASH_LOCAL_HOST:-0.0.0.0}" \
   --port "${SPLASH_LOCAL_PORT:-1234}" \
-  --max-memory "${SPLASH_LOCAL_MEMORY:-26G}" \
+  --max-memory "${SPLASH_LOCAL_MEMORY:-25G}" \
   --max-context "${SPLASH_LOCAL_CONTEXT:-auto}" \
   --kv-format bf16 --state-format bf16 \
   --queue-size 2 \
   --max-cache-disk 0 \
-  --idle-release "${SPLASH_LOCAL_IDLE:-10m}" \
+  --idle-release "${SPLASH_LOCAL_IDLE:-off}" \
   --default-reasoning-effort xhigh \
   "$@"
