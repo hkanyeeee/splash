@@ -25,7 +25,8 @@ exec "$checkout/splash" serve \
   --max-context "${SPLASH_LOCAL_CONTEXT:-auto}" \
   --kv-format bf16 --state-format bf16 \
   --queue-size 2 \
-  --max-cache-disk 0 \
+  --max-cache-disk 32G --persistent-cache \
+  --cache-dir "$HOME/Library/Caches/Splash/prefix-cache" \
   --idle-release "${SPLASH_LOCAL_IDLE:-off}" \
   --default-reasoning-effort xhigh \
   "$@"
