@@ -76,9 +76,10 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
 }
 
 struct QwenTarget::WarmupTrace {
-  struct Point { const char *stage; uint32_t layer, width, routes; };
+  struct Point { const char *stage; uint32_t layer, width, routes; size_t after; };
   static constexpr uint32_t capacity = 1024;
   const char *phase;
+  bool request = false;
   metal::MetalBuffer results, laneRows;
   uint32_t layer = 0;
   std::vector<Point> points;
@@ -105,7 +106,7 @@ void QwenTarget::observe(metal::CommandGraph &graph, const char *stage, const me
   if (!count || count > UINT32_MAX || slot >= WarmupTrace::capacity || count * bytes > buffer.sizeBytes() ||
       (routeRows && uint64_t{rows} * routes * sizeof(uint32_t) > routeRows.sizeBytes()))
     throw std::logic_error("invalid B1 warmup trace extent");
-  trace.points.push_back({stage, trace.layer, width, routes});
+  trace.points.push_back({stage, trace.layer, width, routes, graph.dispatches().size()});
   ops::addWarmupTrace(graph, buffer, trace.results, trace.laneRows, routeRows, rows, width, routes, bytes, slot);
 }
 
@@ -122,6 +123,51 @@ void QwenTarget::finishWarmupTrace() {
     return;
   }
   logLine("NAN_TRACE phase=", trace->phase, " finite_checkpoints=", trace->points.size());
+}
+
+void QwenTarget::beginRequestTrace() {
+  beginWarmupTrace("cold-prefill");
+  warmupTrace_->request = true;
+}
+
+void QwenTarget::traceFinalRow(metal::CommandGraph &graph, const char *stage, const metal::MetalBuffer &row) const {
+  observe(graph, stage, row, 1, geometry_.hiddenSize);
+}
+
+std::function<void()> QwenTarget::takeRequestTrace(const metal::CommandGraph &graph, uint64_t request,
+                                                    uint32_t rows, QwenPrefillLayers layers) {
+  // The ticket owns the result and a copy of the dispatch descriptions until its command finishes.
+  std::shared_ptr<WarmupTrace> trace(std::move(warmupTrace_));
+  std::vector<std::string> dispatches;
+  for (const auto &d : graph.dispatches()) {
+    std::ostringstream line;
+    if (d.pipelineName != "warmup_first_nonfinite") {
+      line << d.pipelineName << (d.indirectThreadgroups.buffer ? " indirect_bound=" : " grid=")
+           << d.threadgroups.x << 'x' << d.threadgroups.y << 'x' << d.threadgroups.z
+           << " threads=" << d.threadsPerThreadgroup.x << 'x' << d.threadsPerThreadgroup.y << 'x' << d.threadsPerThreadgroup.z;
+      for (const auto constant : d.constants) line << " fc=" << constant;
+    }
+    dispatches.push_back(line.str());
+  }
+  return [trace = std::move(trace), dispatches = std::move(dispatches), request, rows, layers]() {
+    const auto *first = static_cast<const uint32_t *>(trace->results.contents());
+    for (size_t i = 0; i < trace->points.size(); ++i) {
+      if (first[i] == UINT32_MAX) continue;
+      const auto &point = trace->points[i];
+      logLine("PREFILL_TRACE request=", request, " rows=", rows, " layers=[", layers.first, ",", layers.end,
+              ") layer=", point.layer, " tensor=", point.stage, " checkpoint=", i, " row=",
+              first[i] / point.width / point.routes, " route=", first[i] / point.width % point.routes,
+              " element=", first[i] % point.width, " graph_position=", point.after);
+      size_t start = 0;
+      for (size_t j = 0; j < i; ++j)
+        if (trace->points[j].layer < point.layer) start = trace->points[j].after;
+      for (size_t j = start; j < point.after; ++j)
+        if (!dispatches[j].empty()) logLine("PREFILL_DISPATCH request=", request, " i=", j, " ", dispatches[j]);
+      return;
+    }
+    logLine("PREFILL_TRACE request=", request, " rows=", rows, " layers=[", layers.first, ",", layers.end,
+            ") finite_checkpoints=", trace->points.size());
+  };
 }
 
 void QwenTarget::discardWarmupTrace() { warmupTrace_.reset(); }
@@ -288,6 +334,12 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
         captures.push_back({capture.row, capture.convolution[layer], capture.recurrent[layer]});
       if (!sequence.endCodes.empty())
         captures.push_back({sequence.rows, {}, sequence.endCodes[layer]});
+      if (warmupTrace_ && warmupTrace_->request) {
+        const auto &state = geometry_.stateLayout;
+        observe(step.graph, "gdn_conv_input", sequence.convolutionIn[layer], 1, state.convolutionHistory * state.convolutionChannels);
+        observe(step.graph, "gdn_recurrent_input", sequence.recurrentIn[layer], 1,
+                state.recurrentGroups * state.recurrentRows * state.recurrentColumns, ops::elementBytes(state.format));
+      }
       ops::GDN::addPrefill(
           step.graph, backend_,
           {u16(b.gdnPacked, geometry_.packedGdnWidth), mixer.convolutionWeights, sequence.convolutionIn[layer],
@@ -300,6 +352,14 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
           geometry_.stateLayout.cachedCodes);
       if (warmupTrace_) {
         const auto &state = geometry_.stateLayout;
+        if (warmupTrace_->request) {
+          observe(step.graph, "gdn_prepare_q", b.gdnQueries, step.rows, geometry_.gdnKeyWidth());
+          observe(step.graph, "gdn_prepare_k", b.gdnKeys, step.rows, geometry_.gdnKeyWidth());
+          observe(step.graph, "gdn_prepare_v", b.gdnValues, step.rows, geometry_.attentionWidth);
+          observe(step.graph, "gdn_prepare_decay", b.gdnDecay, step.rows, geometry_.gdnValueHeads, 4);
+          observe(step.graph, "gdn_prepare_beta", b.gdnBeta, step.rows, geometry_.gdnValueHeads);
+          observe(step.graph, "gdn_scan_rows", b.recurrent, step.rows, geometry_.attentionWidth);
+        }
         observe(step.graph, "seed_gdn_conv_state", sequence.convolutionOut[layer], 1,
                 state.convolutionHistory * state.convolutionChannels);
         observe(step.graph, "seed_gdn_recurrent_state", sequence.recurrentOut[layer], 1,
@@ -344,6 +404,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
                                      b.fullQueries, step.kvLayers[layer], pageTables, sequences, rows,
                                      geometry_.attentionQueryHeads, geometry_.kvLayout, variant);
+  if (warmupTrace_ && warmupTrace_->request)
+    observe(step.graph, "attention_rotated_query", b.fullQueries, step.rows, geometry_.attentionWidth);
   std::array<ops::AttentionHistory, ExecutionLimits::maximumBatchWidth> histories{};
   if (step.decode) {
     std::array<ops::AttentionBlocks, ExecutionLimits::maximumBatchWidth> attended{};

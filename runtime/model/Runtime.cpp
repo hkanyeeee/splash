@@ -708,6 +708,10 @@ struct Runtime::Impl {
   // takeStepChoices).
   std::vector<RuntimeInstrumentation::StepChoice> stepChoices;
 #endif
+  const bool traceColdPrefill = [] {
+    const char *setting = std::getenv("SPLASH_PREFILL_TRACE");
+    return setting && std::string_view(setting) == "1";
+  }();
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -2168,7 +2172,7 @@ struct Runtime::Impl {
   PrefillOutputs encodePrefillGraph(CommandGraph &graph, CommandGraph &encodes,
                                     std::span<const ModelBatchItem> items,
                                     std::array<Request *, kLaneCount> &entries, SpilledKvReads &reads,
-                                    QwenPrefillLayers layers) {
+                                    QwenPrefillLayers layers, bool requestTrace = false) {
     const bool begins = !layers.first, ends = layers.end == geometry.target.layers;
     const std::vector<PrefillChunk> chunks = preparePrefill(items, entries);
     const uint32_t lanes = static_cast<uint32_t>(items.size());
@@ -2275,6 +2279,12 @@ struct Runtime::Impl {
     }
     const std::vector<MetalBuffer> finalHidden =
         targetModel->addPrefill(graph, modelChunks, kvPages, reads, layers, aneFfn);
+    if (requestTrace && ends) {
+      const auto [c, s] = parts[0].back();
+      const auto &last = chunks[c].sequences[s];
+      targetModel->traceFinalRow(graph, "target_last_before_draft", prefillU16(finalHidden[c],
+          last.rowBegin + last.part.tokenCount - 1, 1, geometry.target.hiddenSize));
+    }
     for (uint32_t c = 0; ends && c < chunks.size(); ++c) addDraftContext(graph, chunks, c);
 
     PrefillOutputs outputs;
@@ -2288,6 +2298,7 @@ struct Runtime::Impl {
         const PrefillSequence &last = chunks[c].sequences[s];
         const MetalBuffer lastRow =
             prefillU16(finalHidden[c], last.rowBegin + last.part.tokenCount - 1, 1, geometry.target.hiddenSize);
+        if (requestTrace) targetModel->traceFinalRow(graph, "target_last_after_draft", lastRow);
         if (const auto selection = finishPrompt(graph, *entries[lane], items[lane], lastRow, lane))
           selections[selectionCount++] = *selection;
         outputs.lastRows[lane] = lastRow;
@@ -2300,6 +2311,7 @@ struct Runtime::Impl {
       }
     }
     if (selectionCount) encodeInitialSelections(graph, std::span(selections).first(selectionCount), lanes);
+    if (requestTrace && ends) targetModel->traceFinalRow(graph, "host_finite_row_input", outputs.lastRows[0]);
     return outputs;
   }
 
@@ -3553,7 +3565,7 @@ Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
   impl_->releaseLeftStaging();
   switch (plan.kind) {
   case WorkKind::Prefill:
-    return prefillAsync(plan, items, std::move(completion));
+    return prefillAsync(plan, items, std::move(completion), true);
   case WorkKind::Decode:
     return decodeAsync(plan, items, std::move(completion));
   }
@@ -3563,7 +3575,7 @@ Runtime::submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
 std::unique_ptr<ModelBatchTicket>
 Runtime::prefillAsync(const BatchPlan &plan,
                       std::span<const ModelBatchItem> items,
-                      std::function<void()> completion) {
+                      std::function<void()> completion, bool serving) {
   impl_->requireCommand(plan, items);
   validatePlan(plan, items, WorkKind::Prefill);
   if (plan.decodeStage != DecodeStage::Regular) {
@@ -3587,7 +3599,22 @@ Runtime::prefillAsync(const BatchPlan &plan,
   }
   const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items, layers);
   CommandGraph encodes;
-  const auto outputs = impl_->encodePrefillGraph(graph, encodes, items, entries, *reads, layers);
+  const bool tracing = serving && impl_->traceColdPrefill && items.size() == 1 && !items[0].logicalPosition &&
+                       items[0].tokenCount <= 32 && impl_->backend.capabilities().appleGpuFamily == 8 &&
+                       impl_->model.descriptor.family() == "Qwen3.6-35B-A3B";
+  const auto encode = [&](CommandGraph &work, CommandGraph &images) {
+    if (!tracing) return impl_->encodePrefillGraph(work, images, items, entries, *reads, layers);
+    try {
+      impl_->targetModel->beginRequestTrace();
+      return impl_->encodePrefillGraph(work, images, items, entries, *reads, layers, true);
+    } catch (...) {
+      impl_->targetModel->discardWarmupTrace();
+      throw;
+    }
+  };
+  const auto outputs = encode(graph, encodes);
+  auto report = tracing ? impl_->targetModel->takeRequestTrace(graph, items[0].requestId, items[0].tokenCount, layers)
+                        : std::function<void()>{};
   // A state captured inside the command starts from the lane's context
   // window as the command finds it, whose older rows the command's own rows
   // overwrite. It is copied once, before the command's first pass runs: a
@@ -3600,7 +3627,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   // has waited for every run of the command.
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, entries, outputs, draws, reads, layers, ends,
+  auto finish = [impl, entries, outputs, draws, reads, layers, ends, report = std::move(report),
                  items = std::move(copiedItems)](CommandTiming &timing) mutable {
     // A chunk whose Neural Engine work failed holds no usable outputs, and
     // the split has stopped: the GPU runs the chunk again alone, which
@@ -3621,6 +3648,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // the first run could not read. The first ticket was released before
     // this completion runs (DeferredMetalTicket::wait), so the backend takes
     // the rerun's command, whose time counts in the chunk's.
+    if (report) report();
     if (impl->aneFfn && !impl->aneFfn->finish()) {
       for (uint32_t lane = 0; lane < items.size(); ++lane)
         entries[lane]->rngCounter = draws[lane];

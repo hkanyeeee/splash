@@ -90,7 +90,7 @@ private:
                                        uint32_t stateLane);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   prefillAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
-               std::function<void()> completion);
+               std::function<void()> completion, bool serving = false);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
   decodeAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion);

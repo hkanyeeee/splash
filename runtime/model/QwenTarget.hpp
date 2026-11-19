@@ -449,6 +449,10 @@ public:
   void beginWarmupTrace(const char *phase);
   void finishWarmupTrace();
   void discardWarmupTrace();
+  void beginRequestTrace();
+  std::function<void()> takeRequestTrace(const metal::CommandGraph &, uint64_t request,
+                                         uint32_t rows, QwenPrefillLayers layers);
+  void traceFinalRow(metal::CommandGraph &, const char *stage, const metal::MetalBuffer &) const;
 
   // The step scratch the target allocated itself (qwenTargetScratchBytes).
   [[nodiscard]] virtual QwenTargetScratchBytes allocatedScratchBytes() const noexcept;
