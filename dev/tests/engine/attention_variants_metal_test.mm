@@ -439,9 +439,9 @@ std::vector<kv::ChunkedPrefillParams> sequencesOf(const Case &data, const Stagin
 }
 
 // The plan of a case's staged rows, every lane in one dispatch.
-ops::AttentionPlan planOf(const Case &data, const Staging &staging) {
+ops::AttentionPlan planOf(const Case &data, const Staging &staging, ops::AttentionPass pass) {
   return ops::PagedAttention::plan(
-      sequencesOf(data, staging), kQueryHeads, data.layout, data.attention(), ops::Int8Activations::On,
+      pass, sequencesOf(data, staging), kQueryHeads, data.layout, data.attention(), ops::Int8Activations::On,
       ops::PagedAttention::workspace(data.lanes * ops::kAttentionSequenceSplits, kQueryHeads, data.layout),
       data.variant);
 }
@@ -533,7 +533,7 @@ void checkPrefill(metal::MetalBackend &backend, kv::Format format, bool int8Quer
     for (uint32_t first = 0; first < rows; first += chunk) {
       const uint32_t chunkRows = std::min(chunk, rows - first);
       const Staging staging = stage(backend, data, first, chunkRows, (chunkRows + kPageTokens - 1) / kPageTokens * kPageTokens);
-      run(backend, data, staging, planOf(data, staging));
+      run(backend, data, staging, planOf(data, staging, ops::AttentionPass::Prompt));
       checkStore(data, staging, what);
       largest = std::max(largest, checkOutput(data, staging, what + (whole ? "" : " in chunks of " + std::to_string(chunk))));
     }
@@ -550,7 +550,7 @@ void checkVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queri
   const auto count = uint32_t(histories.size());
   const Case data = makeCase(backend, format, int8Queries, variant, count, kLaneRows, lanes);
   const Staging staging = stage(backend, data, 0, kLaneRows, kPageTokens);
-  run(backend, data, staging, planOf(data, staging));
+  run(backend, data, staging, planOf(data, staging, ops::AttentionPass::Verify));
   const std::string what = describe(data, "verify");
   checkStore(data, staging, what);
   const double largest = checkOutput(data, staging, what);
@@ -681,7 +681,7 @@ void checkTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Q
   for (uint32_t lane = 0; lane < count; ++lane)
     for (uint32_t row = 0; row < kRows; ++row) contents<SplashTreeRow>(tree)[lane * kRows + row] = trees[lane].place(row);
   const Staging staging = stage(backend, data, 0, kRows, kPageTokens);
-  const ops::AttentionPlan plan = planOf(data, staging);
+  const ops::AttentionPlan plan = planOf(data, staging, ops::AttentionPass::Verify);
   run(backend, data, staging, plan, tree);
   const std::string what = describe(data, "tree verify");
   checkStore(data, staging, what);
@@ -734,7 +734,7 @@ void checkRaggedTreeVerify(metal::MetalBackend &backend, kv::Format format, bool
     }
     contents<SplashLaneRows>(staging.layout)[lane] = blocks[lane];
   }
-  run(backend, data, staging, planOf(data, staging), tree);
+  run(backend, data, staging, planOf(data, staging, ops::AttentionPass::Verify), tree);
   const std::string what = describe(data, "ragged tree verify");
   const double largest = checkTreeRows(data, staging, trees, blocks, what);
   std::cout << what << ": lanes of 16, 5, 9 and 12 tree rows at rows 0, 16, 21 and 30, largest error " << largest
@@ -749,7 +749,7 @@ void checkRaggedTreeVerify(metal::MetalBackend &backend, kv::Format format, bool
 void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8Queries) {
   const auto counts = [&](const Case &data, std::span<const uint32_t> splitCounts) {
     const Staging staging = stage(backend, data, 0, kLaneRows, kPageTokens);
-    const ops::AttentionPlan plan = planOf(data, staging);
+    const ops::AttentionPlan plan = planOf(data, staging, ops::AttentionPass::Verify);
     run(backend, data, staging, plan);
     // The workspace production allocates for the lanes, which holds every
     // split count's slots, poisoned again before each.
@@ -810,7 +810,7 @@ void checkWindowWithinHistory(metal::MetalBackend &backend, kv::Format format, b
                            std::array<uint32_t, 4> histories) {
     const Case data = makeCase(backend, format, int8Queries, variant, lanes, rows, histories);
     const Staging staging = stage(backend, data, 0, rows, verify ? kPageTokens : (rows + 31) / 32 * 32);
-    run(backend, data, staging, planOf(data, staging));
+    run(backend, data, staging, planOf(data, staging, verify ? ops::AttentionPass::Verify : ops::AttentionPass::Prompt));
     const auto *begin = contents<uint16_t>(staging.output);
     return std::vector<uint16_t>(begin, begin + staging.output.sizeBytes() / 2);
   };
@@ -833,7 +833,7 @@ void checkNonFiniteQueries(metal::MetalBackend &backend, bool int8Queries) {
   constexpr uint32_t kRows = 24, kHistory = 300;
   const Case data = makeCase(backend, kv::Format::Int8, int8Queries, kWhole, 1, kRows, {kHistory, 0, 0, 0});
   const Staging staging = stage(backend, data, 0, kRows, kPageTokens);
-  const ops::AttentionPlan plan = planOf(data, staging);
+  const ops::AttentionPlan plan = planOf(data, staging, ops::AttentionPass::Prompt);
   const auto outputs = [&] {
     run(backend, data, staging, plan);
     const auto *begin = contents<uint16_t>(staging.output);
@@ -878,7 +878,7 @@ void checkPlans(metal::MetalBackend &backend) {
                           ops::AttentionVariant variant = {}) {
     const std::array sequence{ops::PagedAttention::chunkParams(history, rows, (rows + 31) / 32 * 32,
                                                                (history + rows + 31) / 32)};
-    return ops::PagedAttention::plan(sequence, heads, of, ops::kApple10Attention, off,
+    return ops::PagedAttention::plan(splash::ops::AttentionPass::Prompt, sequence, heads, of, ops::kApple10Attention, off,
                                      ops::PagedAttention::workspace(ops::kAttentionSequenceSplits, heads, of), variant);
   };
   const auto splitsAfter = [&](uint32_t rows, uint32_t history, ops::AttentionVariant variant) {
@@ -1104,7 +1104,7 @@ void checkOutputRows(metal::MetalBackend &backend) {
                                lanesOfEight ? std::array<uint32_t, 4>{0, 505, 4097, 0}
                                             : std::array<uint32_t, 4>{600, 0, 0, 0});
     const Staging staging = stage(backend, data, 0, rows, lanesOfEight ? kPageTokens : 64);
-    const ops::AttentionPlan plan = planOf(data, staging);
+    const ops::AttentionPlan plan = planOf(data, staging, lanesOfEight ? ops::AttentionPass::Verify : ops::AttentionPass::Prompt);
     run(backend, data, staging, plan);
     // The attention of `of` into `output`: its reduce's kernel and the input
     // it prepared.

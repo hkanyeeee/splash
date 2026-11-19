@@ -344,7 +344,7 @@ splash::ops::AttentionPlan planOf(const Case &data) {
   const std::array sequence{data.params};
   const splash::kv::Layout layout{1, kKvHeads, kHeadDimension};
   return splash::ops::PagedAttention::plan(
-      sequence, kQueryHeads, layout, splash::ops::kApple10Attention, splash::ops::Int8Activations::Off,
+      splash::ops::AttentionPass::Prompt, sequence, kQueryHeads, layout, splash::ops::kApple10Attention, splash::ops::Int8Activations::Off,
       splash::ops::PagedAttention::workspace(splash::ops::kAttentionSequenceSplits, kQueryHeads, layout));
 }
 

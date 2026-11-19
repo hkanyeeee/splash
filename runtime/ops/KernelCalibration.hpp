@@ -114,7 +114,7 @@ struct AttentionCalibration final {
   // From this many pages each split of the longest tile or lane reads, a
   // dense split over INT8 pages scores INT8 queries (PagedAttention.cpp).
   uint32_t int8QueriesFromPages;
-  // Keep the measured BF16 prompt reduction order past a full verify tree.
+  // Keep the measured BF16 reduction order for prompt chunks of every length.
   bool sharedBf16PrefillSplits = false;
 };
 

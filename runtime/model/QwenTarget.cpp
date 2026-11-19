@@ -167,10 +167,11 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
   }
   const ops::AttentionWorkspace workspace{chunk.buffers.attentionPartials.sizeBytes(),
                                           chunk.buffers.attentionStatistics.sizeBytes()};
-  step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
+  const auto pass = chunk.decode ? ops::AttentionPass::Verify : ops::AttentionPass::Prompt;
+  step.attention.emplace(operators_.attention(pass, step.attentionSequences(), geometry_.attentionQueryHeads,
                                               geometry_.kvLayout, workspace));
   if (const uint32_t window = geometry_.kvLayout.windowTokens)
-    step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
+    step.windowedAttention.emplace(operators_.attention(pass, step.attentionSequences(), geometry_.attentionQueryHeads,
                                                         geometry_.kvLayout, workspace, {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, chunk.rows);

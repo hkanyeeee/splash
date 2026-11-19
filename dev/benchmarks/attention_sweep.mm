@@ -413,7 +413,7 @@ double listEntries(const QsaBlocks &qsa) {
 // The store and attention graph the runtime encodes for a case, after its
 // block lists when it has QSA bitmaps, and the indexer that selects them
 // with --qsa indexer.
-metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &qsa, const ExecutionPlans &plans) {
+metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &qsa, const ExecutionPlans &plans, bool prefill) {
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
@@ -450,7 +450,7 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, const QsaBlocks &
       sequences.push_back({lane, plan.rows, plan.histories[lane], lane * kv::attentionTiles(plan.rows)});
     PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences, fixture.rows(), qsa.blocks);
   }
-  fixture.addGraph(graph, fixture.attentionPlan(plans), qsa.blocks);
+  fixture.addGraph(graph, fixture.attentionPlan(plans, prefill ? ops::AttentionPass::Prompt : ops::AttentionPass::Verify), qsa.blocks);
   return graph;
 }
 
@@ -510,12 +510,12 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
     fixtures.back()->fill();
     blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words, qsa == "indexer", located));
-    graphs.push_back(caseGraph(*fixtures.back(), blocks.back(), plans));
+    graphs.push_back(caseGraph(*fixtures.back(), blocks.back(), plans, prefill));
     if (located) {
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       const uint64_t paged = outputDigest(*fixtures.back());
       locate(*backends[i], *fixtures.back(), blocks.back());
-      graphs.back() = caseGraph(*fixtures.back(), blocks.back(), plans);
+      graphs.back() = caseGraph(*fixtures.back(), blocks.back(), plans, prefill);
       (void)backends[i]->submitCommandAsync(graphs.back().dispatches()).wait();
       if (outputDigest(*fixtures.back()) != paged)
         throw std::runtime_error("the located verify split changed attention output bits");

@@ -1278,7 +1278,7 @@ void producerTableContract(metal::MetalBackend &backend) {
     const metal::MetalBuffer laneRows = allocate(backend, sizeof(SplashLaneRows));
     *static_cast<SplashLaneRows *>(laneRows.contents()) = {0, kRows};
     const AttentionRows rows{laneRows, kRows};
-    const AttentionPlan plan = PagedAttention::plan(lane, 24, layout, kApple10Attention, Int8Activations::Off,
+    const AttentionPlan plan = PagedAttention::plan(splash::ops::AttentionPass::Verify, lane, 24, layout, kApple10Attention, Int8Activations::Off,
                                                     PagedAttention::workspace(kv::kAttentionMaximumSplits, 24, layout));
     const metal::MetalBuffer partials = allocate(backend, plan.workspace().partialsBytes),
                              statistics = allocate(backend, plan.workspace().statisticsBytes);

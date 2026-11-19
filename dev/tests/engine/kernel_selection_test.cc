@@ -471,14 +471,14 @@ kv::ChunkedPrefillParams sequenceOf(uint32_t history, uint32_t rows) {
 AttentionPlan chunkPlan(const ExecutionPlans &plans, uint32_t rows, uint32_t history, uint32_t heads,
                         const kv::Layout &layout, AttentionVariant v) {
   const std::array sequence{sequenceOf(history, rows)};
-  return plans.attention(sequence, heads, layout, plans.sequenceAttentionWorkspace(heads, layout), v);
+  return plans.attention(AttentionPass::Prompt, sequence, heads, layout, plans.sequenceAttentionWorkspace(heads, layout), v);
 }
 AttentionPlan stepPlan(const ExecutionPlans &plans, std::span<const uint32_t> histories, uint32_t heads,
                        const kv::Layout &layout, AttentionVariant v) {
   std::vector<kv::ChunkedPrefillParams> lanes;
   for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, SPLASH_DRAFT_QUERY_ROWS));
   const AttentionWorkspace lane = plans.laneAttentionWorkspace(heads, layout);
-  return plans.attention(lanes, heads, layout,
+  return plans.attention(AttentionPass::Verify, lanes, heads, layout,
                          {lane.partialsBytes * histories.size(), lane.statisticsBytes * histories.size()}, v);
 }
 

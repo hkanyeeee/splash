@@ -85,10 +85,15 @@ kv::ChunkedPrefillParams sequenceOf(uint32_t history, uint32_t rows) {
 // The plan of `sequences` in a workspace of `slots` tile splits.
 ops::AttentionPlan planOf(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads, kv::Layout layout,
                           ops::Int8Activations int8 = kBf16, uint32_t slots = 4 * ops::kAttentionSequenceSplits,
-                          ops::AttentionCalibration calibration = kApple10Row) {
-  return ops::PagedAttention::plan(sequences, queryHeads, layout, calibration, int8,
+                          ops::AttentionCalibration calibration = kApple10Row, ops::AttentionPass pass = ops::AttentionPass::Prompt) {
+  return ops::PagedAttention::plan(pass, sequences, queryHeads, layout, calibration, int8,
                                    ops::PagedAttention::workspace(slots, queryHeads, layout));
 }
+ops::AttentionPlan verifyPlan(std::span<const kv::ChunkedPrefillParams> lanes, uint32_t heads, kv::Layout layout,
+                              uint32_t slots = 4 * kv::kAttentionMaximumSplits) {
+  return planOf(lanes, heads, layout, kBf16, slots, kApple10Row, ops::AttentionPass::Verify);
+}
+
 ops::AttentionPlan planOf(kv::ChunkedPrefillParams sequence, uint32_t queryHeads, kv::Layout layout,
                           ops::Int8Activations int8 = kBf16, ops::AttentionCalibration calibration = kApple10Row) {
   return planOf(std::span(&sequence, 1), queryHeads, layout, int8, ops::kAttentionSequenceSplits, calibration);
@@ -211,7 +216,7 @@ void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
             "a sequence's last tile does not keep its splits");
   std::array<kv::ChunkedPrefillParams, 4> lanes{};
   for (uint32_t lane = 0; lane < 4; ++lane) lanes[lane] = sequenceOf(1'000'000 - lane, kLaneRows);
-  const auto step = planOf(lanes, queryHeads, layout, kBf16, 4 * kv::kAttentionMaximumSplits);
+  const auto step = verifyPlan(lanes, queryHeads, layout);
   require(step.dispatches().size() == 1 && step.dispatches()[0].slots == 4 * kv::kAttentionMaximumSplits,
           "a decode step's lanes at the most splits do not attend in one dispatch");
   // A decode lane of up to SPLASH_TARGET_VERIFY_ROWS rows takes at most a
@@ -230,7 +235,7 @@ void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
   for (uint32_t lane = 0; lane < 4; ++lane)
     lanes[lane] = sequenceOf(SPLASH_MAXIMUM_CONTEXT_TOKENS - SPLASH_TARGET_VERIFY_ROWS - lane,
                              SPLASH_TARGET_VERIFY_ROWS);
-  const auto wide = planOf(lanes, queryHeads, layout, kBf16, 4 * kv::kAttentionMaximumSplits);
+  const auto wide = verifyPlan(lanes, queryHeads, layout);
   require(wide.dispatches().size() == 1 && wide.dispatches()[0].slots <= 4 * kv::kAttentionMaximumSplits,
           "a decode step's 16-row lanes at the longest context do not attend in one dispatch");
   for (const size_t count : {size_t{0}, size_t{5}}) {
@@ -1540,7 +1545,7 @@ void bufferExtents(metal::MetalBackend &backend, uint32_t queryHeads, kv::Layout
   // A decode step's three lanes, writing the out-projection's table too.
   const std::array lanes{ops::PagedAttention::chunkParams(0, 8, 32, 1), ops::PagedAttention::chunkParams(9, 8, 32, 1),
                          ops::PagedAttention::chunkParams(31, 8, 32, 2)};
-  const auto lanePlan = planOf(lanes, queryHeads, layout);
+  const auto lanePlan = verifyPlan(lanes, queryHeads, layout);
   const metal::MetalBuffer laneTable = allocate(backend, pageTable(lanes[2])),
                            lanePartials = allocate(backend, lanePlan.workspace().partialsBytes),
                            laneStatistics = allocate(backend, lanePlan.workspace().statisticsBytes);
@@ -1754,7 +1759,7 @@ void attentionBlocks(metal::MetalBackend &backend) {
     // the lists' counts, which hold a mask per row of the command, or
     // without lists another buffer of the dispatch.
     const std::array treeLanes{sequences[1], sequences[2]};
-    const auto treePlan = planOf(treeLanes, queryHeads, layout);
+    const auto treePlan = verifyPlan(treeLanes, queryHeads, layout);
     const metal::MetalBuffer treeRows = buffer(16 * sizeof(SplashTreeRow)), rowMasks = buffer(16 * 4),
                              treeLayout = buffer(2 * sizeof(SplashLaneRows));
     static_cast<SplashLaneRows *>(treeLayout.contents())[0] = {0, 8};

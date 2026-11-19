@@ -71,7 +71,7 @@ private:
   splash::ops::AttentionPlan plan() const {
     const std::array lane{splash::ops::PagedAttention::chunkParams(0, kRows, kStride, 1)};
     return splash::ops::PagedAttention::plan(
-        lane, queryHeads(), layout(), splash::test::attentionRow(int8Queries ? 1U : splash::ops::kNever),
+        splash::ops::AttentionPass::Verify, lane, queryHeads(), layout(), splash::test::attentionRow(int8Queries ? 1U : splash::ops::kNever),
         splash::ops::Int8Activations::On,
         splash::ops::PagedAttention::workspace(kAttentionMaximumSplits, queryHeads(), layout()));
   }
@@ -94,7 +94,7 @@ uint32_t laneSplits(uint32_t history) {
   const std::array lane{splash::ops::PagedAttention::chunkParams(history, kRows, kStride,
                                                                  (history + kRows + kPageTokens - 1) / kPageTokens)};
   const splash::kv::Layout layout{.attentionLayers = 1, .kvHeads = 4, .headDimension = kHeadDimension};
-  return splash::ops::PagedAttention::plan(lane, 24, layout, splash::ops::kApple10Attention,
+  return splash::ops::PagedAttention::plan(splash::ops::AttentionPass::Verify, lane, 24, layout, splash::ops::kApple10Attention,
                                            splash::ops::Int8Activations::On,
                                            splash::ops::PagedAttention::workspace(kAttentionMaximumSplits, 24, layout))
       .sequences()[0]

@@ -63,10 +63,10 @@ std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
   return first;
 }
 
-AttentionPlan ExecutionPlans::attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+AttentionPlan ExecutionPlans::attention(AttentionPass pass, std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                         kv::Layout layout, AttentionWorkspace capacity,
                                         AttentionVariant variant) const {
-  return PagedAttention::plan(sequences, queryHeads, layout, calibration().attention, linear_.int8Activations(),
+  return PagedAttention::plan(pass, sequences, queryHeads, layout, calibration().attention, linear_.int8Activations(),
                               capacity, variant);
 }
 

@@ -304,9 +304,9 @@ public:
     return {plan_.sizes[static_cast<size_t>(Tensor::Partials)], plan_.sizes[static_cast<size_t>(Tensor::Statistics)]};
   }
   // The plan of every lane's rows on `plans`' device.
-  [[nodiscard]] ops::AttentionPlan attentionPlan(const ops::ExecutionPlans &plans) const {
+  [[nodiscard]] ops::AttentionPlan attentionPlan(const ops::ExecutionPlans &plans, ops::AttentionPass pass) const {
     const auto chunks = sequences();
-    return plans.attention(std::span(chunks).first(plan_.lanes), plan_.shape.queryHeads, plan_.layout(), workspace(),
+    return plans.attention(pass, std::span(chunks).first(plan_.lanes), plan_.shape.queryHeads, plan_.layout(), workspace(),
                            plan_.shape.variant);
   }
 

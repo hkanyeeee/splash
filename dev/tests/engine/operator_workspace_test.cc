@@ -41,7 +41,7 @@ void attention() {
       for (const uint32_t history : {0U, 65536U, 1'000'000U}) {
         const std::array sequence{ops::PagedAttention::chunkParams(history, rows, (rows + 31) / 32 * 32,
                                                                    (history + rows + 31) / 32)};
-        const auto plan = ops::PagedAttention::plan(sequence, queryHeads, layout, ops::kApple10Attention,
+        const auto plan = ops::PagedAttention::plan(splash::ops::AttentionPass::Prompt, sequence, queryHeads, layout, ops::kApple10Attention,
                                                     ops::Int8Activations::Off, chunk);
         require(plan.dispatches().size() == 1 && plan.workspace().partialsBytes <= chunk.partialsBytes &&
                     plan.workspace().statisticsBytes <= chunk.statisticsBytes,
@@ -51,7 +51,7 @@ void attention() {
     for (uint32_t lane = 0; lane < 4; ++lane)
       lanes[lane] = ops::PagedAttention::chunkParams(1'000'000 - lane, 8, 32, (1'000'008 + 31) / 32);
     for (uint32_t count = 1; count <= 4; ++count) {
-      const auto plan = ops::PagedAttention::plan(std::span(lanes).first(count), queryHeads, layout,
+      const auto plan = ops::PagedAttention::plan(splash::ops::AttentionPass::Verify, std::span(lanes).first(count), queryHeads, layout,
                                                   ops::kApple10Attention, ops::Int8Activations::Off,
                                                   slots(count * kv::kAttentionMaximumSplits));
       require(plan.dispatches().size() == 1 && plan.dispatches()[0].slots == count * kv::kAttentionMaximumSplits,
@@ -75,7 +75,7 @@ void attentionReads() {
   const std::array sequences{ops::PagedAttention::chunkParams(4096, 64, 64, 130),
                              ops::PagedAttention::chunkParams(4096, 8, 32, 129)};
   const auto plan = [&](kv::Layout layout) {
-    return ops::PagedAttention::plan(sequences, 24, layout, ops::kApple10Attention, off,
+    return ops::PagedAttention::plan(splash::ops::AttentionPass::Prompt, sequences, 24, layout, ops::kApple10Attention, off,
                                      ops::PagedAttention::workspace(ops::kAttentionSequenceSplits, 24, selected));
   };
   require(plan(selected).sparse, "a reader of selected blocks did not plan the sparse kernels");

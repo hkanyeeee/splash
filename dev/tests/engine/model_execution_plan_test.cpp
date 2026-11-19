@@ -524,7 +524,7 @@ void checkPrefillAttentionHistory() {
   const kv::Layout &layout = geometry.target.kvLayout;
   const auto splitsAfter = [&](uint32_t history) {
     const std::array chunk{ops::PagedAttention::chunkParams(history, 300, 320, (history + 300 + 31) / 32)};
-    return plans.attention(chunk, heads, layout, plans.sequenceAttentionWorkspace(heads, layout))
+    return plans.attention(ops::AttentionPass::Prompt, chunk, heads, layout, plans.sequenceAttentionWorkspace(heads, layout))
         .sequences()[0]
         .splits;
   };

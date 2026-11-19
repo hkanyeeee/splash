@@ -601,7 +601,7 @@ void attendsThroughLocations(MetalBackend &backend, kv::Format format, uint32_t 
   fixture.fill();
   const auto chunks = fixture.sequences();
   const ops::AttentionPlan verify =
-      ops::PagedAttention::plan(std::span(chunks).first(lanes), kQueryHeads, plan.layout(), ops::kApple10Attention,
+      ops::PagedAttention::plan(splash::ops::AttentionPass::Verify, std::span(chunks).first(lanes), kQueryHeads, plan.layout(), ops::kApple10Attention,
                                 ops::Int8Activations::On, fixture.workspace());
   // Each row of lane 0 selects every other block of its history besides its
   // own, as QSA's lists do (masks of each lane's rows, a bit a block); lane

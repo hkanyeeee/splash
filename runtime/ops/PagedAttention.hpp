@@ -92,6 +92,9 @@ struct AttentionWorkspace final {
 // sequence's partials.
 inline constexpr uint32_t kAttentionSequenceSplits = 2 * kv::kAttentionMaximumSplits;
 
+// Prompt chunks and decode lanes can have identical row counts.
+enum class AttentionPass { Prompt, Verify };
+
 // How one attention layer attends, of the variants its geometry is compiled
 // for (kCompiledAttention, PagedAttention.cpp): its queries and keys rotated
 // by the geometry's RoPE, or unrotated (NoPE); and each row over its whole
@@ -267,7 +270,7 @@ public:
   // kernels' q8q entries) where some tile's splits read at least the
   // device's `int8QueriesFromPages` pages each: a command's sequences share
   // the choice, as a decode step's lanes do.
-  [[nodiscard]] static AttentionPlan plan(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+  [[nodiscard]] static AttentionPlan plan(AttentionPass pass, std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                           kv::Layout layout, const AttentionCalibration &calibration,
                                           Int8Activations int8Activations, AttentionWorkspace capacity,
                                           AttentionVariant variant = {});

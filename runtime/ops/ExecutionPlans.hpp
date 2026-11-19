@@ -52,7 +52,7 @@ public:
 
   // The attention of a command's sequences (PagedAttention::plan) whose
   // dispatches fit `capacity`, the workspace bound to it.
-  [[nodiscard]] AttentionPlan attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+  [[nodiscard]] AttentionPlan attention(AttentionPass pass, std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                         kv::Layout layout, AttentionWorkspace capacity,
                                         AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(

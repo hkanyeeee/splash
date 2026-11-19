@@ -348,7 +348,7 @@ metal::DispatchSize AttentionPlan::reduceGroups(const Dispatch &dispatch) const 
   return {layout.kvHeads, kv::kAttentionTileRows * (queryHeads / layout.kvHeads), dispatch.tiles};
 }
 
-AttentionPlan PagedAttention::plan(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+AttentionPlan PagedAttention::plan(AttentionPass pass, std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                    kv::Layout layout, const AttentionCalibration &calibration,
                                    Int8Activations int8Activations, AttentionWorkspace capacity,
                                    AttentionVariant variant) {
@@ -377,7 +377,7 @@ AttentionPlan PagedAttention::plan(std::span<const kv::ChunkedPrefillParams> seq
     // while leaving the new decode tree and other KV formats on their own law.
     const bool shared = calibration.sharedBf16PrefillSplits && queryHeads == 24 && layout.kvHeads == 4 &&
                         layout.headDimension == 256 && layout.format == kv::Format::BFloat16 &&
-                        chunk.chunk_tokens > SPLASH_TARGET_VERIFY_ROWS && !variant.windowTokens;
+                        pass == AttentionPass::Prompt && !variant.windowTokens;
     const uint32_t splits = attentionSplits(tiles, shared ? 0 : pages, variant.windowTokens, calibration.pagesPerSplit);
     splitReads = std::max(splitReads, (pages + splits - 1) / splits);
     plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens, 0, splits};
