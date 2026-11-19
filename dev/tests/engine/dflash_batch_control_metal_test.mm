@@ -127,7 +127,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
   }
   const std::vector<uint32_t> selected(targetTokens, targetTokens + kLanes * kBlock);
 
-  const splash::ops::Sampling sampling(248320);
+  const splash::ops::Sampling sampling(248320, backend.capabilities().gpuClass());
   CommandGraph graph;
   sampling.addAcceptance(graph, {input, tree, output, retained, accepted, retainedRows, lanes},
                          {width, width * kBlock, kBlock}, std::span(remainingReference).first(width), stops);
@@ -242,7 +242,7 @@ void packedLanes(MetalBackend &backend, const PackedChains &chains) {
   using splash::ops::LaneRows;
   const std::array<LaneRows, kLanes> &packed = chains.packed;
   const std::array<uint32_t, kLanes> &accepted = chains.accepted, &remaining = chains.remaining;
-  const splash::ops::Sampling sampling(248320);
+  const splash::ops::Sampling sampling(248320, backend.capabilities().gpuClass());
   // A run of `lanes` lanes' buffers: verify input, target tokens, retained
   // and accepted counts, and retained rows.
   struct Run final {
@@ -320,7 +320,7 @@ void treeAcceptance(MetalBackend &backend, uint32_t rows) {
   // Siblings take distinct tokens of six, or in a tree of more rows of as
   // many as a row's most children, so that every row finds one.
   const uint32_t alphabet = std::max(6U, rows - 1);
-  const splash::ops::Sampling sampling(248320);
+  const splash::ops::Sampling sampling(248320, backend.capabilities().gpuClass());
   std::array<LaneRows, kLanes> blocks{};
   for (uint32_t lane = 0; lane < kLanes; ++lane)
     blocks[lane] = {lane * rows, rows};

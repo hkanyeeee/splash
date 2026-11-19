@@ -13,8 +13,8 @@ namespace {
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kTargetShards = SPLASH_TARGET_SAMPLING_SHARDS;
-constexpr uint32_t kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
-constexpr uint32_t kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
+static_assert(SPLASH_TARGET_VOCABULARY_RANGES <= Sampling::vocabularyThreads(GpuClass::Apple7));
+static_assert(SPLASH_TARGET_VOCABULARY_RANGES % (Sampling::vocabularyThreads(GpuClass::Apple7) / 32) == 0);
 
 // A sampled lane keeps its topK most likely tokens, and every token for 0 or
 // a topK past the vocabulary (top-k disabled).
@@ -120,8 +120,8 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
+Sampling::Sampling(uint32_t vocabulary, GpuClass gpu)
+    : vocabularyThreads_(vocabularyThreads(gpu)), vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
   if (!vocabulary)
     throw std::invalid_argument("invalid sampling geometry");
 }
@@ -301,15 +301,19 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
     graph.add("decode_sample_mass_sharded",
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses, buffers.laneRows}, params,
               {most * kTargetShards, lanes, 1});
+    const uint32_t drawGroups = SPLASH_TARGET_VOCABULARY_RANGES / (vocabularyThreads_ / 32);
+    const std::array width{vocabularyThreads_};
     graph.add("decode_sample_vocabulary_search",
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses, buffers.vocabularyRows,
                buffers.laneRows},
-              params, {most, lanes, 1}, {kVocabularyThreads, 1, 1});
+              params, {most, lanes, 1}, {vocabularyThreads_, 1, 1});
+    graph.specialize(width);
     graph.add("decode_sample_vocabulary_draw",
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows, buffers.uniforms,
                buffers.outputTokens, buffers.vocabularyRanges, buffers.vocabularyArrivals, buffers.laneRows,
                buffers.treeRows, buffers.verifySources, buffers.candidates, buffers.treeDraws, buffers.treeNext},
-              params, {most * kVocabularyGroups, lanes, 1}, {kVocabularyThreads, 1, 1});
+              params, {most * drawGroups, lanes, 1}, {vocabularyThreads_, 1, 1});
+    graph.specialize(width);
   }
   // Only a selection that reaches a lane's thinking cutoff dispatches it.
   const ThinkingCutoffs cutoffs = thinkingCutoffs(policies, vocabulary_, rows.laneCap, params.mask_row);

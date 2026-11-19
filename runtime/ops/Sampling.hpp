@@ -162,7 +162,12 @@ struct AcceptanceBuffers final {
 // tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  Sampling(uint32_t vocabulary, GpuClass gpu);
+
+  // A whole number of SIMD groups per draw range partition on both paths.
+  [[nodiscard]] static constexpr uint32_t vocabularyThreads(GpuClass gpu) noexcept {
+    return gpu == GpuClass::Apple7 ? 512u : SPLASH_TARGET_VOCABULARY_THREADS;
+  }
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI, for a
   // selection whose lanes' rows end before row `rows` (the workspaces are
@@ -251,6 +256,7 @@ private:
                     std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers,
                     const TargetRows &rows) const;
 
+  uint32_t vocabularyThreads_;
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;
 };

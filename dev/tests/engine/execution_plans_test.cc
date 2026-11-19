@@ -1,6 +1,7 @@
 #include "TestChecks.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/LaneRows.hpp"
+#include "ops/Sampling.hpp"
 
 #include <algorithm>
 #include <array>
@@ -389,6 +390,10 @@ void m2Plans() {
     device.gpuCoreCount = 30;
     const ExecutionPlans plans(device, Int8Activations::Off);
     const bool legacy = family <= 8;
+    const uint32_t threads = Sampling::vocabularyThreads(device.gpuClass());
+    require(threads == (legacy ? 512u : 1024u), "sampled vocabulary threadgroup width");
+    require(SPLASH_TARGET_VOCABULARY_RANGES / (threads / 32) == (legacy ? 16u : 8u),
+            "sampled draw must cover every vocabulary range");
     const Linear &linear = plans.linear();
     for (uint32_t rows : {1u, 8u, 9u, 16u, 17u, 24u, 32u, 33u, 64u, 512u}) {
       const LinearPlan projection = linear.plan({{6144, 2048}, rows});

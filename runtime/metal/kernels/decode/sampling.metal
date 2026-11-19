@@ -177,14 +177,13 @@ kernel void decode_sample_mass_sharded(
 }
 
 // The groups that search and draw a sampled row.
-constant constexpr uint kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
-constant constexpr uint kVocabularySimdgroups = kVocabularyThreads / 32;
-constant constexpr uint kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
+// The host specializes search and draw with their actual dispatch width.
+constant uint kVocabularyThreads [[function_constant(0)]];
+constant uint kVocabularySimdgroups = kVocabularyThreads / 32;
 // The draw's ranges of the vocabulary; the last group loads them one per
 // thread.
 constant constexpr uint kVocabularyRanges = SPLASH_TARGET_VOCABULARY_RANGES;
-static_assert(kVocabularyRanges <= kVocabularyThreads,
-              "a group holds one draw range per thread");
+constant uint kVocabularyGroups = kVocabularyRanges / kVocabularySimdgroups;
 // Pivots per pass: each pass splits a bracket sixteen ways. In logit order
 // kKeyPivots of them split its keys evenly and the others follow the logits'
 // scale (place_pivots).
@@ -282,13 +281,13 @@ struct Selection {
 };
 
 struct VocabularyScratch {
-  uint counts[kVocabularySimdgroups][kPivots];
-  float masses[kVocabularySimdgroups][kPivots];
+  uint counts[SPLASH_TARGET_VOCABULARY_THREADS / 32][kPivots];
+  float masses[SPLASH_TARGET_VOCABULARY_THREADS / 32][kPivots];
   uint total_counts[kPivots];
   float total_masses[kPivots];
   atomic_uint gathered;
-  uint keys[kVocabularyThreads];
-  uint ids[kVocabularyThreads];
+  uint keys[SPLASH_TARGET_VOCABULARY_THREADS];
+  uint ids[SPLASH_TARGET_VOCABULARY_THREADS];
   Selection selection;
 };
 
