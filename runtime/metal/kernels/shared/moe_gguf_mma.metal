@@ -51,7 +51,7 @@ kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const
                        thread_index, GGUF_STAGED_THREADS, simd_lane, 0, p.input_size / kStep, acc);
     elements(acc, sgmatrix::lane_map(simd_lane), [&](uint row, uint column, float v) {
       const ulong o = out + ulong(row) * p.output_size + origin + column;
-      output[o] = bfloat(v);
+      if (row < tile.rows) output[o] = bfloat(v);
     });
   };
   if constexpr (Rows == 8) run(integral_constant<uint, 1>{});
@@ -134,33 +134,38 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   static_assert(Rows * kColumns * sizeof(bfloat) <= kSimdgroupStage * sizeof(half), "the gate fits a stage");
   const bool on_column = up ? up_column : gate_column;
   const sgmatrix::Lane l = sgmatrix::lane_map(simd_lane);
-  float sums[GGUF_COLUMN_ROWS];
-  float2 acc[FN][1];
-  if (on_column) {
-    column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32,
-                                             table, sums);
-  } else {
-    zero(acc);
-    quant_format_switch(s.format, [&](auto f) {
-      accumulate<decltype(f), 1>(x, s.w0, s.w1, s.meta, K, origin, stage + simd_group * kSimdgroupStage, table,
-                                 simd_lane, 0, K / kStep, acc);
-    });
-  }
-  if (!up) {
+  // Adjacent tiles share a packed slab. Only the descriptor's live rows belong to this tile.
+  const auto run = [&](auto rows) {
+    constexpr uint FM = decltype(rows)::value / 8;
+    float sums[GGUF_COLUMN_ROWS];
+    float2 acc[FN][FM];
+    if (on_column) {
+      column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32,
+                                               table, sums);
+    } else {
+      zero(acc);
+      quant_format_switch(s.format, [&](auto f) {
+        accumulate<decltype(f), FM>(x, s.w0, s.w1, s.meta, K, origin, stage + simd_group * kSimdgroupStage, table,
+                                   simd_lane, 0, K / kStep, acc);
+      });
+    }
+    if (!up) {
+      if (on_column)
+        for (uint row = 0; row < tile.rows; ++row) gate[row * kColumns + simd_lane] = bfloat(sums[row]);
+      else
+        elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v); });
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!up) return;
     if (on_column)
-      for (uint row = 0; row < tile.rows; ++row) gate[row * kColumns + simd_lane] = bfloat(sums[row]);
+      for (uint row = 0; row < tile.rows; ++row)
+        output[out + ulong(row) * N + origin + simd_lane] = product(sums[row], gate[row * kColumns + simd_lane]);
     else
-      elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v); });
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (!up) return;
-  if (on_column)
-    for (uint row = 0; row < tile.rows; ++row)
-      output[out + ulong(row) * N + origin + simd_lane] = product(sums[row], gate[row * kColumns + simd_lane]);
-  else
-    elements(acc, l, [&](uint row, uint column, float v) {
-      output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
-    });
+      elements(acc, l, [&](uint row, uint column, float v) {
+        if (row < tile.rows) output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
+      });
+  };
+  moe_live_rows<Rows>(tile.rows, run);
 }
 using MoeExpertGgufMmaGateUpKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
                                        device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
