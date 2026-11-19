@@ -10,6 +10,7 @@
 #include "ops/Normalization.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/RowCopy.hpp"
+#include "ops/WarmupTrace.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -105,11 +106,7 @@ void QwenTarget::observe(metal::CommandGraph &graph, const char *stage, const me
       (routeRows && uint64_t{rows} * routes * sizeof(uint32_t) > routeRows.sizeBytes()))
     throw std::logic_error("invalid B1 warmup trace extent");
   trace.points.push_back({stage, trace.layer, width, routes});
-  const std::array<uint32_t, 7> params{width, routes, rows, bytes, uint32_t(bool(trace.laneRows)),
-                                       uint32_t(bool(routeRows)), slot};
-  graph.add("warmup_first_nonfinite", {buffer, trace.results, trace.laneRows ? trace.laneRows : buffer,
-                                       routeRows ? routeRows : buffer},
-            params, {(count + 127) / 128, 1, 1}, {128, 1, 1});
+  ops::addWarmupTrace(graph, buffer, trace.results, trace.laneRows, routeRows, rows, width, routes, bytes, slot);
 }
 
 void QwenTarget::finishWarmupTrace() {
