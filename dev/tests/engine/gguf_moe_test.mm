@@ -851,12 +851,21 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
                std::map<std::pair<uint32_t, uint32_t>, GateUp> &products, Stats &stats, const std::string &label) {
   const uint32_t rows = plan.rows();
   allocate(backend, b, plan);
+  const uint64_t outputBytes = b.moe.scratch.expertOutput.sizeBytes();
+  const uint64_t guardBytes = uint64_t{plan.tileRows()} * kHidden * 2;
+  if (plan.configuration().simdgroupMma) {
+    b.moe.scratch.expertOutput = zeros(backend, outputBytes + guardBytes, "moe-down-with-guard");
+    std::memset(static_cast<uint8_t *>(b.moe.scratch.expertOutput.contents()) + outputBytes, kCanary, guardBytes);
+  }
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   for (const MetalBuffer *buffer : {&b.moe.scratch.groupedRoutes, &b.moe.scratch.groupedInput})
     std::memset(buffer->contents(), kCanary, buffer->sizeBytes());
   CommandGraph graph;
   splash::test::addMoeStep(graph, b.moe, m.weights, plan);
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  if (plan.configuration().simdgroupMma)
+    require(untouched(static_cast<const uint8_t *>(b.moe.scratch.expertOutput.contents()) + outputBytes, guardBytes),
+            label + ": expert down wrote past the last packed row");
   const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
   const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
@@ -1018,6 +1027,8 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
     require(!std::memcmp(result.output.data(), output, result.output.size() * 2),
             label + ": the output differs from a repeat of the run");
   }
+  // The two-pass reference below uses the MPP tile's accumulation order.
+  if (plan.configuration().simdgroupMma) return result;
   std::deque<MoeGgufExpertParams> passes;
   const MetalBuffer gate = zeros(backend, b.moe.scratch.expertIntermediate.sizeBytes(), "moe-two-pass-gate");
   const std::vector<ComputeDispatch> reference = fullGridsTwoPasses(graph, gate, passes);
@@ -1157,7 +1168,7 @@ void bufferExtents(MetalBackend &backend) {
                         });
 }
 
-int moe(MetalBackend &backend) {
+int moe(MetalBackend &backend, bool packedMma = false) {
   int failures = 0;
   Buffers b;
   b.input = activations(uint64_t{kMaximumRows} * kHidden);
@@ -1166,6 +1177,18 @@ int moe(MetalBackend &backend) {
   b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
   b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  if (packedMma) {
+    const Model m = makeModel(backend, kShape, Q4K, true);
+    std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
+    Stats stats;
+    for (const uint32_t rows : {1u, 8u, 17u, 33u}) {
+      MoeConfig config{rows <= 8 ? MoeExpertTile::M8 : MoeExpertTile::M32};
+      config.simdgroupMma = true;
+      runPlan(backend, m, b, MoE::plan(kShape, rows, config), products, stats, "packed MMA rows=" + std::to_string(rows));
+    }
+    std::cout << "packed Apple7/8 MMA tail guard, intermediates, down and residual: PASS\n";
+    return 0;
+  }
   const MoeShape shape = kShape;
   // A model's prefill on the staged 32-row tiles, whose live-row matmuls
   // (moe_live_rows) differ by chunk, with the router on each float tile: a
@@ -1656,12 +1679,14 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     const bool stress = argc == 4 && std::string(argv[2]) == "float-stress";
-    if (argc != 2 && !stress) {
-      std::cerr << "usage: gguf-moe <production-and-test.metallib> [float-stress <iterations>]\n";
+    const bool packedMma = argc == 3 && std::string(argv[2]) == "m2-packed";
+    if (argc != 2 && !stress && !packedMma) {
+      std::cerr << "usage: gguf-moe <production-and-test.metallib> [m2-packed | float-stress <iterations>]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
+      if (packedMma) return moe(backend, true);
       if (stress) {
         const int iterations = std::atoi(argv[3]);
         int failed = 0;
