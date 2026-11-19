@@ -23,9 +23,10 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "install"
 
-# The options serve shares with the server, in modules of the standard
-# library alone: the launcher runs before .venv exists.
-from server import serve_options, serve_record
+# The options, the record and the console serve shares with the server, in
+# modules of the standard library alone: the launcher runs before .venv
+# exists.
+from server import diagnostics, serve_options, serve_record, unix_socket
 
 from . import clients, paths
 from . import models as model_artifacts
@@ -108,8 +109,20 @@ def _run_held(command, *, relay=None, **options):
         signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
 
 
+def _flush_console():
+    """Wait, LAST_LINES_SECONDS at most, for the launcher's lines to be
+    written before an exec, which drops those its console (diagnostics) still
+    holds."""
+    diagnostics.flush_console(diagnostics.LAST_LINES_SECONDS)
+
+
 def _base_url(port):
     return f"http://127.0.0.1:{port}"
+
+
+# The --host values under which a server listens at _base_url's address: the
+# default, its name, and every IPv4 address.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "0.0.0.0")
 
 
 # The server is on this Mac's loopback: requests to it connect directly, so
@@ -147,11 +160,11 @@ def _ensure_runtime():
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                print("Another Splash build is running; waiting...", flush=True)
+                diagnostics.print_line("Another Splash build is running; waiting...")
                 fcntl.flock(lock, fcntl.LOCK_EX)
             for command in (
                 ["make", "platform-check", "install-environment"],
-                ["make", "-j4", "all"],
+                ["make", "-j2" if os.environ.get("SPLASH_RUNTIME_LANES") == "2" else "-j4", "all"],
             ):
                 if subprocess.run(
                     command, cwd=ROOT, pass_fds=(lock.fileno(),)
@@ -199,8 +212,7 @@ def _ensure_installed(selection):
         if isinstance(event, dict) and event.get("event") == "error":
             failure = event["message"]
         else:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            diagnostics.print_line(line.removesuffix("\n"))
 
     if _run_held(command, cwd=ROOT, relay=relay):
         if failure is None:
@@ -253,26 +265,68 @@ def _prepare_local_model(args):
     return prepared
 
 
+def _printable(value):
+    """Whether `value` is a string a line can show as it is."""
+    return isinstance(value, str) and value != "" and value.isprintable()
+
+
 def _serve_lock_owner(lock):
+    """The process holding a port's lock, by the names a refusal words
+    (_words): its PID, model and port, as serve wrote them in the lock, with
+    its --host where the lock names one and the phase its serve record says
+    where the record is that PID's; none for a lock without the first
+    three."""
     try:
         lock.seek(0)
         owner = json.load(lock)
     except (OSError, UnicodeError, ValueError):
-        return ""
+        return {}
     if not isinstance(owner, dict):
-        return ""
+        return {}
     pid, model, port = owner.get("pid"), owner.get("model"), owner.get("port")
     if (
         type(pid) is not int
         or pid <= 0
-        or not isinstance(model, str)
-        or not model
-        or not model.isprintable()
+        or not _printable(model)
         or type(port) is not int
         or not 1 <= port <= 65535
     ):
+        return {}
+    names = {"PID": pid, "model": model, "port": port}
+    if _printable(host := owner.get("host")):
+        names["host"] = host
+    try:
+        record = json.loads(_serve_record(port).read_bytes())
+    except (OSError, ValueError):
+        record = None
+    if isinstance(record, dict) and record.get("pid") == pid:
+        if _printable(phase := record.get("phase")):
+            names["phase"] = phase
+    return names
+
+
+def _words(owner):
+    """A lock's owner (_serve_lock_owner) in a refusal's words, after
+    "serving"; nothing for a lock that names none."""
+    if not owner:
         return ""
-    return f" (PID {pid}, model {model}, port {port})"
+    return f" ({', '.join(f'{name} {value}' for name, value in owner.items())})"
+
+
+def _port_holder(port):
+    """The process holding `port`'s lock, as _serve_lock_owner names it, or
+    None while none holds it: the lock taken shared without waiting, which
+    only a holder refuses, as the app probes it."""
+    try:
+        lock = _serve_lock(port).open()
+    except OSError:
+        return None
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _serve_lock_owner(lock)
+    return None
 
 
 def _check_port(host, port):
@@ -283,7 +337,15 @@ def _check_port(host, port):
     process's listener at a wider or narrower address of the port (0.0.0.0
     or a dual-stack :: beside 127.0.0.1, or the reverse), and the two would
     then split the address's connections, so a listener that accepts one
-    there owns the port too."""
+    there owns the port too. A UNIX socket's path is claimed and bound as the
+    HTTP listener claims and binds it, and given up again."""
+    if (path := unix_socket.path(host)) is not None:
+        with (
+            contextlib.closing(unix_socket.Claim(path)) as claim,
+            socket.socket(socket.AF_UNIX) as probe,
+        ):
+            claim.bind(probe)
+        return
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind((host, port))
@@ -306,8 +368,14 @@ def _prepare_start(args):
     try:
         _check_port(args.host, args.port)
     except OSError as error:
+        # A UNIX socket has no port: --host names all of where it listens.
+        address = (
+            args.host
+            if unix_socket.path(args.host) is not None
+            else f"{args.host}:{args.port}"
+        )
         raise LauncherError(
-            f"cannot bind {args.host}:{args.port}: {error}", serve_record.PORT
+            f"cannot bind {address}: {error}", serve_record.PORT
         ) from None
     if args.model_dir is not None:
         return _prepare_local_model(args)
@@ -407,13 +475,25 @@ def serve(args):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # The port names the lock whatever --host listens on, a UNIX
+            # socket too: a second server takes another.
             raise LauncherError(
-                f"Splash is already serving{_serve_lock_owner(lock)}; "
-                "stop it with Ctrl+C first"
+                f"Splash is already serving{_words(_serve_lock_owner(lock))}; "
+                "stop it with Ctrl+C first, or serve on another --port"
             ) from None
         lock.seek(0)
         lock.truncate()
-        json.dump({"pid": os.getpid(), "model": args.model, "port": args.port}, lock)
+        # With where it listens, which an agent command that finds no server
+        # at 127.0.0.1:PORT names (coding_client).
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "model": args.model,
+                "port": args.port,
+                "host": args.host,
+            },
+            lock,
+        )
         lock.flush()
         # The record is the lock holder's: from here on a start that fails
         # says why in it, as the server, which keeps this pid, does too. A
@@ -433,6 +513,7 @@ def serve(args):
             command, environment = _server(args, _prepare_start(args), record)
             os.set_inheritable(installation.fileno(), True)
             os.set_inheritable(lock.fileno(), True)
+            _flush_console()
             # The exec resets the handlers; the server unblocks the signals
             # once its own are in place, past its imports.
             signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
@@ -461,10 +542,34 @@ def coding_client(args):
     path = clients.find_executable(args.command)
     listing = _request_json("/v1/models", port=args.port)
     if listing is None:
-        message = (
-            f"No ready Splash server at {_base_url(args.port)}. "
-            "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
-        )
+        holder = _port_holder(args.port)
+        if holder is None:
+            message = (
+                f"No ready Splash server at {_base_url(args.port)}. "
+                "Run 'splash serve --model <HF_REPO_ID>' in another terminal first."
+            )
+        elif holder.get("phase") == "ready" and (
+            "host" not in holder or holder["host"] in _LOOPBACK_HOSTS
+        ):
+            # Its record says ready, and it listens where the agent commands
+            # ask, or may: a lock that names no address, as 1.6.1's do not,
+            # says nothing of where. So only that it did not answer is known:
+            # a server that stops closes its listener first and holds the
+            # port, its record still ready, until its engine has stopped.
+            message = (
+                f"Splash is serving{_words(holder)} but does not answer at "
+                f"{_base_url(args.port)}: it may be stopping"
+                + ("." if "host" in holder else ", or listen on another address.")
+            )
+        else:
+            # The server holding the port listens elsewhere, on another
+            # address or a UNIX socket, or is not ready yet; a second one
+            # would be refused the port.
+            message = (
+                f"No ready Splash server at {_base_url(args.port)}, but Splash "
+                f"is serving{_words(holder)}. Agent commands connect over TCP "
+                "on loopback to a server that is ready."
+            )
         # OpenCode and Hermes have a --port of their own, which goes after --.
         if args.explicit_port:
             message += (
@@ -499,19 +604,20 @@ def coding_client(args):
         client_version=client_version,
         later_system=args.command == "pi" and _renders_later_system(args.port),
     )
-    print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
+    diagnostics.print_line(
+        f"Starting {args.command}: {model} · {context:,} context tokens"
+    )
     if args.command == "claude":
-        print(
+        diagnostics.print_line(
             "Claude hosted WebSearch is unavailable. "
-            "WebFetch, local tools and MCP are unchanged.",
-            flush=True,
+            "WebFetch, local tools and MCP are unchanged."
         )
     elif args.command == "codex":
-        print(
+        diagnostics.print_line(
             "Codex hosted WebSearch is disabled: Splash does not provide "
-            "OpenAI's search service. Local tools and MCP are unchanged.",
-            flush=True,
+            "OpenAI's search service. Local tools and MCP are unchanged."
         )
+    _flush_console()
     os.execvpe(path, command, environment)
 
 
@@ -726,10 +832,10 @@ def main(argv=None):
     except LauncherError as error:
         if not error.said:
             subject = f"{error.subject}: " if error.subject else ""
-            print(f"error: {subject}{error}", file=sys.stderr)
+            diagnostics.print_line(f"error: {subject}{error}", error=True)
         return 1
     except (clients.ClientError, OSError, serve_record.NotRecorded) as error:
-        print(f"error: {error}", file=sys.stderr)
+        diagnostics.print_line(f"error: {error}", error=True)
         return 1
     except StopSignal as stop:
         # The status a shell gives a program the signal ends: 130 for

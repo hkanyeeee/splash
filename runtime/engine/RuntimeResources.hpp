@@ -103,6 +103,8 @@ struct CacheDiskQuota final {
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+  // Cached states keep stateFormat rather than codes (--cached-states exact).
+  bool exactCachedStates = false;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;
@@ -122,7 +124,8 @@ struct RuntimeResourcesConfig {
   // process.
   bool persistentCache = false;
   // The volume a directory lives on (volumeOf), which the automatic quota
-  // reads for each place the tier may keep its files before it opens them.
+  // reads for each place the tier may keep its files before it opens them,
+  // and the tier at each measure for the place they opened in (DiskSpace).
   std::function<std::optional<DiskVolume>(const std::filesystem::path &directory)> diskVolume =
       volumeOf;
   // Patches per image, from --max-image-patches: the engine admits images up
@@ -159,10 +162,14 @@ struct RuntimeResourcesConfig {
   // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
   // for validation that trimming changes no output (CacheWindowPolicy::trim).
   bool kvWindowTrim = true;
-  // --verify-rows: the rows of the draft's block a decode cycle verifies
-  // (model::budgetsVerifyRows); a benchmark round verifies every row so that
-  // rounds repeat one another.
+  // --verify-rows: the rows a decode cycle verifies (reportVerifyRows); a
+  // benchmark round verifies every row of a draft's block a lane (all) so
+  // that rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --activations: whether the plans may round activations to int8
+  // where an int8-activation path takes them, or keep every activation bf16
+  // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -297,9 +304,9 @@ public:
   // finds a persistent tier emptied (CacheDirectory::engineFailed).
   void engineFailed() noexcept;
   // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
-  // each state copy's label takes its state's current recency, both files
-  // reach the drive and the directory records a clean end. False when they
-  // did not; true at once without a persistent tier.
+  // the cache closes its tier (Cache::closePersistentTier), both files reach
+  // the drive and the directory records a clean end. False when they did
+  // not; true at once without a persistent tier.
   [[nodiscard]] bool closePersistentCache();
 
   [[nodiscard]] metal::MetalBackend &backend() noexcept { return *backend_; }
@@ -339,7 +346,7 @@ public:
   [[nodiscard]] std::optional<model::KvBlockCacheStats> kvBlockCacheStats() const;
   [[nodiscard]] std::optional<model::KvHistoryStreamStats> kvHistoryStreamStats() const;
 
-  [[nodiscard]] model::RuntimeContext modelContext() noexcept;
+  [[nodiscard]] model::RuntimeContext modelContext();
   // What the engine gives back while idle (NativeLoopConfig::weights): the
   // weight images, and the Neural Engine split's program if it runs one.
   [[nodiscard]] ReleasableMemory &releasableMemory() noexcept { return releasableMemory_; }
@@ -415,8 +422,9 @@ private:
 // run on a prefill arena of their own, its programs wait for the ANE's
 // service until `cancelled` returns true, and its calibrations are
 // remembered beside the programs (ane::recall) under its layers' shapes and
-// formats, the device, the macOS version, the engine's `buildId` and the
-// most units the plan holds.
+// formats and the Int8Activations its GPU part plans with
+// (ops::AneFfn::calibrationKey), the device, the macOS version, the engine's
+// `buildId` and the most units the plan holds.
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
                                       std::string_view buildId, std::function<bool()> cancelled);

@@ -83,8 +83,8 @@ public:
     core_.setCompletionNotifier(std::move(notifier));
   }
 
-  // Sends Warming, before announceReady, once the engine holds its weights.
-  void announceWarming();
+  // Sends the warm-up's `progress`, before announceReady, once the engine holds its weights.
+  void announceWarming(const protocol::WarmingEvent &progress);
   // Sends `ready` (readyEventFor), once, and starts the idle release's count.
   void announceReady(const protocol::ReadyEvent &ready);
 
@@ -165,8 +165,7 @@ private:
   void promptProgress(uint64_t requestId, uint32_t processedTokens) override;
   void firstTokenParts(uint64_t requestId, const TtftParts &parts) override;
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
-  void maskRequested(uint64_t requestId,
-                     std::span<const uint32_t> simulationTokens) override;
+  void maskRequested(const ModelMaskRequest &request) override;
   void completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                  uint32_t promptTokens, uint32_t completionTokens,
                  uint32_t deduplicatedTokens,

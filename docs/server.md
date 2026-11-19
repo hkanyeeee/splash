@@ -19,8 +19,11 @@ repository and variant, `OWNER/REPO:VARIANT`, such as
 Splash identifies the model from its own metadata and pairs the DFlash2 draft
 trained for it. The first serve sets up Python dependencies and downloads the
 model and its draft; each start loads the weights into memory
-([Weight loading](internals.md#weight-loading)) and follows the model's revision
-([Revisions](#revisions)). Splash packages, the prebuilt format of earlier
+([Weight loading](internals.md#weight-loading)), follows the model's revision
+([Revisions](#revisions)) and warms up, the console counting the steps
+(`Warming up · 3 of 11 steps`): the first start after an update also prepares
+the GPU's programs then, which takes a couple of minutes
+([Warmup and pipelines](internals.md#warmup-and-pipelines)). Splash packages, the prebuilt format of earlier
 releases, are no longer loaded ([Splash packages](models.md#splash-packages)). Public
 repositories need no login; private or gated ones need `HF_TOKEN` or `hf auth login`, and a gated
 one its terms accepted on its Hub page. Ctrl+C
@@ -40,11 +43,18 @@ executable, or a start whose GPU commands another process's memory starved
 restart that failed for want of memory the Mac refused is retried, at most 60 s
 apart, for as long as it fails, and neither counts toward the six below nor
 starts them anew. For any other cause it stops after the sixth failure in a
-row, each within 60 s of starting. Once it stops, requests get 500
-`engine_failed` until the server is restarted; its message names the crash
-trace when
-`SPLASH_CRASH_TRACE=1` recorded one
-([crash traces](internals.md#failures-and-crash-traces)). Meanwhile generation requests get
+row, each within 60 s of starting. Once it stops, the server logs why
+(`Engine stopped · …`), naming the crash trace when `SPLASH_CRASH_TRACE=1`
+recorded one ([crash traces](internals.md#failures-and-crash-traces)), and
+exits with status 69 (`EX_UNAVAILABLE`), where a stop exits 0, a failed start
+1, refused arguments 2 and a stop before the server runs 130 or 143; a stop
+that lands as the engine stops for good may still exit 69. Until then requests
+get 500 `engine_failed` in the same words. What
+runs the server, such as launchd with `KeepAlive`, decides whether to start it
+again, and a new server counts failures from none, so give it a
+`ThrottleInterval` for a cause the next start meets again; the app shows why it
+stopped. While the engine restarts, the [serve record](#serve-record) says
+`recovering` and generation requests get
 503 `engine_recovering`, whose message names the last failure and whose
 `Retry-After` the time until the next bound on the restart's start: when it
 should be ready, as long after its spawn as the start before took, then up to
@@ -55,12 +65,13 @@ same rules; so is one that leaves a frame unread for 30 seconds. A request the
 engine had started at each of two engine failures in a row that a request may
 cause (an execution failure, broken output, or a crash by a fault signal; not
 a kill, nor a command short of GPU memory) is refused with 400
-`request_quarantined` until the server restarts. A restarted engine is asked
-for the first engine's context, with `--max-context` as without, and serves
-what its plan holds of it ([Neural Engine prefill](internals.md#neural-engine-prefill)): one
-whose plan holds less, as once the Mac's memory budget shrank, serves less, and
-the server serves that until a later restart regains it; `/status` reports it
-as `capabilities.max_context_tokens`.
+`request_quarantined` for an hour the Mac is awake, or until the server
+restarts. A restarted engine is asked for the first engine's context, with
+`--max-context` as without, and serves what its plan holds of it
+([Neural Engine prefill](internals.md#neural-engine-prefill)): one whose plan
+holds less, as once the Mac's memory budget shrank, serves less, and the
+server serves that until a later restart regains it; `/status` reports it as
+`capabilities.max_context_tokens`.
 
 Ctrl+C or SIGTERM stops the server: it stops its engine with SIGTERM, which
 gives a persistent cache's newest restore points up to 6 s to reach the disk,
@@ -73,6 +84,57 @@ when the Mac sleeps continues when it wakes. While requests run, Splash keeps
 the Mac from sleeping automatically, as `caffeinate -i` does; the display may
 still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
 `serve --allow-idle-sleep` lets it sleep automatically.
+
+### Serve record
+
+`splash serve` writes what it is at to `serve-PORT.json` in the runtime
+directory ([files Splash writes](#files-splash-writes)), beside the lock it
+holds, `serve-PORT.lock`, in which it names its `pid`, `model`, `port` and
+`--host` as `host`. The record is one JSON object, replaced atomically,
+with the server's `pid` and its `phase`:
+
+| `phase` | The server |
+|---|---|
+| `starting` | Holds the port's lock and prepares the model. |
+| `loading` | Loads the tokenizer, then the engine its weights. |
+| `warming` | Warms the engine up; `warmup` counts `steps_done` of `steps`. |
+| `ready` | Answers requests. |
+| `recovering` | Answers `/status` and refuses generation while it starts a failed engine again ([engine restarts](#engine-restarts-and-sleep)): from the failure, through the wait for the failed engine's exit and the backoff, until the engine started in its place serves. Then `ready` again, with the same `pid`. |
+| `failed` | Has ended: `failure` gives the `kind`, the `message` and, for a shortfall of memory or context, its `bound` and numbers. A start that failed, or, with `kind` `stopped`, a server that stopped restarting its engine. |
+
+The desktop app follows a start by the record. What supervises a server can
+read it instead of polling HTTP: a server that restarts its engine loads the
+whole model again inside the same process, so its memory falls and then grows
+as in a start, and `recovering` tells that load from memory that grows while
+the server should be serving; `/status` says the rest (`transport.recovering`,
+`transport.restarts`, `transport.error`). A restart is one phase, not
+`loading` and `warming` again: those are a process that does not answer yet
+and ends if the phase fails, where a recovering server answers `/status`,
+waits out a backoff before it loads, and retries a restart that failed or
+stops. A server that was stopped or killed leaves its last record, so check
+that the `pid` runs or that the lock is held, and take a phase you do not
+know, as a later release may add one, for no news of the server. The
+launcher's `starting` record and the server's first `ready` fail the start
+where they cannot be written; once a server is ready, a record it cannot
+write is a warning in its log, and it serves on.
+
+### Console
+
+The server writes its console lines, its engine's and Python's tracebacks
+from one thread, in the order they come, so that a log of both streams, as
+`2>&1` or the app's server log, keeps that order: status and request lines go
+to stdout, errors, warnings, tracebacks and the engine's lines to stderr. A
+stdout that stops draining therefore holds up stderr too. Output that stops
+draining, as a log pipe whose reader stalls, holds up that thread alone, never
+a request, the engine or an HTTP answer. Once 1024 lines wait, each further
+line is dropped; once the console writes again, a `Warning · N console lines
+dropped …` line takes their place, and `/status` counts them as
+`console.dropped_lines`. A failed engine's last lines, why it failed or what
+it saved as it stopped, come before the lines the server prints after the
+failure, its report among them, which wait up to 1 s for the engine's stderr
+to end; the failure itself reaches the requests in flight and schedules the
+restart at once. At exit the server waits up to 1 s for its last lines, run
+with or without `python -u`.
 
 ### Shell completion
 
@@ -104,7 +166,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
-| `--host` | `127.0.0.1` | HTTP bind address. See [network and authentication](#network-and-authentication). |
+| `--host` | `127.0.0.1` | HTTP bind address, or `unix:PATH` for a UNIX socket. See [network and authentication](#network-and-authentication). |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, `/health` and `/ready`. |
@@ -113,7 +175,8 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to the model's limit; past the 256K native window a model with YaRN turns it on. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
-| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
+| `--cached-states` | `int8` | Cached recurrent state storage: `int8` codes, or `exact`, in `--state-format`'s precision. See [state precision](#state-precision). |
+| `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto streams it through a cache of at most the rows of a 128K-token prompt, less where memory is short. See [PLE table streaming](#ple-table-streaming). |
 | `--expert-memory` | Auto | MoE targets: the memory routed experts keep, e.g. `16G`; they stream through a store of exactly this size, which neither grows nor gives memory back, and read the other experts from the SSD when a step routes them; a size that holds every expert, or `off`, loads them all. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to their floor while requests need it. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](internals.md#weight-loading). |
@@ -123,16 +186,19 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--reasoning-effort` | `SPLASH_REASONING_EFFORT` or each request's own | Effort of every Chat, Responses and Messages request, whatever the request asks; `none` turns thinking off. See [default reasoning effort](#default-reasoning-effort). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, `</think>` its last token; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
+| `--chat-template-file` | The model's own | A Jinja chat template to render every request with, in place of the model's. See [custom chat templates](models.md#custom-chat-templates). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](api.md#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
-| `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
+| `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. A request waiting for memory on its way back is owed it too, and the prompt's next unit waits for that memory until its last unit has ended for as long as it took, at most 500 ms. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
-| `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
+| `--activations` | `auto` | On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, `auto` rounds activations to int8 where that is faster and leaves the others bf16: prefill chunks of more than 64 rows through a target's MLX 4- and 5-bit weights in groups of 64 (not a MoE model's routed experts), rounded per row and 64 inputs, about a quarter less time to the first token on Qwen3.8-27B MLX 4-bit; a Ternary-Bonsai (rotated PQ2_0) model's decode, 13-16% less time a cycle on a 20-core M5 Pro; and attention over the INT8 KV cache where a split reads 8 pages or more, 4-7% sooner first tokens at 32K-64K (see [KV cache precision](#kv-cache-precision)). `bf16` is a precision opt-out for evaluations and bf16 parity: every activation stays bf16, though a [persistent cache](#persistent-cache) keeps what an `auto` run prefilled, so a parity run starts in a fresh `--cache-dir`. What `auto` costs, as next-token KL against bf16: about 2.2e-3 for Qwen3.8-27B MLX 4-bit's prefill on the GPU alone, 2.8e-4 for Bonsai's decode, and with INT8 queries 1.37x the KL the INT8 KV cache alone gives Qwen3.8-27B. The Neural Engine split, which multiplies its part in int8 whatever this option, has its own switch, `--disable-ane`. See [kernel selection](internals.md#kernel-selection). |
+| `--verify-rows` | `auto` | The rows decode cycles verify: `auto` gives each cycle the step of the most expected accepted tokens per cost, by the costs the Mac measured at a start and what its cycles show a long history adds to them (on a target whose experts stream, the rows whose chance of a token is worth their time by its cycles' cost line), which is faster but makes greedy and seeded outputs vary from run to run; `all` verifies every row of a draft's block a lane the output limit leaves, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -164,6 +230,42 @@ listener or allowlist client IPs. A request that names the server any other way
 gets 403 with the `--allowed-host` flag that would accept it; the check keeps out
 web pages that rebind a DNS name to this address. The chat page works over plain
 HTTP from another machine too.
+
+`--host unix:PATH` listens on a UNIX socket at `PATH` instead of a TCP port, so
+that the server listens on no IP address and file permissions decide who
+connects: a client needs write permission on the socket, which is created
+under the server's umask, and search permission on its directory. `PATH` is
+at most 103 bytes long, the longest socket path macOS takes; a relative one is
+taken from the directory the server starts in, and may fit where the whole
+path does not. One server serves a path: it holds a lock, `PATH.lock` beside
+the socket, from before it binds until it has removed the socket as it stops.
+A second server at the path is therefore refused, also while the first still
+loads its model. The lock file itself stays, unlocked, after a stop and after
+a start that was refused: one removed could still be held by a server beside
+a new file of its name. With the lock held, no Splash server is behind a
+socket already at the path, and a start replaces one that refuses its
+connection, as the socket a killed server left behind does, and one its
+sandbox does not let it connect to. A socket that accepts a connection stays,
+as do one whose permissions refuse the server's user and a file of another
+kind, and the start is refused. So is a start that finds a symbolic link at
+`PATH` or at `PATH.lock`: the server follows neither. A link put at `PATH`
+while the server starts is followed by the bind, and the start is then
+refused: keep the socket in a directory only you write to. A sandbox's profile must
+let the server bind `PATH` and accept there, and write `PATH`, which it
+creates and removes, and `PATH.lock`; it may refuse the server a connection
+to `PATH`.
+`--port` names the server's lock and [record](#serve-record),
+`serve-PORT.lock` and `serve-PORT.json` in the runtime directory, as it does
+for every `--host`, so two socket servers take two ports though neither
+listens on one; `/status` reports `instance.host` as `unix:PATH` and
+`instance.port` as null. Clients connect with, e.g.,
+`curl --unix-socket PATH http://localhost/health`, and the Host check applies
+as it does over TCP: a request names the server `localhost`, a loopback
+address or an `--allowed-host` name. The agent commands reach a server at
+`127.0.0.1:PORT` alone and find none where it listens on a socket, which their
+refusal names ([agent launchers](#agent-launchers)): forward a loopback TCP
+port to the socket and give them that port, whose `Host: 127.0.0.1:PORT` the
+relay passes on and the check accepts. The desktop app serves on TCP alone.
 
 Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request
@@ -232,11 +334,10 @@ target the floors of a request whose KV is on the SSD
 target's routed experts load with their layers where that leaves KV its
 allowance, and otherwise stream through a store of all that the allowance and
 the PLE table's share leave ([streamed experts](#streamed-experts)); the PLE
-table too keeps the allowance first: it loads where the rest holds it beside
-the allowance, and otherwise streams through a row cache of what the allowance
-leaves, up to its share, at most the rows of every id a 128K-token prompt
-stages ([PLE table streaming](#ple-table-streaming)); KV and the states take
-what remains. The allowance is the KV of a context, in the fewest pages whose
+table streams through a row cache of what the allowance leaves, up to its
+share, at most the rows of every id a 128K-token prompt stages, however much
+memory the budget has ([PLE table streaming](#ple-table-streaming)); KV and
+the states take what remains. The allowance is the KV of a context, in the fewest pages whose
 extents hold it as one request's KV capacity rounds them: a block-sparse
 target's first 64K tokens, kept in memory, or `--max-context` where that is
 less. A dense target's allowance is `--max-context`, so that its experts load
@@ -262,20 +363,19 @@ gives back while memory is short only adds room ([streamed
 experts](#streamed-experts)). A size below the part's smallest store, a
 `--sparse-kv-memory` beyond what the floors leave and a `--ple-memory` size for
 a table that cannot stream are refused, and startup logs how each part was
-sized. Only a loaded model sizes
-the arenas, which rest on its weights' formats and grow where a part
+sized. The arenas rest on the weights' formats and grow where a part
 streams: prefill groups for streamed experts, a step's staged rows for a
-streamed table. One load gives them for whatever streams, so a start loads
-its weights once where the plan without the arenas already loads each part
-as the plan with them does, as for a model with no part to stream, and
-otherwise loads them again with the stores that plan gives (`Weights loaded
-again`): automatic routed experts the first plan streams load at their
-smallest store until then; a store `--expert-memory` sizes loads once. An
-automatic store sized for a run that spills keeps all of it as its floor.
-Where the run then cannot spill (the SSD cache turns off or its KV file does
-not open), the weights load once more for a store above its smallest size,
-whose floor is then 85% of its slots; a store at its smallest size is all its
-floor either way, and the weights do not load again.
+streamed table. The files' headers give them for whatever streams before
+any weight loads: the target's images are read reserved, without memory or a
+write, which gives every projection its formats. So the plan is made before
+the weights load, a model whose floors the budget cannot hold is refused
+before anything loads, and the weights load once (`Weights loaded in N s.`),
+with the stores the plan gives, whatever streams. An automatic store sized for
+a run that spills keeps all of it as its floor. Where the run then cannot
+spill (the SSD cache turns off or its KV file does not open), the weights load
+once more for a store above its smallest size (`Weights loaded again`), whose
+floor is then 85% of its slots; a store at its smallest size is all its floor
+either way, and the weights do not load again.
 
 A block-sparse target serves the window where its floors hold a request of
 that length and the SSD cache has room for its KV, and otherwise the longest
@@ -284,8 +384,11 @@ the bounds under `memory_plan.budget.context_bounds`: the model's `window`,
 one request's KV in memory (`resident`), the longest context the floors hold
 (`spilled`) and the room the SSD cache has for active KV beside every lane's
 state (`disk`), and in `bound` which one sets the limit (`model`, `memory` or
-`disk`). Its context therefore follows the free space of the cache's volume
-at a first start; a dense target's never does, nor does a block-sparse one's
+`disk`). The resident context is one a lone request takes: its KV in whole
+extents beside its lane's state and what a target whose KV spills holds from
+its start, the Index runway and the page tables the readers of spilled KV
+allocate. A block-sparse target's context therefore follows the free space of
+the cache's volume at a first start; a dense target's never does, nor does a block-sparse one's
 with `--max-cache-disk 0`. A relaunch keeps its first engine's context
 whatever room the volume has left since: where its plan spills, the cache
 opens however little room the volume has, and each request's commitment
@@ -324,15 +427,33 @@ aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
 fit, startup prints a memory budget breakdown and stops.
 
+A request fails with `capacity_exhausted` only alone and once nothing else
+holds memory it could get: every cached prefix it may take evicted, the expert
+store at its floor and no write to the SSD cache in flight. Short of that it
+waits, and beside other requests one of them yields instead. Its
+message names what it could not allocate, its lane's KV mode (`Resident`, its
+KV in memory, or `Spill`, its KV partly [on the SSD](#kv-on-the-ssd)), its
+phase and its tokens, and the Metal memory outside the server's buffers then
+(`device_untracked_bytes`, as `/status` reports it under `memory_audit` at
+startup: 17 MB on a 64 GB M5 Pro serving Flash-Next), which the budget charges
+past the runtime reserves. Only a `Spill` lane's, the one whose KV goes there,
+says why its KV gave no more memory back: the SSD cache took no more of it,
+where its writes stopped for the quota, the write budget or a closed cache, or
+otherwise the request does not fit even with its KV released down to its floor.
+A request refused at its start because neither memory nor the [SSD
+cache](#kv-on-the-ssd) holds it names its lane, tokens and
+`device_untracked_bytes` the same way, with what its least start needs
+(`memory_needed_bytes`) and what memory has for it (`memory_available_bytes`).
+
 ### PLE table streaming
 
 Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows
 of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata)
 is read by a handful of rows per token: 16 per position, eight heads each of
-the 2- and 3-gram hashes of the token and the tokens before it. Where memory
-cannot hold it beside everything else (`--ple-memory auto`, the default,
-[memory and context](#memory-and-context)), or with `--ple-memory SIZE`, such
-as `--ple-memory 2G`, the table stays in its GGUF on the SSD: no `ple.bin`
+the 2- and 3-gram hashes of the token and the tokens before it. With
+`--ple-memory auto`, the default ([memory and context](#memory-and-context)),
+or with `--ple-memory SIZE`, such as `--ple-memory 2G`, the table stays in its
+GGUF on the SSD: no `ple.bin`
 image is written, and the weights shrink by the stored table size. Startup
 memory requirements also include the cache and Metal staging buffers. The
 rows each command gathers are read through a host cache with a SIZE-byte
@@ -344,7 +465,8 @@ count, reserves about 1.9 times the bytes of a Q8_0 table. The cache hits only r
 reads few distinct rows (a 128K-token prompt about 1.1M): caches from
 256 MiB, which no run filled, to 2 GiB hit as often, while each GiB more of
 the expert store makes a 24 GB Mac decode 11-23% faster, so the experts take
-the rest.
+the rest, and the KV and its caches what they leave: auto streams the table
+however much memory the Mac has.
 The engine refuses a SIZE that holds no row, and a SIZE that holds the
 whole table loads it with the weights instead, as `--ple-memory off` does. A
 table whose rows the GGUF does not store as the gathers read them (NVFP4,
@@ -384,8 +506,7 @@ size with a warning.
   (`streamed_table_bytes`): the governor charges it beside Metal's
   allocations, and the startup memory audit bounds it by the plan and counts
   it toward the hard budget beside Metal's footprint since the weights that
-  serve began to load, not a first load that held the table whole before the
-  plan with the arenas streamed it. It is not released while idle.
+  serve began to load. It is not released while idle.
 - Once the weights that serve loaded, before the engine is ready, the engine
   writes every page of the cache's rows, ids, recency links and index
   (`SparseRowStore::commit`), so that the cache holds all of its host memory
@@ -433,25 +554,36 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes run. A decode step's load is one such round; a prefill command's
-  loads take as many rounds as its rows may route experts, each staging half
-  of the staging while the other half is read ahead. The kernels read every
-  routed expert through the layer's slot table and the chunks that hold its
-  slots, so resident experts, one chunk of every expert, and streamed
-  experts run the same kernels.
+  passes over them run. A load of at most 32 rows (a decode step's of so
+  few, four lanes of 8, or a prompt chunk's) is one such round; a longer
+  command's loads take as many rounds as its rows may route experts,
+  each staging half of the staging while the other half is read ahead. The
+  kernels find every routed expert through a table of its slot and the
+  chunks that hold its slots, so resident experts, one chunk of every expert,
+  and streamed experts run the same kernels.
+- The grouping puts the tiles of the experts already resident first and those
+  a load brings last (their slot-table entry is marked absent). Every
+  command's expert passes over the resident ones and the shared expert, each
+  of its chunks', run while its load's first host step reads from the SSD, on
+  the grouping's copy of the slot table; the passes over the experts it
+  brought and the combine run after the repack, through a second table of the
+  slots the load routed, which the host step writes and the GPU reads no
+  earlier. Outputs are bitwise the same: each expert's tiles, their kinds and
+  the combine order do not change.
 - An expert's rows a GGUF stores as they are are read straight into the
   staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
   without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
   at 9.3 GB/s instead of 8.1, with less than half the CPU).
 - While the GPU repacks a round or runs a layer, the next round's experts or
   the next block's likely experts are read ahead: those the next block's
-  router picks from this block's input in a decode step; after a long prefill
-  chunk's last repack, one more host step reads nearly all of the next
-  block's into the whole staging. A load takes the read-ahead over without
+  router picks from this block's input in a load of a cycle's rows; after a
+  long prefill chunk's last repack, one more host step reads nearly all of the
+  next block's into the whole staging. A load takes the read-ahead over without
   waiting for its reads of experts it does not route, and a read ahead of an
   expert no load routes may fail without failing anything. A decode step
-  loads and predicts only the experts its lanes' verify rows route
-  ([Drafts](models.md#drafts)); the selector writes those rows before the step's load.
+  loads and predicts only the experts its lanes' rows route, none of a row of
+  no lane ([Drafts](models.md#drafts)); the selector writes those rows before
+  the step's load.
 - Experts of one format share their slots, held in chunks, each a buffer of
   its own of at most the device's largest buffer (`maxBufferLength`). One
   chunk holds each format's floor: under auto every slot when KV can spill
@@ -475,7 +607,7 @@ off` loads every expert, as a SIZE that holds them all does.
   cap has as many of the cap's chunks as the slots above its lower floor take,
   at most 7 in a store under 6.7 GiB. A size of one block (layers in formats
   of their own) is one chunk of every expert.
-- A decode step's loads keep the GPU awake through their host steps
+- A load of a cycle's rows keeps the GPU awake through its host step
   ([Host steps](internals.md#host-steps)), so the work after a load starts at once and at
   full clocks rather than after the GPU's wake-up.
 - A prefill command runs a group of up to four chunks of 2048 rows layer by
@@ -499,9 +631,10 @@ off` loads every expert, as a SIZE that holds them all does.
   cached prefixes nothing in use holds that leave memory at once, by the
   cache's order; the caches the model rebuilds; the cached prefixes that
   first need a copy on the SSD cache, whose writes it waits for rather than
-  take what follows; on a target whose KV can stay on the SSD cache, that
-  request's own [spill](#kv-on-the-ssd); then the store's last chunk, one at
-  a time; and only then anything in use. A start, optional work and memory
+  take what follows; on a target whose KV can stay on the SSD cache, the
+  memory of [spilling requests](#kv-on-the-ssd)' pages of its priority or a
+  lower one, then that request's own spill; then the store's last chunk, one
+  at a time; and only then anything in use. A start, optional work and memory
   the host refused never take a chunk. When the host runs short of its 1 GiB
   margin, the engine gives it cached prefixes and the caches the model rebuilds,
   never a chunk; macOS's warning alone takes nothing. A chunk given back keeps
@@ -509,26 +642,26 @@ off` loads every expert, as a SIZE that holds them all does.
   slots' recycling would recycle first evicted to make room, and later steps
   read the evicted ones from the SSD again. Under macOS's critical pressure the
   engine gives the Mac, each second, the 1 GiB margin and what requests the host
-  refused wait for, in the same order, store chunks above the floor among them,
-  never the store below its floor.
+  refused wait for, in the same order, every spilling request's pages and store
+  chunks above the floor among them, never the store below its floor.
 - The store's cap is a reservation the engine repays: between commands, the
   store tries to take one chunk back, one it gave back or started without,
   its slots empty, once 30 s have passed since its last try and since a
   request's claim last went unmet or took a chunk, a prefill between its
-  passes, its own spill or something in use (a request the cache served does
-  not count), as long as no request waits for memory and the weights are not
-  released. The chunk takes memory `--max-memory` leaves free, which needs
-  normal pressure and 1 GiB to spare beyond the chunk; for what that lacks
-  the engine evicts cached prefixes that leave memory at once, only when they
-  cover it, never one in use, the prefix the newest conversation resumes from or
-  those that requests waiting to start would resume from. A chunk such prefixes
-  pay for whole comes back under macOS's warning too while the host keeps its
-  margin. A prefix that would first need a copy on the SSD cache stays; the
-  engine copies such prefixes ahead for what the chunk lacked, so a later try
-  finds them free to go. A store a burst shrank thus comes back a chunk per 30 s
-  once requests stop going short, even when the burst's KV, cached, fills the
-  room. Each chunk given back or taken back logs a line
-  (`Expert store gave back`, `Expert store took back`). Elasticity serves
+  passes, a spilling request's pages, its own spill or something in use (a
+  request the cache served does not count), as long as no request waits for
+  memory and the weights are not released. The chunk takes memory `--max-memory`
+  leaves free, which needs normal pressure and 1 GiB to spare beyond the chunk;
+  for what that lacks the engine evicts cached prefixes that leave memory at
+  once, only when they cover it, never one in use, the prefix the newest
+  conversation resumes from or those that requests waiting to start would resume
+  from. A chunk such prefixes pay for whole comes back under macOS's warning too
+  while the host keeps its margin. A prefix that would first need a copy on the
+  SSD cache stays; the engine copies such prefixes ahead for what the chunk
+  lacked, so a later try finds them free to go. A store a burst shrank thus
+  comes back a chunk per 30 s once requests stop going short, even when the
+  burst's KV, cached, fills the room. Each chunk given back or taken back logs a
+  line (`Expert store gave back`, `Expert store took back`). Elasticity serves
   concurrency, the prefix cache and the rest of the Mac; the advertised context
   is planned with the store at the cap the engine's limit gives it and does not
   change.
@@ -563,27 +696,52 @@ to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
 The [SSD cache](#ssd-cache) supports both formats, preserving their stored
 bytes without further quantization.
 
+On M5 and later Macs, whose GPUs multiply int8 at twice their bf16 rate, INT8 KV
+also quantizes the attention queries to INT8 where each split of dense attention
+reads at least 8 pages of 32 tokens. Prefill chunks of about 225 tokens or more
+take INT8 queries even with no history, and verify takes them from about 7K
+tokens of history. `--activations bf16` keeps the queries bf16 with either
+KV format.
+
 ### State precision
 
 The linear-attention (GDN) layers of the targets carry a recurrent state,
 which every lane holds and every cached state keeps, in memory and on the SSD.
-Select its storage when starting the server:
+A cached state stores it as int8 codes, each block of 32 values of a row with
+a bf16 scale, whatever format the lanes run in: 47 MiB a state for 27B instead
+of 153 MiB in FP32, 20 MiB for 35B instead of 64 MiB, so memory and the
+[SSD cache](#ssd-cache) hold 3.25 times as many cached states. A restore
+decodes the codes into the lane's state, so a cache hit continues from a state
+a little off the one it cached: restoring 40 cached prompts of code, chat and
+agent transcripts changed 27B's next-token distributions by a mean KL of
+1.1e-4, below the 1.5e-4 by which a cold run of the same prompts already
+differs from a restore of its own state, and the error does not build up over
+a conversation's successive hits.
+
+`--cached-states exact` keeps a cached state in the running state's format
+instead, as 1.6 did: a restore is the state it cached, bit for bit, and a
+cached state takes as much memory and SSD as a lane's state (153 MiB for 27B in
+FP32, 81 MiB in BF16). The default, `--cached-states int8`, stores the codes.
+The two keep their caches apart on the SSD, so switching starts the persistent
+cache cold. Restart to switch.
+
+Select the running state's storage when starting the server:
 
 ```bash
 splash serve --model mlx-community/Qwen3.8-27B-4bit --state-format bf16
 ```
 
-BF16 halves the recurrent state, most of a cached state's bytes, so memory and
-the [SSD cache](#ssd-cache) hold nearly twice as many cached states, and a
-decode step reads and writes half the state. The kernels compute in FP32
-either way and round the state to BF16 where they store it: at the end of each
-prefill chunk, at each state a chunk captures inside it (a replay point,
-junction or checkpoint), and at the end of each decode step. So where a
-prompt's chunks end and its states are captured also changes its state in the
-last bits ([sampling](api.md#sampling)). Restart to switch
-formats; the SSD cache keeps each format's states apart. Omit `--state-format`
-or use `--state-format fp32` for the default, the precision the models'
-configurations ask for.
+BF16 halves the recurrent state each lane holds, and a decode step reads and
+writes half the state. The kernels compute in FP32 either way and round the
+state to BF16 where they store it: at the end of each prefill chunk, at each
+state a chunk captures inside it (a replay point, junction or checkpoint), and
+at the end of each decode step. So where a prompt's chunks end and its states
+are captured also changes its state in the last bits
+([sampling](api.md#sampling)). Cached states take the same codes in either
+format, and the SSD cache keeps them for both, unless `--cached-states exact`
+keeps them in the running format. Restart to switch formats. Omit
+`--state-format` or use `--state-format fp32` for the default, the precision
+the models' configurations ask for.
 
 ### SSD cache
 
@@ -608,8 +766,10 @@ that conversation leaves memory at once instead of waiting for its writes.
 Without memory pressure the cache writes nothing ahead, so a Mac whose memory
 never runs short spends no SSD writes on it. Nothing else is copied ahead: not
 the KV a reply adds past the point, which no state resumes from, a shorter
-prompt, which is quicker to compute again, or a progress checkpoint. These
-copies take only the room the cache has free beside its other copies and the
+prompt, which is quicker to compute again, or a progress checkpoint, the state
+where a response's generation ended among them
+([API](api.md#output-limits-and-streaming)). These copies take only the room
+the cache has free beside its other copies and the
 room spilling requests hold for their KV: they give up no copy, a point that
 room cannot hold is not copied, and a full cache gives up the copies of what
 memory still holds first. They wait while the cache reads a prompt back, writes
@@ -637,10 +797,28 @@ cache off. A full cache keeps the only copy of the prefix the newest
 conversation resumes from and of those that requests waiting to start will
 resume from: only a spilling request's KV displaces them.
 
-State writes stage through a buffer of one state (64 MiB for 35B, 153 MiB for
+The quota counts what the cache's files keep on the volume: for each cached
+state and KV page, the 16 KiB pages its bytes fill. A page of a model with
+sliding-window layers holds only the other layers' KV once every window has
+passed it, for Flint 14 of its 49 layers, 464 KiB where a whole page takes
+1.59 MiB, so the same quota holds 3.5 times as many tokens of such pages as of
+whole ones. A file keeps a whole page's room for each copy and leaves the
+part a copy does not fill unallocated, so its length (`ls -l`) can pass the
+quota while the space it takes (`du`) stays within it, beside what APFS
+allocates past the files' ends as they grow and keeps until it drops it on its
+own: about 16 MiB past a file that grows by many small writes, and a few
+percent of one that grows by a few large ones (15.8 MiB past two 153 MiB
+states, the 27B's before cached states took int8 codes; 29.6 MiB past both
+files, 451.5 MiB long together, in another run). That needs a volume
+that gives the unused part of a file back, as APFS does; on one that does not,
+such as HFS+ or exFAT, every copy counts a whole page's or state's room, and
+the log says so once.
+
+State writes stage through a buffer of one state (20 MiB for 35B, 47 MiB for
 27B) that the memory plan sets aside within `--max-memory`; on a 24 GB Mac
-serving 27B that costs 4,096 tokens of context. A size sets it aside whatever
-it costs, as before, and a quota too small for one state leaves the cache off.
+serving 27B that costs about 1,500 tokens of context, the KV of 46 pages.
+A size sets it aside whatever it costs, as before, and a quota too small for
+one state leaves the cache off.
 `auto` sets it aside only where the memory plan holds the model and the
 requested context beside it, and gives it up to the
 [Neural Engine split](internals.md#neural-engine-prefill) where the plan holds the split
@@ -680,12 +858,22 @@ cause repeated reads and writes.
 Startup prints one line: where the files are, the limit and why, the write
 budget when one is set, and that `--max-cache-disk 0` turns the cache off.
 `/status` reports under `disk` the quota (`capacity_bytes`), what the volume
-leaves of it now (`limit_bytes`), `used_bytes`, `volume_available_bytes`, what
-holds writes back (`writes_gated`: `no`, `budget`, or `closed` once a file
-stopped taking writes), `write_budget_bytes`, the bytes the next state's
-write not in use may take now, and `writes_deferred_ms`, how long writes held
-back for SSD reads a step waited for. Without a write budget `writes_gated` is
-never `budget` and `write_budget_bytes` is 0. It counts the KV pages copied
+leaves of it now (`limit_bytes`), what its copies count of it (`used_bytes`,
+of which the KV pages' `kv_bytes` over `kv_blocks` pages), what the files
+keep on the volume by the same count (`file_bytes`),
+`volume_available_bytes`, what holds writes back (`writes_gated`: `no`,
+`budget`, or `closed` once a file stopped taking writes),
+`write_budget_bytes`, the bytes the next state's write not in use may take
+now, and `writes_deferred_ms`, how long writes held back for SSD reads a step
+waited for. Without a write budget `writes_gated` is
+never `budget` and `write_budget_bytes` is 0. `written_last_hour_bytes` and
+`written_last_day_bytes` are the cache's write rate: what its writes took over
+the last hour and the last day the Mac was awake, counted as the write budget
+counts them, with a budget or without. The day's bytes are the number to set
+`--max-cache-disk-writes` from and to hold against the drive's rated
+endurance; 24 times the hour's projects them for the load of the moment. Each
+is exact to a minute, and a server that has run for less than an hour or a day
+has written all of its count. `/status` also counts the KV pages copied
 ahead (`kv_copies`), and under `write_behind` the restore points queued for
 their copies, the one being copied among them (`waiting`), copied
 (`durable`), gone on from first (`unneeded`) and not copied for want of room
@@ -751,13 +939,16 @@ its copies, not as the request's KV. One whose KV spills writes its own over
 them before its pages spill.
 
 A start takes back every recorded point whose chain is whole. A clean stop
-writes the waiting points (newest first, up to 6 s, whatever the write budget)
-and syncs the files. After a crash the next start takes back what reached the
-disk, each state with the class it had last: a checkpoint a request went on to
-reuse as an ordinary state comes back as one. Every start serves its first
-minute on probation: after two starts in a row fail within it, or one whose
-engine reports its own failure, the next start begins empty. `/status` reports
-all this under `disk` (`persistent`, `taken_back`).
+writes the waiting points (newest first, up to 6 s, whatever the write budget),
+gives up the copies no point needs (up to 2 s), such as those of the blocks a
+long request wrote past its point, and syncs the files, so that the next start
+leaves nothing behind. After a crash the next start takes back what reached
+the disk, each state with the class it had last: a checkpoint a request went on
+to reuse as an ordinary state comes back as one; the copies no point needs
+stay behind, and that start frees them. Every start serves its first minute on
+probation: after two starts in a row fail within it, or one whose engine
+reports its own failure, the next start begins empty. `/status` reports all
+this under `disk` (`persistent`, `taken_back`).
 
 ### KV on the SSD
 
@@ -773,48 +964,92 @@ what memory holds, as a dense target's is.
   tokens or fewer, or takes no more in memory than spilling it would at its
   peak, keeps its KV in memory, and so does one whose KV, beside what the
   requests in service are projected to grow into, fits the memory free now
-  with what a start may take (the cached prefixes nothing in use holds and
-  the caches the model rebuilds, never the
-  [expert store](#streamed-experts)'s chunks), counted in whole extents with
-  the states its prefill holds; any other spills. A request
-  that cannot spill, the SSD cache closed or its quota short, or whose KV
-  fits in the pages a spilling request keeps whole anyway, keeps its KV in
-  memory.
-- A decoding request in memory whose KV cannot grow spills from then on
-  rather than yield its lane or fail, where that covers what it lacks: what
-  spilling the pages only it holds frees, past its first 2,048 tokens and
-  its last 64 pages, less the hot block cache's floor its reads need
-  (390 MiB), which takes a request of about 46K tokens or more. Its pages whose copies landed before,
-  as a prefix restored from the SSD cache has them, spill at once, and it
-  waits while the others' copies land. From then on it is a spilling request
-  like any other. No other request and no shortage of the host's makes a
-  request spill, and a request in prefill does not. When other memory is
-  short, a state, a spilling request's reads, or the host's, what can go
-  goes in a fixed order: a cached prefix, the caches the model rebuilds,
+  with what a start may take (the cached prefixes nothing in use holds, the
+  caches the model rebuilds and the memory spilling requests of its priority
+  or a lower one give back, below, never the pages of a prefix it reuses nor
+  the [expert store](#streamed-experts)'s chunks), counted in whole extents with
+  the states its prefill holds; any other spills. A request whose KV fits
+  in the pages a spilling request keeps whole anyway keeps its KV in memory.
+  So does one that cannot spill, the SSD cache closed or its quota short,
+  where it fits the context memory holds of one request and memory holds its
+  KV now: beside other requests in service, with what a start may take, as
+  above; alone, with what a request in service may take, the buffers the
+  next request starts from among it. Where memory does not hold it, it waits
+  for the other requests in service, and makes one of a lower priority yield
+  only while all of them are of a lower priority. Alone, where memory holds
+  its prompt,
+  it keeps its KV in memory with its output bounded to what memory holds, as
+  the SSD cache bounds a spilling request's, and ends at that bound; where
+  memory does not, it takes the SSD cache's bound on its output or waits for
+  its quota as a spilling request does, and is otherwise refused at its
+  start rather than fail partway through its prefill. The refusal names what
+  the SSD cache has for it and, as `capacity_exhausted` does, the request's
+  lane and tokens and `device_untracked_bytes`, with the memory its prompt
+  needs (`memory_needed_bytes`) and what memory has for it
+  (`memory_available_bytes`).
+- A request in memory whose KV cannot grow, in decode or in prefill, spills
+  from then on rather than yield its lane or fail, where that covers what it
+  lacks: what spilling the pages only it holds frees, past its first 2,048
+  tokens and its last 64 pages, less the hot block cache's floor its
+  decode's reads need (585 MiB), which takes a request of about 62K tokens
+  or more. Its pages whose copies have landed, as a prefix restored from the
+  SSD cache or copied ahead has them, give back the memory it lacks at once,
+  as below, so it misses no step; it waits only while the copies it starts
+  land, its growth then giving back the memory of those it lacks, and a
+  prompt prefilling beside it waits for those up to the time of one of its
+  units (`--decode-share`).
+  From then on it is a spilling request like any other, a prefill going on
+  as one's.
+  No other request and no shortage of the host's makes a request spill.
+  When other memory is short,
+  a state, a spilling request's reads, or the host's, what can go goes in a
+  fixed order: a cached prefix, the caches the model rebuilds, the pages of
+  spilling requests (below; for the host only under macOS's warning or
+  critical pressure),
   then, for a request in service, a chunk of the store above its floor, of
   which a target that can spill has none.
-- A spilling request writes each committed page once to the SSD cache. Once
-  the copy has landed, the page keeps only its index, 24 KiB of the int8
-  page's 414 KiB. Alone at the memory wall, it waits while its writes land
-  rather than fail. Its first 2,048 tokens, which rows with less history read
-  whole, its last 64 pages and up to two prefill groups' pages still being
-  written stay whole. The memory the pages free leaves with the extents they
-  empty, all of them once every spilling request decodes, but one while a
-  spilling prompt still grows into it or the host holds growth back.
+- A spilling request writes each committed page once to the SSD cache and
+  keeps the page in memory while memory lasts: it decodes on its pages in
+  memory and reads nothing back. Once memory is short, a page whose copy has
+  landed gives its memory back, the oldest first, and keeps only its index,
+  24 KiB of the int8 page's 414 KiB: as much as a request lacks, in whole
+  extents, for the request's own growth or reads, for a request in service or
+  a start of its priority or a higher one, and under macOS's warning or
+  critical pressure for the host, which takes every request's, the lowest
+  priority's first. Where every request holding them
+  reads pages back already, a request's growth, one the host refuses among
+  them, first takes the pages it lacks in place. Where those would leave too
+  few index pages free for the next, an extent more gives its memory back
+  with them and refills them; without that extent pages give back nothing in
+  place, since the memory left may hold no new index pages. A prefix's page
+  that several requests share gives its memory back only where the one
+  asking may take it from each of them, and beside it the memory each of
+  them then needs for its reads, and never while a request that starts with
+  its KV in memory restores it; it does so once, and counts once in what a
+  start may take. A request's reads then miss only the blocks of the pages
+  given back. Alone at the memory wall, a spilling request waits while its
+  writes land rather than fail. Its first 2,048 tokens, which rows with less
+  history read whole, its last 64 pages and the pages still being written
+  stay whole. The memory a page gives back leaves with the extents it empties
+  and pays for the index pages it moves into, so pages keep giving memory
+  back under critical pressure too. With `--kv-spill always`, for
+  validation, each page keeps only its index as soon as its copy lands.
 - A decode step reads, after each attention layer selects its blocks, the
   selected blocks not in memory into one hot block cache that all requests
   share, a page's in one read from its first missed block to its last on the
   32 SSD readers, and attends them there.
-  The cache holds at least, for n decoding requests, n + 1 times the blocks a
-  request's 8 rows select, 8,192 blocks a layer (390 MiB) for one, taken
-  whole as a spilling request starts decoding; `--sparse-kv-memory` raises
-  its target, toward which it grows only while a request holds a floor. A
-  decoding request's floor goes only with the request. While no request
-  reads above the floor, the cache's memory, up to 975 MiB after the last
-  spilling request ends, is among the first to go when memory is short, as
-  a cache the model rebuilds. It shares the readers' memory
-  with the history staging below, which the plan sets aside the larger of,
-  so a target within the staging takes nothing from the expert store.
+  The cache holds at least, for n decoding requests, the blocks each
+  request's 16 rows select and 8 rows' more, 12,288 blocks a layer (585 MiB)
+  for one, taken
+  whole as a request some of whose pages gave their memory back starts decoding,
+  by the same release as its first pages give memory back, whichever request's
+  claim it was for; `--sparse-kv-memory` raises its target, toward which it
+  grows only while a request holds a floor. A decoding request's floor goes only
+  with the request. While no request reads above the floor, the cache's memory,
+  up to 1,755 MiB after the last spilling request ends, is among the first to go
+  when memory is short, as a cache the model rebuilds. It shares the readers'
+  memory with the history staging below, which the plan sets aside the larger
+  of, so a target within the staging takes nothing from the expert store.
 - A prefill streams each attention layer's history from the SSD cache into
   staging, a layer's pages read whole (36 KiB each) while the previous layer
   runs. A second buffer, which lets the next layer's reads overlap this
@@ -822,6 +1057,8 @@ what memory holds, as a dense target's is.
   or where what the streamed stores and the first 64K tokens of KV leave
   holds it: where a store binds that is nothing, and the store keeps the
   room; otherwise the buffer takes it from the KV kept resident beyond them.
+  A request reads nothing back, and takes neither the staging nor the hot
+  block cache, until its first pages give memory back.
   A prefill whose history is on the SSD runs alone, and with others waiting
   it takes the fewest rows whose work covers its reads. The staging holds
   nothing between prompts: a decoding request's floor of the hot block cache
@@ -841,7 +1078,8 @@ what memory holds, as a dense target's is.
   `model_context_window_exceeded`. A request that cannot spill, the cache
   short of room, its file closed or its write budget spent, keeps its KV in
   memory where it fits the context memory holds of one request
-  (`context_bounds.resident`). Past what it committed, as when its output
+  (`context_bounds.resident`) and memory holds it now, or alone its prompt
+  under memory's bound (above). Past what it committed, as when its output
   outgrows the 4,096 tokens admission counted, a request commits each
   page's slot as it writes it, while the room lasts; its pages stay in
   memory beyond it, and the other requests' committed pages are still
@@ -849,9 +1087,12 @@ what memory holds, as a dense target's is.
 - The KV a spilling request writes is in use and always written, so one long
   request may overdraw `--max-cache-disk-writes` once. Until the budget
   covers what spilling requests were promised, a new request that would
-  spill keeps its KV in memory where it fits and is refused otherwise
-  (`kv_write_budget`, 503 with a `Retry-After` of the seconds until the
-  budget covers them again as it refills).
+  spill keeps its KV in memory where it fits the context memory holds of
+  one request and memory holds it now, or alone its prompt under memory's
+  bound (above), waits for the other requests in service where memory does
+  not hold it beside them, and is refused otherwise (`kv_write_budget`, 503
+  with a `Retry-After` of the seconds until the budget covers them again as
+  it refills).
 - A block that cannot be read back fails only the requests that read it, as
   `kv_unreadable`, which they may retry; the copy is dropped.
 
@@ -878,9 +1119,12 @@ Each start follows the model's default branch, or the branch or tag
 `--revision` names: one Hub request of at most 5 seconds asks for its current
 commit, and when the Hub answered, another asks for the commit of the draft
 repository's default branch ([Drafts](models.md#drafts)). A new commit downloads only
-the files that changed and replaces the installed model once it is installed.
-There is no update flag; to stay on one commit, pass it as `--revision`. A
-40-hex `--revision` never moves, nor does its draft, and `--offline` (or
+the files that changed and replaces the installed model once it is installed,
+freeing the earlier commit's files, unless another tool's files share its
+snapshot. An older `--revision` downloads them again, as a new commit that then
+fails to load would need. There is no update flag; to stay on one commit,
+pass it as `--revision`. A 40-hex `--revision` never moves, nor does its draft,
+and `--offline` (or
 `HF_HUB_OFFLINE=1`) forbids the Hub: both start the installed model without a
 request.
 
@@ -910,7 +1154,7 @@ also when a new draft has Splash assemble it again.
 
 | Path | Holds |
 | --- | --- |
-| `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
+| `~/Library/Application Support/Splash` | The data directory of a packaged install: `models/`, the installed models' links into the Hugging Face cache and the metadata derived from GGUFs; `runtime/`, the locks and [serve records](#serve-record) of running servers; and `thinking.key`, which encrypts the Messages reasoning a response hides. A source checkout keeps the first two in `install/models` and `build/runtime`. |
 | Hugging Face cache (`HF_HUB_CACHE`, by default `~/.cache/huggingface/hub`) | Model and draft downloads, with Splash's pins under `refs/splash` and the commit of a default branch as `refs/main` ([revisions](#revisions)). |
 | `~/Library/Caches/Splash/prefix-cache` (`--cache-dir`) | The [persistent cache](#persistent-cache), with `--persistent-cache` only, within the [SSD cache](#ssd-cache)'s limit. Every start removes the caches there that nobody used for 14 days. |
 | `$TMPDIR/splash-cache-*` | The [SSD cache](#ssd-cache)'s files, on by default, without `--persistent-cache`, or when another process holds the persistent cache's directory or it cannot be used: one of KV pages and one of states, together at most about the SSD cache's limit: under `auto` a quarter of the volume's free space beyond its floor, up to 32 GiB, or the size `--max-cache-disk` sets while the volume keeps its floor. Each is unlinked as it is created, so no directory lists it and macOS's storage settings count it as System Data, and its space returns when the engine exits, even after a crash. `--cache-dir` does not move them; they follow `TMPDIR`. |
@@ -967,6 +1211,30 @@ reasoning, and any other reply is all answer
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
 
+`--reasoning-effort` (or `SPLASH_REASONING_EFFORT`) sets the effort of every
+request instead, with the same values: each Chat, Responses and Messages
+request, `/apply-template` and token count renders as though it had sent that
+effort and nothing else of reasoning. The effort replaces the request's
+`reasoning_effort` or `reasoning.effort`, the effort of its Messages `thinking`
+and `output_config`, and an `enable_thinking` or `reasoning_effort` among its
+`chat_template_kwargs`; `none` turns thinking off for every request. It is for
+a server whose clients ask for thinking themselves: a Messages request's
+`thinking` outranks the default effort, so a coding agent that sends one on
+every turn thinks on every turn, whatever the default. A malformed field is
+refused with the 400 it gets without the option.
+
+```sh
+splash serve --model mlx-community/Qwen3.8-27B-4bit --reasoning-effort none
+```
+
+It leaves no request for a default effort to set, so the server refuses it
+together with `--default-reasoning-effort`, from either's flag or environment
+variable. A [thinking token budget](#thinking-token-budget), the server's or a
+request's own, still caps the thinking of a request that thinks: the effort
+says whether and how hard a request thinks, the budget for how long. A model
+that decides itself whether to reason takes no effort, so the server refuses to
+start one, such as Flint, with the option.
+
 `/v1/models` reports, as `reasoning`, what efforts do to the model's default
 template, rendered as at startup: `thinks`, whether a request without an effort
 reasons; `efforts`, the efforts besides `none` that the template renders, and
@@ -975,19 +1243,27 @@ stands in for (`low`, `medium` and `xhigh` for Qwen3.8; none for Qwen3.6, whose
 template switches reasoning on and off alike at every effort); and `default`,
 the one of them a request without an effort renders like,
 `--default-reasoning-effort` in place of the template's (`xhigh` for `high` on
-Qwen3.8). For Flint, whose model decides, `thinks` is `null` and `efforts`
-empty.
+Qwen3.8). Where a request's effort decides nothing, `thinks` is `null` and
+`efforts` empty, so that a client offers none: for Flint, whose model decides,
+and under `--reasoning-effort`, where the server does, and `/status` names its
+effort as `reasoning_effort`.
 
 `/apply-template` uses the same default. Anthropic `thinking` keeps its protocol
 semantics (off when omitted) unless the request's `chat_template_kwargs` set
 `enable_thinking`; judgment endpoints always disable thinking. The
 built-in chat page offers Auto, the efforts `/v1/models` reports and Off, and
-no menu for a model that decides; it sends no effort unless the user picks one.
+no menu where `thinks` is `null`; it sends no effort unless the user picks one.
 
-The console's Started line shows how each chat request reasons: the effort it
-sent, or `absent` and the default it took, its `enable_thinking` when it set
-one, and whether it thinks, as in
-`Started · input 2,473 · cached 0 · effort absent → low · thinking on`.
+The console's Started line names the request the engine took, by the id its
+Done, Cancelled or Error line names too, and shows how each chat request
+reasons: the effort it sent, or `absent`; after an arrow, the effort it
+rendered with where the server gave it another, the default or the one
+`--reasoning-effort` sets; the effort its `chat_template_kwargs` set, which
+the template renders over the others, followed by `(chat_template_kwargs)`;
+its `enable_thinking` when it set one that counted; and whether it thinks, as in
+`Started · request 12 · input 2,473 · cached 0 · effort absent → low · thinking on`,
+`effort low (chat_template_kwargs) · thinking on`
+or, under `--reasoning-effort none`, `effort high → none · thinking off`.
 
 A Chat or Messages request's `chat_template_kwargs` are passed to the template
 as variables and outrank the effort, and in Messages `thinking`, so
@@ -1070,8 +1346,17 @@ count. Text completions have no reasoning split and refuse a budget with 400.
 Agents must already be installed; `splash claude|opencode|codex|hermes|pi`
 connects to the running server. Arguments pass through, for example
 `splash codex resume --last` or `splash hermes chat -q "Hello"`. `splash`
-reaches the server on loopback without a proxy. Where the environment names a
-proxy (`http_proxy`, `https_proxy` or `all_proxy`, in either case), it adds
+reaches the server on loopback without a proxy, over TCP at
+`http://127.0.0.1:PORT`, once it is ready. Where none answers there but a
+Splash server holds the port, one that listens on another address or a UNIX
+socket or still starts, the refusal names that server as a second `serve` on
+the port does: its PID, model, port, `--host` and the phase of its [serve
+record](#serve-record), as in
+`(PID 4242, model ID, port 8000, host unix:/tmp/splash.sock, phase ready)`.
+Of a server that listens on loopback and whose record says `ready`, the
+refusal says only that it does not answer, as one that is stopping does not.
+Where the environment names a proxy (`http_proxy`, `https_proxy` or
+`all_proxy`, in either case), it adds
 `127.0.0.1`, `localhost` and `::1` to the agent's `NO_PROXY` and `no_proxy`,
 keeping the hosts already there and leaving `*` as it is, so no proxy receives
 the server's key. A proxy set only in macOS system settings is left to that

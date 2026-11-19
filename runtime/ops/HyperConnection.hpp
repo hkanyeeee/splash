@@ -31,9 +31,7 @@ struct HyperConnection final {
   // The normalized streams (bf16) and, with inject, the injection weights
   // (fp32 [rows][streams]), of the shape its kernels are compiled for
   // (HYPER_CONNECTION_NORM_HIDDEN). A register-tile projection reading the
-  // output prepares its own table. `staged` (ExecutionPlans::hyperNormStaged)
-  // runs an injecting mix of the quarters' rows on the staged kernel, bit for
-  // bit the same.
+  // output prepares its own table.
   static void addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
                       metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
                       HyperShape shape, uint32_t rows, bool staged = false);

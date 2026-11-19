@@ -10,7 +10,11 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     var text: String
     /// What the model thought before it answered.
     var reasoning = ""
-    /// Images the user attached, as PNG or JPEG data.
+    /// What the user attached (`Attachment`); nil for nothing, as in a message an earlier app kept.
+    var attachments: [Attachment]?
+    /// Images an earlier app kept in the message itself, as PNG or JPEG data, which
+    /// `ChatStore.adoptFiles` moves into files of their own; none after. Always written, as the
+    /// 1.6.0 app requires it of every message, and skips a chat that lacks it, as after a downgrade.
     var images: [Data] = []
     /// The model that answered.
     var model: String?
@@ -27,11 +31,60 @@ struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     var isEmpty: Bool { text.isEmpty && reasoning.isEmpty }
 }
 
+/// A file the user attached to a message: an image, PNG or JPEG, or a PDF. It is kept as a file of
+/// its own in the attachments folder (`ChatStore.attachments`), not inside its conversation's file,
+/// and read as a request or the transcript needs it.
+struct Attachment: Codable, Identifiable, Equatable, Sendable {
+    enum Kind: String, Codable, Sendable { case image, pdf }
+
+    var id = UUID()
+    var kind: Kind
+    /// Its media type: image/png, image/jpeg or application/pdf.
+    var type: String
+    var bytes: Int
+    /// A PDF's name and pages, which its chip shows.
+    var name: String?
+    var pages: Int?
+
+    /// Its file's name in the attachments folder.
+    var file: String {
+        let suffix = switch type {
+        case "image/png": "png"
+        case "application/pdf": "pdf"
+        default: "jpg"
+        }
+        return "\(id.uuidString).\(suffix)"
+    }
+
+    /// Writes `data`, its content, as its file in `folder`, made where there is none; false where
+    /// it can't be written.
+    func write(_ data: Data, in folder: URL) -> Bool {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return (try? data.write(to: folder.appending(path: file), options: .atomic)) != nil
+    }
+
+    /// The record of an image, of its PNG or JPEG data.
+    static func image(_ data: Data) -> Attachment {
+        Attachment(kind: .image, type: ChatClient.mediaType(data), bytes: data.count)
+    }
+
+    /// Its pages, where they are known, and its size, as a PDF's chip says them.
+    var details: String {
+        [pages.map { $0 == 1 ? "1 page" : "\($0) pages" }, Format.size(Int64(bytes))].compactMap { $0 }.joined(separator: " · ")
+    }
+}
+
 struct Conversation: Codable, Identifiable, Equatable {
     var id = UUID()
     var title = ""
     var updated = Date.now
     var messages: [ChatMessage] = []
+    /// When it was pinned to the top of the list; nil where it is not.
+    var pinned: Date?
+
+    /// The files its attachments are kept in, by name in the attachments' folder
+    /// (`ChatStore.attachments`).
+    var attachmentFiles: [String] { messages.flatMap { ($0.attachments ?? []).map(\.file) } }
 }
 
 /// The model a message goes to: the server's address, the model it serves and whether it sees
@@ -47,7 +100,8 @@ struct ChatTarget: Equatable, Sendable {
     var apiKey: String?
 }
 
-/// The conversations, one JSON file each in the app's folder, and the one reply that streams.
+/// The conversations, one JSON file each in the app's folder, and the one request under way: the
+/// reply that streams, and until the request is its chat's for good, what it would make of the chat.
 @MainActor @Observable
 final class ChatStore {
     /// The reply that streams: when it was asked for, when the model began to think, and how much
@@ -75,70 +129,243 @@ final class ChatStore {
         }
     }
 
+    /// What the request under way would make of its chat, held apart from the conversations kept,
+    /// which the list, the search and the files show, until it is the chat's for good: a message
+    /// once the server takes the request, an answer asked again once it says something in the
+    /// earlier one's place (`stream`). Until then nothing is kept that a refusal, a failure or a
+    /// stop would have to take back: the chat stays as it was, and a new one was never listed,
+    /// opened or written.
+    private struct Pending {
+        /// What a request asks for: a new chat's first message, which has no conversation to show
+        /// in, and which the composer holds meanwhile; a later message, which its chat shows, the
+        /// composer having given it up; or an answer asked again.
+        enum Ask { case first, later, again }
+
+        let conversation: Conversation
+        let ask: Ask
+        /// Tells that the message shows in its conversation, for the composer to give it up.
+        let shown: () -> Void
+    }
+
     private(set) var conversations: [Conversation] = []
-    /// The open conversation; nil is a new one, saved once it has a message.
+    /// The open conversation; nil is a new one, kept once the server takes its first message.
     var selection: UUID?
     private(set) var reply: Reply?
+    private var pending: Pending?
 
-    /// The conversation whose reply streams now, the open one or another.
+    /// The conversation whose request is under way, the open one or another, or a new chat's,
+    /// which is none of those kept until the server takes its first message.
     var streaming: UUID? { reply?.conversation }
 
+    /// Whether the request under way is the open chat's, which Stop then stops: its reply streams
+    /// in the open conversation, or the server has yet to take the first message of the new chat,
+    /// which is open (`sendingFirstMessage`).
+    var answering: Bool {
+        guard let reply else { return false }
+        return pending?.ask == .first ? selection == nil : reply.conversation == selection
+    }
+
+    /// Whether the server has yet to take the first message of the new chat, which is open: its
+    /// composer holds the message meanwhile, as it was sent, Stop in Send's place. Another chat's
+    /// composer holds that chat's own draft.
+    var sendingFirstMessage: Bool { pending?.ask == .first && selection == nil }
+
     private let folder: URL
+    /// Where the conversations' attachments are kept, a file each (`Attachment.file`).
+    nonisolated let attachments: URL
     private var replying: Task<Void, Never>?
+    /// The requests for titles under way, by conversation (`title`).
+    @ObservationIgnored private var titling: [UUID: Task<Void, Never>] = [:]
     /// Writes and removes the conversations' files in the order they change, off the main thread:
     /// a conversation with images takes milliseconds to encode and write, which a send and a
     /// reply's end would otherwise wait for.
     private let files = DispatchQueue(label: "ChatStore.files", qos: .utility)
+    /// Whether every conversation's file could be read, so that `adoptFiles` knows each file a
+    /// conversation names.
+    @ObservationIgnored private var readAll = false
 
     init(folder: URL) {
         self.folder = folder
+        attachments = folder.appending(path: "Attachments")
         let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
-        conversations = files.filter { $0.pathExtension == "json" }
-            .compactMap { try? JSONDecoder().decode(Conversation.self, from: Data(contentsOf: $0)) }
-            .map(Self.interrupted)
-            .sorted { $0.updated > $1.updated }
+        let kept = files.filter { $0.pathExtension == "json" }
+        let read = kept.compactMap { try? JSONDecoder().decode(Conversation.self, from: Data(contentsOf: $0)) }
+        conversations = read.map(Self.interrupted).sorted { $0.updated > $1.updated }
+        readAll = read.count == kept.count
     }
 
+    /// Brings the folder to how this app keeps it: the images an earlier app kept inside its
+    /// conversations go into files of their own; then the attachments no conversation names go,
+    /// as those of a draft the app quit with, unless a conversation that can't be read may name
+    /// them. In that order: the removal, off the main thread, would take the moved images for
+    /// strays. The app does it as it launches, before any draft (`AppState.launch`), once it is
+    /// the one Splash that runs, from where it can: a copy that gives way or one on the disk image
+    /// leaves the chats as the app that goes on running reads them.
+    func adoptFiles() {
+        for index in conversations.indices where conversations[index].messages.contains(where: { !$0.images.isEmpty }) {
+            conversations[index] = Self.movingImages(of: conversations[index], to: attachments)
+            write(conversations[index])
+        }
+        guard readAll else { return }
+        let named = Set(conversations.flatMap(\.attachmentFiles))
+        let attachments = attachments
+        files.async {
+            let stray = ((try? FileManager.default.contentsOfDirectory(at: attachments, includingPropertiesForKeys: nil)) ?? [])
+                .filter { !named.contains($0.lastPathComponent) }
+            stray.forEach { try? FileManager.default.removeItem(at: $0) }
+        }
+    }
+
+    /// `conversation` with the images an earlier app kept in its messages moved into files of
+    /// their own in `folder`, in their order; one that can't be written stays where it was.
+    nonisolated static func movingImages(of conversation: Conversation, to folder: URL) -> Conversation {
+        var conversation = conversation
+        for index in conversation.messages.indices {
+            let images = conversation.messages[index].images
+            guard !images.isEmpty else { continue }
+            var attached = conversation.messages[index].attachments ?? []
+            var kept: [Data] = []
+            for image in images {
+                let attachment = Attachment.image(image)
+                if attachment.write(image, in: folder) {
+                    attached.append(attachment)
+                } else {
+                    kept.append(image)
+                }
+            }
+            conversation.messages[index].attachments = attached.isEmpty ? nil : attached
+            conversation.messages[index].images = kept
+        }
+        return conversation
+    }
+
+    /// The open conversation as it shows: with what the request under way would make of it, as a
+    /// message shows in its chat while the server has yet to take it. A new chat shows none.
     var current: Conversation? {
-        conversations.first { $0.id == selection }
+        guard var open = conversations.first(where: { $0.id == selection }) else { return nil }
+        if let pending, pending.conversation.id == open.id { open.messages = pending.conversation.messages }
+        return open
+    }
+
+    /// The conversations whose title or messages hold `query`, as the list's search finds them, in
+    /// the list's order; every one for an empty query.
+    func matching(_ query: String) -> [Conversation] {
+        guard !query.isEmpty else { return conversations }
+        return conversations.filter { conversation in
+            conversation.title.localizedStandardContains(query)
+                || conversation.messages.contains { $0.text.localizedStandardContains(query) }
+        }
     }
 
     func newChat() {
         selection = nil
     }
 
-    func delete(_ id: UUID) {
-        if streaming == id { stop() }
-        conversations.removeAll { $0.id == id }
-        let file = file(id)
-        files.async { try? FileManager.default.removeItem(at: file) }
-        if selection == id { selection = nil }
+    /// Deletes the conversations of `ids` it holds, and their files, stopping a reply that streams
+    /// in one; the open one deleted, a new chat opens.
+    func delete(_ ids: Set<UUID>) {
+        if let streaming, ids.contains(streaming) { stop() }
+        for id in ids { titling.removeValue(forKey: id)?.cancel() }
+        let deleted = conversations.filter { ids.contains($0.id) }
+        let removed = deleted.map { file($0.id) }
+            + deleted.flatMap(\.attachmentFiles).map { attachments.appending(path: $0) }
+        conversations.removeAll { ids.contains($0.id) }
+        files.async { removed.forEach { try? FileManager.default.removeItem(at: $0) } }
+        if let selection, ids.contains(selection) { self.selection = nil }
     }
 
+    /// Renames conversation `id` `title`, trimmed; a name of nothing leaves it as it was.
     func rename(_ id: UUID, to title: String) {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        titling.removeValue(forKey: id)?.cancel()
         guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[index].title = title
         write(conversations[index])
     }
 
-    /// Sends `text` and `images` in the open conversation, or a new one, to the model `server`
-    /// serves, and streams its reply into the conversation.
-    func send(_ text: String, images: [Data], to server: ChatTarget) {
-        guard streaming == nil else { return }
-        var conversation = current ?? Conversation()
-        if conversation.title.isEmpty {
-            let line = text.split(separator: "\n").first.map(String.init) ?? "Image"
-            conversation.title = String(line.prefix(80))
-        }
-        conversation.messages.append(ChatMessage(role: .user, text: text, images: images))
-        stream(conversation, to: server)
+    /// Pins conversation `id` to the top of the list, or takes it off there.
+    func pin(_ id: UUID, _ pinned: Bool) {
+        guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[index].pinned = pinned ? .now : nil
+        write(conversations[index])
     }
 
-    /// Answers the open conversation's last message again, in place of the last answer.
-    func retry(with server: ChatTarget) {
-        guard streaming == nil, var conversation = current, conversation.messages.last?.role == .assistant else { return }
+    /// What a request that came to nothing gives back to the composer, in its conversation, nil
+    /// for a new one: the message the composer gave up, where it did, and why the request came to
+    /// nothing, unless it was stopped. A new chat's first message, which the composer still
+    /// holds, and a reply asked again give back only why. Its chat is the open one by then
+    /// (`stream`).
+    struct Refused: Equatable {
+        let text: String
+        let attachments: [Attachment]
+        let reason: String?
+        let conversation: UUID?
+    }
+
+    /// Sends `text` and `attachments`, kept in the attachments folder already, in the open
+    /// conversation, or a new one, to the model `server` serves, and streams its reply into the
+    /// conversation. The message is its chat's once the server takes the request (`stream`): an
+    /// open conversation shows it at once, and a new chat becomes a conversation, listed, written
+    /// and open, only then. `shown` tells that the message shows in its conversation, for the
+    /// composer to give it up: at once in an open one, and for a new chat once the server has
+    /// taken it. A request the server refuses, that never reaches it or that is stopped before
+    /// it takes it leaves the chats as they were, and goes to `refused`, with what the composer
+    /// gave up of it and why, its chat open again (`stream`).
+    func send(_ text: String, attachments: [Attachment], to server: ChatTarget,
+              refused: @escaping (Refused) -> Void = { _ in }, shown: @escaping () -> Void = {}) {
+        guard streaming == nil else { return }
+        let open = current
+        var conversation = open ?? Conversation()
+        if conversation.title.isEmpty { conversation.title = Self.firstLine(text, attachments: attachments) }
+        conversation.messages.append(ChatMessage(role: .user, text: text, attachments: attachments.isEmpty ? nil : attachments))
+        stream(conversation, new: open == nil, to: server, shown: shown) { reason in
+            if let open {
+                refused(Refused(text: text, attachments: attachments, reason: reason, conversation: open.id))
+            } else if let reason {
+                refused(Refused(text: "", attachments: [], reason: reason, conversation: nil))
+            }
+        }
+    }
+
+    /// A chat's title until the model sums it up (`title`): the first line of its first message,
+    /// or, for attachments alone, the first PDF's name, else Image.
+    static func firstLine(_ text: String, attachments: [Attachment] = []) -> String {
+        let line = text.split(separator: "\n").first.map(String.init) ?? attachments.lazy.compactMap(\.name).first ?? "Image"
+        return String(line.prefix(80))
+    }
+
+    /// Titles conversation `id` as the model sums up its first exchange, `question` and `answer`,
+    /// while its title is still the first line; renaming or deleting it meanwhile cancels the
+    /// request, and where the model gives no title, the first line stays.
+    private func title(_ id: UUID, question: ChatMessage, answer: String, with server: ChatTarget) {
+        guard conversations.first(where: { $0.id == id })?.title == Self.firstLine(question.text, attachments: question.attachments ?? [])
+        else { return }
+        titling[id]?.cancel()
+        titling[id] = Task { [weak self] in
+            let title = try? await ChatClient.title(question: question.text, answer: answer, with: server)
+            guard let self, !Task.isCancelled else { return }
+            titling[id] = nil
+            guard let title, let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+            conversations[index].title = title
+            write(conversations[index])
+        }
+    }
+
+    /// Answers the open conversation's last message again, in place of the last answer, which
+    /// stays the chat's until the new one says something (`stream`): where the server refuses the
+    /// request, or the new answer ends before it says anything, stopped or failed, the earlier
+    /// one shows again, and a refusal or a failure goes to `refused` with why, its chat open
+    /// again (`stream`). Stopped, it gives nothing back, and the open chat stays: the request's
+    /// end alone tells of it (`streaming`).
+    func retry(with server: ChatTarget, refused: @escaping (Refused) -> Void = { _ in }) {
+        guard streaming == nil, var conversation = current, let previous = conversation.messages.last,
+              previous.role == .assistant else { return }
         conversation.messages.removeLast()
-        stream(conversation, to: server)
+        let id = conversation.id
+        stream(conversation, new: false, to: server, instead: previous) { reason in
+            if let reason { refused(Refused(text: "", attachments: [], reason: reason, conversation: id)) }
+        }
     }
 
     /// Stops the reply; what it said so far stays.
@@ -146,22 +373,49 @@ final class ChatStore {
         replying?.cancel()
     }
 
-    private func stream(_ conversation: Conversation, to server: ChatTarget) {
+    /// Stops the request under way as the app quits. A later message the server has yet to take
+    /// is its chat's first, as though the server had taken it: its chat shows it, and the
+    /// composer, which gave it up, goes with the app, as would the attachments no chat names
+    /// (`adoptFiles`). A new chat's first message, which the composer still holds, goes with the
+    /// composer, as any draft does, and an answer asked again leaves the earlier one.
+    func quit() {
+        if pending?.ask == .later { keep() }
+        stop()
+    }
+
+    /// Streams the reply to `conversation`'s last message, asked again `instead` of an earlier
+    /// answer where one is given. The open conversation shows the request at once, which `shown`
+    /// tells; a `new` chat, which has no conversation, shows nothing of it. What the request
+    /// makes of its chat is the chat's for good (`keep`) once nothing can take it back: a message
+    /// once the server takes the request (`ChatClient.reply`), and an answer asked again once it
+    /// says something in the earlier one's place. A request that ends before, refused, failed or
+    /// stopped, leaves every chat as it was, and goes to `back` with why, nil for a stop, unless
+    /// its chat was deleted meanwhile, which its message went with. What it gives back, a message
+    /// or why, comes back to its chat, which opens first; an answer asked again with no why, as
+    /// one stopped, gives nothing back, and opens nothing. One that ends after leaves its answer
+    /// in the chat, saying why it stopped short.
+    private func stream(_ conversation: Conversation, new: Bool, to server: ChatTarget, instead previous: ChatMessage? = nil,
+                        shown: @escaping () -> Void = {}, back: @escaping (String?) -> Void) {
         var conversation = conversation
         let history = conversation.messages
         var answer = ChatMessage(role: .assistant, text: "", model: server.model)
         conversation.messages.append(answer)
-        conversation.updated = .now
-        put(conversation)
-        selection = conversation.id
+        pending = Pending(conversation: conversation, ask: new ? .first : previous == nil ? .later : .again, shown: shown)
+        if !new { shown() }
         let reply = Reply(answer, in: conversation.id)
         self.reply = reply
+        let files = attachments
         replying = Task { [weak self] in
-            var shown = ContinuousClock.now
+            var drawn = ContinuousClock.now
             var thinking: Date?
             var read: Double?
             do {
-                for try await delta in ChatClient.stream(history, with: server) {
+                let deltas = try await ChatClient.reply(to: history, with: server, files: files)
+                // The server has taken the request: a message is its chat's, unless stopped by then.
+                if previous == nil, !Task.isCancelled { self?.keep() }
+                for try await delta in deltas {
+                    // Stopped, it reads no more: what it said stays, and what was not kept is not.
+                    if Task.isCancelled { break }
                     if !delta.reasoning.isEmpty, thinking == nil {
                         thinking = .now
                         reply.live.thinking = thinking
@@ -176,24 +430,66 @@ final class ChatStore {
                     read = delta.read ?? read
                     // Asked for no limit, a reply runs to the end of the context.
                     if delta.cut { answer.error = "The reply reached the end of the model’s context." }
+                    // An answer asked again is its chat's once it says something.
+                    if !answer.isEmpty { self?.keep() }
                     // A redraw per token would be wasted work: the page lets out what comes at an
                     // even pace (page.js).
-                    if ContinuousClock.now - shown > .milliseconds(50) {
-                        shown = .now
+                    if ContinuousClock.now - drawn > .milliseconds(50) {
+                        drawn = .now
                         reply.live.read = read
                         reply.message = answer
                     }
                 }
-                // Cancelled, the stream just ends; what it said stays.
-                if Task.isCancelled { answer.stopped = true }
             } catch {
-                answer.error = error.localizedDescription
+                // A request stopped ends as it can, which is no failure.
+                if !Task.isCancelled { answer.error = error.localizedDescription }
+            }
+            if Task.isCancelled { answer.stopped = true }
+            guard let self else { return }
+            self.reply = nil
+            if pending != nil {
+                pending = nil
+                let listed = conversations.contains { $0.id == conversation.id }
+                guard new || listed else { return }
+                // What comes back comes back to its chat, which opens first, the new chat for a new
+                // chat's first message, which nothing lists: the composer says why in the chat it
+                // is about alone, and Send sends what it holds to the open chat. Under a chat
+                // opened while the server had the message, a message refused came back with its
+                // reason unsaid, and one stopped from elsewhere, as a switch of models stops it,
+                // with nothing said, each for Send to send there. An answer asked again with no
+                // why, as one stopped, gives nothing back, and opens nothing.
+                if previous == nil || answer.error != nil { selection = listed ? conversation.id : nil }
+                back(answer.error)
+                return
             }
             // A reply that ended while the model still thought.
             if let thinking, answer.thinkingTime == nil { answer.thinkingTime = Date.now.timeIntervalSince(thinking) }
-            self?.finish(answer, in: conversation.id)
-            self?.reply = nil
+            finish(answer, in: conversation.id)
+            // A first exchange answered in full gets the title the model sums it up in.
+            if history.count == 1, answer.error == nil, answer.stopped == nil, !answer.text.isEmpty {
+                title(conversation.id, question: history[0], answer: answer.text, with: server)
+            }
         }
+    }
+
+    /// Makes what the request under way would make of its chat the chat's, once: its messages
+    /// in the conversation as it is now, so that a pin, a name or a title it took meanwhile
+    /// stays, and its title where the chat has none; first in the list, and written. A chat
+    /// deleted meanwhile stays gone. A new chat becomes a conversation, which opens where the
+    /// new chat is still open, and tells that it shows its message; another chat opened
+    /// meanwhile stays open.
+    private func keep() {
+        guard let pending else { return }
+        self.pending = nil
+        guard var conversation = pending.ask == .first ? pending.conversation
+            : conversations.first(where: { $0.id == pending.conversation.id }) else { return }
+        conversation.messages = pending.conversation.messages
+        if conversation.title.isEmpty { conversation.title = pending.conversation.title }
+        conversation.updated = .now
+        put(conversation)
+        guard pending.ask == .first else { return }
+        if selection == nil { selection = conversation.id }
+        pending.shown()
     }
 
     /// Puts the reply that ended, `message`, in its conversation, which it brings to the top, and
@@ -269,8 +565,9 @@ enum ChatClient {
 
     /// The tokens `messages` take as the model reads them, its template, images and earlier
     /// thinking included, counted without inference and without waking a sleeping engine.
-    static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, session: URLSession = .shared) async throws -> Int {
-        let request = try countRequest(messages, with: server)
+    static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, files: URL,
+                            session: URLSession = .shared) async throws -> Int {
+        let request = try countRequest(messages, with: server, files: files)
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else {
@@ -284,9 +581,11 @@ enum ChatClient {
         return count.input_tokens
     }
 
-    /// The request counting `messages`: the prompt `stream` sends, as it sends it.
-    static func countRequest(_ messages: [ChatMessage], with server: ChatTarget) throws -> URLRequest {
-        let json = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, images: server.acceptsImages))
+    /// The request counting `messages`, their attachments in `files`: the prompt `reply` sends, as
+    /// it sends it.
+    static func countRequest(_ messages: [ChatMessage], with server: ChatTarget, files: URL) throws -> URLRequest {
+        let json = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, vision: server.acceptsImages,
+                                                                     files: files))
         return request("v1/chat/completions/count_tokens", json, to: server, timeout: 30)
     }
 
@@ -301,18 +600,28 @@ enum ChatClient {
         return request
     }
 
-    static func stream(_ messages: [ChatMessage], with server: ChatTarget) -> AsyncThrowingStream<Delta, Error> {
-        AsyncThrowingStream { continuation in
+    /// Asks `server` for the reply to `messages`, their attachments in `files`, and returns once
+    /// the server has taken the request, with the reply as it streams; throws where it hasn't,
+    /// with the server's error in the app's words (`message`), or why it could not be reached.
+    /// The server takes a request as it starts its response, with status 200: an error it finds
+    /// before, it answers with in the response's place, under the error's status, and one it finds
+    /// after comes as an event of the stream (`parse`), which ends the reply (`guarded_stream` in
+    /// server/server.py). It starts the response as its engine starts the request, or with a
+    /// keepalive once the request has waited 2 s for the engine, as while a model that slept
+    /// loads again. So the response's start is the first word no refusal can follow, and it
+    /// comes within about 2 s of the server reading the request.
+    static func reply(to messages: [ChatMessage], with server: ChatTarget, files: URL) async throws -> AsyncThrowingStream<Delta, Error> {
+        let json = try body(messages, effort: server.effort, vision: server.acceptsImages, files: files)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request("v1/chat/completions", json, to: server, timeout: 3600))
+        if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
+            var data = Data()
+            for try await byte in bytes { data.append(byte) }
+            throw Failure(errorDescription: message(of: data, for: messages, server: server)
+                ?? HTTPURLResponse.localizedString(forStatusCode: status))
+        }
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let json = try body(messages, effort: server.effort, images: server.acceptsImages)
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request("v1/chat/completions", json, to: server, timeout: 3600))
-                    if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
-                        var data = Data()
-                        for try await byte in bytes { data.append(byte) }
-                        throw Failure(errorDescription: message(of: data, for: messages, server: server)
-                            ?? HTTPURLResponse.localizedString(forStatusCode: status))
-                    }
                     for try await line in bytes.lines {
                         switch try parse(line) {
                         case .delta(let delta): continuation.yield(delta)
@@ -329,28 +638,79 @@ enum ChatClient {
         }
     }
 
-    /// The request for `messages`: the prompt, streamed, with its progress and the usage asked for.
-    static func body(_ messages: [ChatMessage], effort: String, images: Bool) throws -> Data {
-        var body = prompt(messages, effort: effort, images: images)
+    /// A title of a few words for a chat that begins with `question` and `answer`, as the model
+    /// sums them up; nil where its reply holds none, or its few tokens cut it short.
+    static func title(question: String, answer: String, with server: ChatTarget, session: URLSession = .shared) async throws -> String? {
+        let ask = try titleBody(question: question, answer: answer)
+        let (data, response) = try await session.data(for: request("v1/chat/completions", ask, to: server, timeout: 120))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        struct Completion: Decodable {
+            struct Choice: Decodable {
+                struct Message: Decodable { let content: String? }
+                let message: Message
+                let finish_reason: String?
+            }
+            let choices: [Choice]
+        }
+        guard let choice = (try? JSONDecoder().decode(Completion.self, from: data))?.choices.first,
+              choice.finish_reason != "length" else { return nil }
+        return choice.message.content.flatMap(title(in:))
+    }
+
+    /// The request for a title: the start of a chat's first exchange and what to answer, in the
+    /// background, where a request of the user's comes first, without thinking, in a few tokens and
+    /// not streamed.
+    static func titleBody(question: String, answer: String) throws -> Data {
+        let ask = "Give the chat below a title of at most six words, in the chat's language. Reply with the title alone."
+            + "\n\nUser: \(question.prefix(1000))\n\nAssistant: \(answer.prefix(1000))"
+        return try JSONSerialization.data(withJSONObject: [
+            "messages": [["role": "user", "content": ask]], "priority": "background", "reasoning_effort": "none",
+            "thinking_token_budget": 0, "max_tokens": 32, "temperature": 0.2,
+        ] as [String: Any])
+    }
+
+    /// The title in a model's reply: its first line that holds any, without a Title: label, quotes,
+    /// Markdown's marks or a closing stop, in at most 80 characters; nil where none is left.
+    static func title(in reply: String) -> String? {
+        // A heading's marks lead it, emphasis and quotes wrap it; a # within, as C#'s, stays.
+        func tidy(_ text: some StringProtocol) -> String {
+            String(text.drop { $0 == "#" }).trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”‘’「」*`").union(.whitespaces))
+        }
+        var line = tidy(reply.split(whereSeparator: \.isNewline).first { !tidy($0).isEmpty } ?? "")
+        if line.lowercased().hasPrefix("title:") { line = tidy(line.dropFirst(6)) }
+        while let last = line.last, ".。".contains(last) { line = tidy(line.dropLast()) }
+        return line.isEmpty ? nil : String(line.prefix(80))
+    }
+
+    /// The request for `messages`, their attachments in `files`: the prompt, streamed, with its
+    /// progress and the usage asked for.
+    static func body(_ messages: [ChatMessage], effort: String, vision: Bool, files: URL) throws -> Data {
+        var body = prompt(messages, effort: effort, vision: vision, files: files)
         body["stream"] = true
         body["stream_options"] = ["include_usage": true]
         body["return_progress"] = true
         return try JSONSerialization.data(withJSONObject: body)
     }
 
-    /// The prompt of `messages`: images as data URLs, or a note in their place for a model that
-    /// cannot see them; earlier answers with what the model thought, empty ones left out; and the
-    /// reasoning effort unless it is the model's default.
-    private static func prompt(_ messages: [ChatMessage], effort: String, images: Bool) -> [String: Any] {
+    /// The prompt of `messages`: their attachments, read from `files`, as data URLs, or a note in
+    /// their place for a model without `vision`; earlier answers with what the model thought, empty
+    /// ones left out; and the reasoning effort unless it is the model's default.
+    private static func prompt(_ messages: [ChatMessage], effort: String, vision: Bool, files: URL) -> [String: Any] {
         let wire: [[String: Any]] = messages.compactMap { message in
+            let attachments = message.attachments ?? []
             switch message.role {
-            case .user where !message.images.isEmpty && images:
-                let parts: [[String: Any]] = message.images.map { image in
-                    ["type": "image_url", "image_url": ["url": "data:\(mediaType(image));base64,\(image.base64EncodedString())"]]
+            case .user where !attachments.isEmpty && vision:
+                let parts: [[String: Any]] = attachments.compactMap { attachment in
+                    guard let data = try? Data(contentsOf: files.appending(path: attachment.file)) else { return nil }
+                    let url = "data:\(attachment.type);base64,\(data.base64EncodedString())"
+                    return switch attachment.kind {
+                    case .image: ["type": "image_url", "image_url": ["url": url]]
+                    case .pdf: ["type": "file", "file": ["filename": attachment.name ?? "document.pdf", "file_data": url]]
+                    }
                 }
                 return ["role": "user", "content": parts + [["type": "text", "text": message.text]]]
-            case .user where !message.images.isEmpty:
-                let note = message.images.count == 1 ? "[An image this model can’t see]" : "[\(message.images.count) images this model can’t see]"
+            case .user where !attachments.isEmpty:
+                let note = unseen(attachments)
                 return ["role": "user", "content": message.text.isEmpty ? note : "\(note)\n\n\(message.text)"]
             case .user:
                 return ["role": "user", "content": message.text]
@@ -413,6 +773,14 @@ enum ChatClient {
         // A new chat leaves the earlier messages behind; a first message has none to leave.
         return messages.count == 1 ? "This message is longer than \(context)."
             : "This chat is longer than \(context). Start a new chat to continue."
+    }
+
+    /// What a model that sees no attachments is told in their place.
+    private static func unseen(_ attachments: [Attachment]) -> String {
+        let images = attachments.count { $0.kind == .image }, pdfs = attachments.count { $0.kind == .pdf }
+        let notes = [images == 1 ? "[An image this model can’t see]" : images > 1 ? "[\(images) images this model can’t see]" : nil,
+                     pdfs == 1 ? "[A PDF this model can’t read]" : pdfs > 1 ? "[\(pdfs) PDFs this model can’t read]" : nil]
+        return notes.compactMap { $0 }.joined(separator: " ")
     }
 
     /// The type of an image the app keeps, PNG or JPEG.

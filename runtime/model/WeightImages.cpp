@@ -17,44 +17,82 @@
 namespace splash::model {
 
 WeightFile WeightImages::load(ImagePlan image) {
-  if (released_) throw std::logic_error("weights load while their memory is released");
-  metal::MetalBuffer buffer = backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
-  image.write(contentsOf(buffer), buffer);
+  // A restore's writer holds its image in place (restore()).
+  if (released_ && restored_) throw std::logic_error("weights load while a restore is under way");
+  metal::MetalBuffer buffer =
+      released_ ? backend_->reserveBuffer(image.bytes, metal::BufferStorage::Shared, image.component)
+                : backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
+  if (!released_) image.write(contentsOf(buffer), buffer);
   WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type,
-                  image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(), contentIdentity_);
+                  image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(), contentIdentity_,
+                  std::move(image.planned));
   images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write)});
   return file;
 }
 
+WeightImages::~WeightImages() { static_cast<void>(endWrite()); }
+
+std::exception_ptr WeightImages::endWrite() {
+  if (!writing_) return nullptr;
+  writing_->thread.join();
+  const std::exception_ptr failure = writing_->failure;
+  writing_.reset();
+  return failure;
+}
+
 void WeightImages::release() {
-  // During a restore, only the images it wrote back hold memory.
+  // The next restore writes the image again, so its write's failure, if
+  // any, no longer matters.
+  static_cast<void>(endWrite());
+  // During a restore, only the images it took back hold memory.
   const size_t held = released_ ? restored_ : images_.size();
   for (size_t index = 0; index < held; ++index) backend_->releaseMemory(images_[index].buffer);
   released_ = true;
   restored_ = 0;
 }
 
+bool WeightImages::writing() const noexcept {
+  return writing_ && !writing_->ended.load(std::memory_order_acquire);
+}
+
 bool WeightImages::restore(const metal::AllocationAdmission &admit) {
   if (!released_) throw std::logic_error("weights are not released");
+  if (writing()) throw std::logic_error("weights restored while an image is being written");
+  if (const std::exception_ptr failure = endWrite()) {
+    try {
+      std::rethrow_exception(failure);
+    } catch (const metal::MetalAllocationError &) {
+      // A writer refused memory of its own leaves the image released too.
+      backend_->releaseMemory(images_[--restored_].buffer);
+      throw;
+    }
+  }
   if (restored_ < images_.size()) {
     Image &image = images_[restored_];
-    const metal::AllocationResult admitted = admit(image.buffer.sizeBytes(), [&] {
-      backend_->restoreMemory(image.buffer);
-      try {
-        image.write(contentsOf(image.buffer), image.buffer);
-      } catch (const metal::MetalAllocationError &) {
-        // A writer refused memory of its own leaves the image released too.
-        backend_->releaseMemory(image.buffer);
-        throw;
-      }
-    });
+    const metal::AllocationResult admitted =
+        admit(image.buffer.sizeBytes(), [&] { backend_->restoreMemory(image.buffer); });
     if (!admitted)
       throw metal::MetalAllocationError("unable to restore " + image.component + ": " +
                                             metal::allocationFailureName(admitted.failure),
                                         admitted.failure);
     ++restored_;
+    // The image stays in place: load(), the only call that adds one, refuses
+    // a restore under way.
+    auto writing = std::make_unique<Writing>();
+    writing->thread = std::thread([&image, &state = *writing, written = written_] {
+      try {
+        image.write(contentsOf(image.buffer), image.buffer);
+      } catch (...) {
+        state.failure = std::current_exception();
+      }
+      // Ended before the loop wakes, so that the restore() it wakes for finds
+      // the write over.
+      state.ended.store(true, std::memory_order_release);
+      if (written) written();
+    });
+    writing_ = std::move(writing);
   }
-  released_ = restored_ < images_.size();
+  released_ = restored_ < images_.size() || writing_ != nullptr;
   return !released_;
 }
 

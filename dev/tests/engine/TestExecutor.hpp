@@ -184,7 +184,7 @@ public:
     if (state_->emitted)
       return {};
     state_->emitted = true;
-    return {{state_->requestId, {10, 11, 12, 13, 14, 15, 16, 17}}};
+    return {{state_->requestId, {10, 11, 12, 13, 14, 15, 16, 17}, {kNoMaskParent, 0, 1, 2, 3, 4, 5, 6}}};
   }
   bool ownsMaskWait(uint64_t id) const noexcept override {
     return state_->emitted && id == state_->requestId;
@@ -272,6 +272,7 @@ public:
     entry.resident = false;
     entry.position = 0;
     ++suspensions;
+    suspendedIds.push_back(id);
     if (laneReleased)
       laneReleased();
     if (kvGrowthBlocked && unblockGrowthOnSuspend)
@@ -411,8 +412,9 @@ public:
     std::vector<ModelStepResult> result;
     for (const auto &item : items) {
       requireRows(item, item.logicalPosition);
-      // The production runtime stores eight verify rows from the lane's
-      // position; the engine must have covered them with page-table entries.
+      // The production runtime stores a decode lane's rows, up to its verify
+      // block's most, from the lane's position; the engine must have covered
+      // them with page-table entries.
       if (uint64_t{item.pageTable.size()} * engine::KvCache::pageTokens <
           item.logicalPosition + model::ExecutionLimits::targetVerifyRows) {
         throw std::invalid_argument("page_table_too_short");
@@ -441,12 +443,21 @@ public:
         ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
                              DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
-        if (item.generationStateCapture) {
-          const auto &capture = *item.generationStateCapture;
-          auto *reservation = dynamic_cast<Reservation *>(capture.reservation.get());
-          if (!reservation || generationStateBoundary(item.requestId, item.logicalPosition) != capture.tokens)
-            throw std::logic_error("invalid generated checkpoint reservation");
-          step.generationCheckpoint = GenerationCheckpoint{capture.tokens, seal(*reservation)};
+        // A cycle seals the state it captures once the tokens it stores, all
+        // it emits but a terminal anchor, reach its boundary.
+        const uint64_t stored = item.logicalPosition + tokens.size() - decodeTokensWithoutKv;
+        if (item.stateCaptures.size() > 1)
+          throw std::logic_error("a decode cycle captures one state at most");
+        for (const StateCapture &capture : item.stateCaptures) {
+          if (!decodeStateCaptures || !capture.reservation || capture.tokens % engine::KvCache::pageTokens ||
+              capture.tokens <= item.logicalPosition ||
+              capture.tokens > item.logicalPosition + std::min(model::ExecutionLimits::targetVerifyRows,
+                                                               limit - state.generated))
+            throw std::logic_error("a decode capture lies past the rows its cycle may retain");
+          if (capture.tokens > stored)
+            continue;
+          captures.push_back({item.requestId, capture.tokens, stored});
+          step.capturedStates.push_back(seal(static_cast<Reservation &>(*capture.reservation)));
         }
         if (speculative != speculativeCounts.end()) {
           step.draftedTokens = speculative->second.first;
@@ -566,6 +577,7 @@ public:
             .indexPageLanes = 1,
             .streamsWeights = streamedExperts};
   }
+  bool capturesInDecode() const noexcept override { return decodeStateCaptures; }
   // With timing, the profile's work (TimedWork); otherwise the default.
   model::CommandWork prefillWork(std::span<const model::PrefillLane> lanes, uint32_t first,
                                  uint32_t passesLeft) const override {
@@ -606,11 +618,6 @@ public:
     commandEnd_.reset();
     if (const std::function<void()> completion = std::exchange(timedCompletion_, {}))
       completion();
-  }
-  std::optional<uint32_t> generationStateBoundary(uint64_t id, uint64_t logicalPosition) const override {
-    if (captureGenerationState && requests.at(id).generated >= 64 && logicalPosition % 32 == 0)
-      return static_cast<uint32_t>(logicalPosition);
-    return std::nullopt;
   }
   // A state's buffers for a resident lane's page boundary, or nullptr with the
   // cause: refused for the next `deniedReservations` calls, at
@@ -664,13 +671,8 @@ public:
   std::optional<uint32_t> statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : std::optional<uint32_t>{0};
   }
-  // What a lane's start (takeLaneState) and the state it captures
-  // (takeStateBuffers) allocate. Nothing without `memory`.
-  uint64_t startStateBytes() const noexcept override {
-    if (!memory)
-      return 0;
-    return laneTake().allocated + (stateReused() ? 0 : State().bytes());
-  }
+  // What a lane's start allocates (takeLaneState). Nothing without `memory`.
+  uint64_t startStateBytes() const noexcept override { return memory ? laneTake().allocated : 0; }
   // The production model's pool releases the buffers beyond a lane's with
   // keepLane, else all of them (QwenStateStorage::idleBytes); the fake's are
   // those of the states the cache let go of and of `evictedStates` more (none
@@ -683,8 +685,7 @@ public:
     const LaneTake lane = afterStart ? laneTake() : LaneTake{};
     const uint64_t pooled = pooledLaneBytes - lane.pooled;
     const uint64_t each = keptTier ? 0 : State().bytes();
-    const uint64_t returned = *evictedStateBytes - (afterStart && stateReused() ? State().bytes() : 0) +
-                              uint64_t{evictedStates} * each;
+    const uint64_t returned = *evictedStateBytes + uint64_t{evictedStates} * each;
     if (!keepLane)
       return reclaimableIdleStateBytes - lane.idle + pooled + returned;
     const uint64_t refill = std::min(returned, laneFootprintBytes - std::min(laneFootprintBytes, pooled));
@@ -729,8 +730,8 @@ public:
       *kvGrowthBlocked = false;
     return released;
   }
-  std::optional<std::string> provideMask(uint64_t id,
-                                         std::span<const uint32_t> words) override {
+  std::optional<std::string> provideMask(uint64_t id, std::span<const uint32_t> words,
+                                         std::span<const uint32_t>) override {
     Request &entry = requests.at(id);
     const bool verify = overlap && overlap->emitted && overlap->requestId == id &&
                         !overlap->provided && !overlap->abandoned;
@@ -835,10 +836,10 @@ public:
   uint32_t restored = 0;
   // State reservations granted, and asked for.
   uint32_t reservations = 0;
-  bool captureGenerationState = false;
   uint32_t reservationAttempts = 0;
-  // Each state a prefill step captured: its request, its boundary and the
-  // step's end, past the boundary for one inside the step.
+  // Each state a step captured: its request, its boundary and the step's
+  // end, past the boundary for one inside the step (a decode cycle's: the
+  // tokens it stores).
   struct Capture {
     uint64_t requestId = 0;
     uint32_t tokens = 0;
@@ -855,6 +856,9 @@ public:
   // With it, captured states are OffloadStates, written as the cache lets
   // them leave RAM, their copies landing when it says so.
   std::shared_ptr<OffloadControl> offloadTier;
+  // Its decode cycles capture states (Model::capturesInDecode), as every
+  // target but one with auxiliary state bytes does.
+  bool decodeStateCaptures = true;
   uint32_t deniedReservations = 0;
   std::optional<uint32_t> denyReservationAt;
   uint32_t beginAttempts = 0;
@@ -865,6 +869,8 @@ public:
   // Begins the budget refuses, and resumes the host refuses.
   uint32_t deniedBegins = 0;
   uint32_t suspensions = 0;
+  // The request of each suspension, in order.
+  std::vector<uint64_t> suspendedIds;
   uint32_t resumptions = 0;
   uint32_t resumeAttempts = 0;
   // Requests the engine ended (end()).
@@ -1108,7 +1114,7 @@ private:
       times = timing->times(lanes, plan.layer, plan.passes - plan.pass);
     } else {
       const auto width = static_cast<uint32_t>(items.size());
-      const uint32_t rows = width * model::ExecutionLimits::targetVerifyRows;
+      const uint32_t rows = width * model::ExecutionLimits::draftQueryRows;
       const auto spilling = static_cast<uint32_t>(std::ranges::count_if(
           items, [](const ModelBatchItem &item) { return item.pageSources && item.pageSources->indexPages(); }));
       times = decodeTimes(profile, width, rows, share, spilling);

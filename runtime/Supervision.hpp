@@ -12,7 +12,8 @@
 // Stopping, from the outside in:
 // 1. The engine, on SIGTERM or the end of its input, stops taking work,
 //    gives the newest restore points of a persistent cache up to kFlush to
-//    reach the disk, and exits.
+//    reach the disk and the copies no state needs up to kDrain to go, and
+//    exits.
 // 2. The server stops its engine with SIGTERM, sends SIGKILL to one still
 //    running after kStop, then waits up to kStop more for it to exit.
 // 3. The server, on SIGTERM or a first SIGINT, stops as in 2; later SIGTERMs
@@ -29,12 +30,14 @@ using std::chrono::milliseconds;
 
 // Metal fails an event wait still unmet this long after its queue reached it
 // ("Caused GPU Timeout Error"), and the command with it: the work between two
-// waits of a command, with the host step's or the Neural Engine's part, must
-// end within it (metal::EventStep). Metal's limit, not ours.
+// waits of a command, with the Neural Engine's part, must end within it
+// (metal::EventStep). No wait spans a host step, which may take longer (an
+// expert load from a slow disk). Metal's limit, not ours.
 inline constexpr milliseconds kGpuWaitLimit{5'000};
 // A command that makes no progress this long fails the engine
-// (metal::CommandWatchdog): a GPU hang or a lost completion, since Metal fails
-// a slow host step or Neural Engine wait first.
+// (metal::CommandWatchdog): a GPU hang, a lost completion, or a host step
+// that does not return (a disk that stopped answering), since Metal fails a
+// slow Neural Engine wait first.
 inline constexpr milliseconds kCommandTimeout{120'000};
 // The longest one iteration of the native loop takes (FdTransport::run): its
 // input, a control pass and a tick. A frame waits at most this long before
@@ -46,6 +49,14 @@ inline constexpr milliseconds kMaskWait{5'000};
 // What a clean stop gives the newest restore points of a persistent cache to
 // reach the disk (main.mm).
 inline constexpr milliseconds kFlush{6'000};
+// What a clean stop then gives a persistent cache's KV copies no state needs
+// to go: none goes, and no punch of one starts, past it, so the stop waits
+// past it for one punch and the files' syncs at most (RuntimeResources::
+// closePersistentCache); the next start frees those left, as after a crash.
+// A copy's punch and its record's clear took 0.10-0.16 ms on an M5 Max's
+// SSD, so 2 s gives up some 12,000, past the 8,192 blocks of a 262,144-token
+// chain; the 48 GB M5 Pro's long tests left 1, 37 and 628.
+inline constexpr milliseconds kDrain{2'000};
 // From a stop signal to the engine's exit, its flush included; the server
 // kills an engine still running after it.
 inline constexpr milliseconds kStop{15'000};
@@ -60,7 +71,7 @@ inline constexpr milliseconds kProbation{60'000};
 inline constexpr milliseconds kStartRetryWindow{30'000};
 
 static_assert(kGpuWaitLimit < kCommandTimeout);
-static_assert(kFlush < kStop);
+static_assert(kFlush + kDrain < kStop);
 static_assert(kLoopStall < kProbation);
 static_assert(kStartRetryWindow < kProbation);
 

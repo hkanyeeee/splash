@@ -146,7 +146,7 @@ __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
-    uint sg, uint lane, threadgroup uint *query_stage) {
+    SplashAttentionTree tree, uint sg, uint lane, threadgroup uint *query_stage) {
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint M = Rows * G;
@@ -154,12 +154,12 @@ __attribute__((always_inline)) inline void tile(
   constexpr uint D = HeadDim;
   static_assert(N == 32 && (D == 256 || D == 128),
                 "fragment maps assume Page32 and D of 256 or 128");
-  static_assert(SPLASH_TARGET_VERIFY_ROWS == 8 && SPLASH_PREFILL_ATTENTION_TILE_ROWS == 8 &&
+  static_assert(SPLASH_ATTENTION_TILE_ROWS == 8 &&
                     8 % Rows == 0 && M % 8 == 0,
                 "one simdgroup per eight fused rows of an eight-row tile or one of its parts");
   const uint visible = committed_tokens + active_rows;
   const uint pages = splash_attention_pages(visible);
-  const uint first_page = splash_attention_first_page<Window>(committed_tokens);
+  const uint first_page = splash_attention_first_page<Window>(splash_attention_window_position(tree.rows != nullptr, tree.anchor, committed_tokens));
   const uint per_split = splash_attention_pages_per_split(pages - first_page, splits);
   const uint page_begin = first_page + split * per_split;
   if (page_begin >= pages)
@@ -173,8 +173,12 @@ __attribute__((always_inline)) inline void tile(
       min(visible, committed_tokens + min(row / G, active_rows - 1) + 1),
       min(visible, committed_tokens + min((row + 1) / G, active_rows - 1) + 1));
   // A row's first key with a window: its causal end less Window keys.
-  const uint2 window_start(splash_attention_window_start<Window>(limit.x - 1),
-                           splash_attention_window_start<Window>(limit.y - 1));
+  const auto sees = [&](uint token, uint fused, uint end) {
+    const uint query = min(fused / G, active_rows - 1);
+    const uint position = tree.rows ? tree.anchor + tree.rows[query].depth : end - 1;
+    return token < end && token >= splash_attention_window_start<Window>(position) &&
+           (!tree.rows || token < tree.anchor || ((tree.rows[query].ancestors >> min(token - tree.anchor, 31u)) & 1u));
+  };
 
   // Q^T fragments for all D/4 QK steps, bfloat pairs (row, row + 1), staged
   // in this lane's own threadgroup words (step-major, so lanes never share a
@@ -251,8 +255,8 @@ __attribute__((always_inline)) inline void tile(
       if constexpr (Quantized)
         score *= key_scale[s];
       score *= kScoreScale;
-      scores[s] = float2(token < limit.x && token >= window_start.x ? score.x : -INFINITY,
-                         token < limit.y && token >= window_start.y ? score.y : -INFINITY);
+      scores[s] = float2(sees(token, row, limit.x) ? score.x : -INFINITY,
+                         sees(token, row + 1, limit.y) ? score.y : -INFINITY);
       local_max = max(local_max, scores[s]);
     }
     // Lane bits 1, 2 and 4 select fm: the other 28 tokens of these rows.
@@ -266,9 +270,9 @@ __attribute__((always_inline)) inline void tile(
     for (uint s = 0; s < 4; ++s) {
       const uint token = token_start + page_token(fm, s);
       probability[s] =
-          float2(token < limit.x && token >= window_start.x
+          float2(sees(token, row, limit.x)
                      ? fast::exp(scores[s].x - next_max.x) : 0.0f,
-                 token < limit.y && token >= window_start.y
+                 sees(token, row + 1, limit.y)
                      ? fast::exp(scores[s].y - next_max.y) : 0.0f);
       local_sum += probability[s];
     }
@@ -293,9 +297,9 @@ __attribute__((always_inline)) inline void tile(
     for (uint s = 0; s < 4; ++s) {
       const uint token = token_start + page_token(fm, s);
       weights[s] = float2(
-          token < limit.x && token >= window_start.x
+          sees(token, row, limit.x)
               ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
-          token < limit.y && token >= window_start.y
+          sees(token, row + 1, limit.y)
               ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
     }
 

@@ -37,15 +37,17 @@ ModelMemoryProfile model() {
   return test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
 }
 
-// The pages the budget holds for one request's KV beside one lane's state.
+// The pages the budget holds for one request's KV beside one lane's state,
+// each with its tokens' lookup index on the host.
 uint64_t budgetPages(const EngineMemoryBreakdown &budget) {
-  return (budget.dynamicBudgetBytes - budget.laneStateBytes) / budget.kvPageBytes;
+  return (budget.dynamicBudgetBytes - budget.laneStateBytes) /
+         (budget.kvPageBytes + 32 * model::kLookupIndexTokenBytes);
 }
 
 void testUnifiedElasticBudget() {
   EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
   const auto &budget = plan.breakdown();
-  require(budget.kvPageTokens == 32 && budget.maximumBatchWidth == 4 &&
+  require(budget.kvPageTokens == 32 && budget.maximumBatchWidth == model::ExecutionLimits::maximumBatchWidth &&
               budget.kvExtentPages == 128,
           "execution geometry did not reach memory planning");
   require(budget.fixedRuntimeBytes == model().fixedRuntimeBytes(),
@@ -54,7 +56,7 @@ void testUnifiedElasticBudget() {
               budget.hardBudgetBytes - budget.fixedRuntimeBytes,
           "state and KV do not share one dynamic budget");
   require(budget.minimumDynamicBytes ==
-                  budget.laneStateBytes + budget.kvExtentBytes &&
+                  budget.laneStateBytes + budget.kvExtentBytes + 128 * 32 * model::kLookupIndexTokenBytes &&
               budget.minimumRequiredBytes ==
                   budget.fixedRuntimeBytes + budget.minimumDynamicBytes,
           "minimum B1 plus the KV runway is incorrect");
@@ -146,7 +148,7 @@ void testStateFormatStatus() {
 }
 
 // The minimum holds the KV runway, the whole smallest extents that hold the
-// pages startup warmup runs on: two of the 27B's 32-page BF16 extents.
+// pages startup warmup runs on at the compiled prefill width.
 void testMinimumHoldsTheWarmupRunway() {
   auto profile = model();
   profile.targetKvLayout.format = kv::Format::BFloat16;
@@ -155,7 +157,8 @@ void testMinimumHoldsTheWarmupRunway() {
   const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
   const auto &budget = plan.breakdown();
   require(budget.minimumDynamicBytes ==
-              budget.laneStateBytes + 64 * budget.kvPageBytes,
+              budget.laneStateBytes + kvRunwayPages(profile.targetKvLayout.minimumExtentPages()) *
+                                          (budget.kvPageBytes + kv::kPageTokens * model::kLookupIndexTokenBytes),
           "the minimum does not hold the warmup runway");
   const auto refused =
       evaluateEngineMemoryPlan(device(), profile, budget.minimumRequiredBytes - 1);
@@ -356,6 +359,7 @@ void testWindowedKvCostsSlimPages() {
     return layers;
   }();
   ModelMemoryProfile flint = model();
+  flint.commandPages = 64;  // This fixture prices a 2048-token command.
   flint.targetKvLayout = {49, 4, 128, kv::Format::Int8, 0, false, 512, windowedLayers};
   ModelMemoryProfile unwindowed = flint;
   unwindowed.targetKvLayout.windowTokens = 0;
@@ -368,9 +372,11 @@ void testWindowedKvCostsSlimPages() {
   const auto extents = [&](uint64_t pages) { return (pages + extent - 1) / extent; };
   const uint64_t taken =
       extents(81) * extent * fullBytes + extents(budget.kvCapacityPages - 81) * extent * slimBytes;
+  // With each page's tokens' lookup index on the host.
+  const uint64_t index = 32 * model::kLookupIndexTokenBytes, held = taken + budget.kvCapacityPages * index;
   require(budget.kvPageBytes == fullBytes && budget.kvSlimPageBytes == slimBytes && budget.kvWindowFloorPages == 81 &&
               budget.kvExtentPages == extent && (budget.kvCapacityPages - 81) % extent == 0 &&
-              taken <= available && available - taken < extent * slimBytes && budget.kvCapacityBytes == taken &&
+              held <= available && available - held < extent * (slimBytes + index) && budget.kvCapacityBytes == taken &&
               budget.kvCapacityPages > 3 * full.kvCapacityPages,
           "a windowed layout's KV capacity is not its lane's Full pages and the Slim extents beside them");
   require(full.kvSlimPageBytes == 0 && full.kvWindowFloorPages == 0 &&
@@ -397,7 +403,7 @@ void testExtentSizeFollowsThePool() {
     return evaluateEngineMemoryPlan(
         device(), compact,
         reference.fixedRuntimeBytes + reference.laneStateBytes +
-            pages * reference.kvPageBytes);
+            pages * (reference.kvPageBytes + 32 * model::kLookupIndexTokenBytes));
   };
   for (const auto [pages, extent] :
        std::array<std::array<uint64_t, 2>, 4>{{{10'240, 512}, {10'496, 256},
@@ -411,7 +417,7 @@ void testExtentSizeFollowsThePool() {
   const auto tooSmall = planFor(255);
   require(!tooSmall.plan && tooSmall.status.code == BudgetErrorCode::KvPoolDoesNotFit &&
               tooSmall.status.breakdown.minimumDynamicBytes ==
-                  reference.laneStateBytes + 256 * 332'800,
+                  reference.laneStateBytes + 256 * (332'800 + 32 * model::kLookupIndexTokenBytes),
           "a budget below the smallest extent was accepted");
 }
 
@@ -553,17 +559,18 @@ StreamedMemoryPlan requirePlan(const StreamedMemoryInputs &inputs) {
 }
 
 // One definition of the hot block cache: its floor holds requiredSlots(1)
-// slots a layer, (1 + 1) x 8 rows x 512 blocks, in whole extents: four of
-// Flash-Next's 256-page extents of K/V without the index, 390 MiB.
+// slots a layer, a verify block's 16 rows x 512 blocks and a spare of 8
+// rows', in whole extents: six of Flash-Next's 256-page extents of K/V
+// without the index, 585 MiB.
 void testHotBlockCacheIsDefinedOnce() {
   const model::SparseKvShape shape = test::sparseKvShape();
-  require(shape.laneSlots() == 4'096 && shape.requiredSlots(0) == 0 && shape.requiredSlots(1) == 8'192 &&
-              shape.requiredSlots(4) == 20'480,
-          "the hot block cache's floor is not (lanes + 1) x laneSlots");
+  require(shape.laneSlots() == 8'192 && shape.requiredSlots(0) == 0 && shape.requiredSlots(1) == 12'288 &&
+              shape.requiredSlots(4) == 36'864,
+          "the hot block cache's floor is not lanes x laneSlots and 8 rows' spare");
   const KvSpillPlan spill = requirePlan(kFlashNext.inputs(kM5Pro)).spill;
   const kv::Layout layout = test::sparseKvLayout();
-  require(spill.enabled && spill.laneSlots == 4'096 && spill.hotFloorBytes == 4 * 256 * layout.kvBytesPerModelPage() &&
-              spill.hotFloorBytes == 408'944'640 && spill.hotTargetBytes == spill.hotFloorBytes,
+  require(spill.enabled && spill.laneSlots == 8'192 && spill.hotFloorBytes == 6 * 256 * layout.kvBytesPerModelPage() &&
+              spill.hotFloorBytes == 613'416'960 && spill.hotTargetBytes == spill.hotFloorBytes,
           "the hot floor is not requiredSlots(1) in whole extents");
   require(spill.indexRunwayBytes == 256 * layout.indexBytesPerModelPage() && spill.densePages == 64 &&
               spill.windowPages == 64 && spill.groupPages == 256,
@@ -588,13 +595,14 @@ void testFlashNextOnTheThreeMacs() {
     require(spill.enabled && plan.tableBytes == kFlashNextTableShare,
             std::string("Flash-Next's table on the ") + mac.name + " does not stream through its share");
     // The floors, the arenas, the stores and the KV of the first 64K tokens
-    // and their speculative rows (2,049 pages), in the fewest pages whose
+    // and their speculative rows (2,049 pages) with their lookup index, in the fewest pages whose
     // extents hold them as one request's capacity, the runway among them,
     // fill the budget, or leave the KV more where the experts load whole.
     const uint64_t charged = inputs.fixedBytes + inputs.arenaBytes[plan.expertBytes != 0][1] + inputs.laneStateBytes +
                              spill.floorBytes +
                              (plan.expertBytes ? plan.expertBytes : kFlashNext.experts.allBytes) + plan.tableBytes +
-                             budgetPagesHolding(test::sparseKvLayout(), 2'049) * page;
+                             budgetPagesHolding(test::sparseKvLayout(), 2'049) *
+                                 (page + 32 * model::kLookupIndexTokenBytes);
     if (mac.workingSet == kM5Pro.workingSet)
       require(!plan.expertBytes && charged < hardBudget(mac), "the M5 Pro does not load Flash-Next's experts whole");
     else
@@ -602,11 +610,12 @@ void testFlashNextOnTheThreeMacs() {
                   charged == hardBudget(mac),
               std::string("Flash-Next's experts on the ") + mac.name + " do not take what the floors leave");
     const uint32_t disk = static_cast<uint32_t>(
-        std::min<uint64_t>(1'010'000, (mac.activeLimit - 4 * inputs.stateSlotBytes) / inputs.kvSlotBytes * 32));
+        std::min<uint64_t>(1'010'000, (mac.activeLimit - model::ExecutionLimits::maximumBatchWidth * inputs.stateSlotBytes) / inputs.kvSlotBytes * 32));
     require(spill.memoryTokens == 1'010'000 && spill.diskTokens == disk &&
                 spill.floorTokens == std::min<uint32_t>(1'010'000, disk),
             std::string("Flash-Next's context bounds on the ") + mac.name + " are wrong");
-    const uint64_t stagedPages = (pagesOf(spill.floorTokens + 7) + 255) / 256 * 256;
+    const uint64_t stagedPages =
+        (pagesOf(spill.floorTokens + model::ExecutionLimits::speculativeScratchTokens) + 255) / 256 * 256;
     const uint32_t buffers = plan.expertBytes ? 1 : 2;
     require(spill.stagingBuffers == buffers &&
                 spill.stagingBytes == buffers * stagedPages * test::sparseKvLayout().bytesPerLayerPage(),
@@ -617,13 +626,28 @@ void testFlashNextOnTheThreeMacs() {
               requirePlan(kFlashNext.inputs(kStudio)).expertBytes,
           "a larger Mac did not stream more experts");
   // The floors hold the larger of the hot cache's floor and the staging,
-  // both buffers where there are two: beside them the M5 Max's and the M5
-  // Pro's floors of one context are the same.
+  // both buffers where there are two, and the readers' tables: beside them
+  // the M5 Max's and the M5 Pro's floors of one context are the same.
   const KvSpillPlan max = requirePlan(kFlashNext.inputs(kStudio)).spill, pro = requirePlan(kFlashNext.inputs(kM5Pro)).spill;
   require(max.floorTokens == pro.floorTokens && max.stagingBuffers == 1 && pro.stagingBuffers == 2 &&
-              max.floorBytes - std::max(max.stagingBytes, max.hotFloorBytes) ==
-                  pro.floorBytes - std::max(pro.stagingBytes, pro.hotFloorBytes),
-          "the floors did not hold both staging buffers where there are two");
+              max.floorBytes - max.tableBytes - std::max(max.stagingBytes, max.hotFloorBytes) ==
+                  pro.floorBytes - pro.tableBytes - std::max(pro.stagingBytes, pro.hotFloorBytes),
+          "the floors did not hold both staging buffers and their tables where there are two");
+}
+
+// --ple-memory auto streams Flash-Next's table through its share however
+// much the budget holds: a budget of 192 GiB loads every routed expert and
+// would hold the table's 28.8 GB too, which off loads. A table no larger
+// than its share loads whole where the budget holds it
+// (testArenasFollowWhatStreams).
+void testAutoStreamsTheTableWhereMemoryHoldsIt() {
+  StreamedMemoryInputs inputs = kFlashNext.inputs(kM5Pro);
+  inputs.hardBudgetBytes = 192 * kGiB;
+  const StreamedMemoryPlan automatic = requirePlan(inputs);
+  require(!automatic.expertBytes && automatic.tableBytes == kFlashNextTableShare,
+          "auto did not stream Flash-Next's table through its share where a budget of 192 GiB holds it whole");
+  inputs.table.setting = {StreamedSetting::Mode::Off, 0};
+  require(!requirePlan(inputs).tableBytes, "--ple-memory off streamed Flash-Next's table");
 }
 
 // A spill-capable target keeps resident the requested context where that is
@@ -637,17 +661,18 @@ void testSpillAllowanceFollowsASmallerRequestedContext() {
   const StreamedMemoryPlan plan = requirePlan(inputs);
   const uint64_t charged = inputs.fixedBytes + inputs.arenaBytes[plan.expertBytes != 0][1] + inputs.laneStateBytes +
                            plan.spill.floorBytes + plan.expertBytes + plan.tableBytes +
-                           budgetPagesHolding(test::sparseKvLayout(), 513) * page;
+                           budgetPagesHolding(test::sparseKvLayout(), 513) *
+                               (page + 32 * model::kLookupIndexTokenBytes);
   require(plan.spill.enabled && plan.expertBytes && charged == hardBudget(kM6),
           "Flash-Next with a 16K context kept more than 16K tokens resident beside its experts");
 }
 
 // Main's plan for the 35B on the three Macs: every routed expert loads with
-// its layer, and the KV holds main's context, pinned: the M6 229,369 tokens
+// its layer, and the KV holds main's context, pinned: the M6 229,361 tokens
 // beside the whole Q2_K_XL, the others the 256K window of UD-Q4_K_M.
 void testDense35BKeepsMainsPlan() {
   const std::tuple<Mac, Target, uint32_t, uint64_t> pinned[] = {
-      {kM6, k35BQ2, 229'369, 229'376}, {kStudio, k35BQ4, 262'144, 352'256}, {kM5Pro, k35BQ4, 262'144, 2'801'664}};
+      {kM6, k35BQ2, 229'361, 229'376}, {kStudio, k35BQ4, 262'144, 344'064}, {kM5Pro, k35BQ4, 262'144, 2'777'088}};
   for (const auto &[mac, target, context, capacityTokens] : pinned) {
     const StreamedMemoryPlan plan = requirePlan(target.inputs(mac));
     require(!plan.expertBytes && !plan.tableBytes && !plan.spill.enabled,
@@ -661,7 +686,7 @@ void testDense35BKeepsMainsPlan() {
 }
 
 // An explicit context loads every expert of the 35B where main holds it so
-// on the M6, beside the SSD cache's state staging up to main's 229,369
+// on the M6, beside the SSD cache's state staging up to main's 229,361
 // tokens, and without it up to main's context then (the automatic SSD cache
 // gives its staging up for them, RuntimeResources::create); a token more
 // streams them. 225,000 tokens load them beside the staging, and 233,000
@@ -671,7 +696,7 @@ void testDenseExplicitContextKeepsMainsExperts() {
   withoutStaging.footprint.stateStagingBytes = 0;
   const uint32_t beside = test::requireMemoryPlan(deviceOf(kM6), k35BQ2.profile()).maximumContextTokens(),
                  alone = test::requireMemoryPlan(deviceOf(kM6), withoutStaging).maximumContextTokens();
-  require(beside == 229'369 && beside < 233'000 && alone >= 233'000 && alone < 262'144,
+  require(beside == 229'361 && beside < 233'000 && alone >= 233'000 && alone < 262'144,
           "main's contexts of the 35B on the M6 moved");
   StreamedMemoryInputs inputs = k35BQ2.inputs(kM6);
   const auto streams = [&](uint32_t context) {
@@ -742,10 +767,11 @@ void testDense35BContextGrowsWithTheBudget() {
 
 // The arenas are those of the parts that stream: each plan is the one made
 // with the arenas of what it streams, the routed experts' prefill groups and
-// the table's staging. Flash-Next with its experts loaded through a store of
-// 12 GiB from a budget that loads its table whole to one that streams it,
-// with a staging of 512 MiB, and with experts the plan sizes from one that
-// loads them whole to one that streams them.
+// the table's staging. Beside Flash-Next's experts loaded through a store of
+// 12 GiB, a table no larger than its share, 200 MiB, from a budget that
+// streams it to one that loads it whole, with a staging of 512 MiB; and
+// Flash-Next with experts the plan sizes from one that loads them whole to
+// one that streams them.
 void testArenasFollowWhatStreams() {
   const auto same = [](const StreamedMemoryPlan &plan, const StreamedMemoryPlan &other) {
     return plan.expertBytes == other.expertBytes && plan.tableBytes == other.tableBytes &&
@@ -757,10 +783,11 @@ void testArenasFollowWhatStreams() {
   };
   StreamedMemoryInputs inputs = kFlashNext.inputs(kM5Pro);
   inputs.experts.setting = {StreamedSetting::Mode::Loaded, 12 * kGiB};
+  inputs.table.allBytes = 200 * kMiB;
   const uint64_t group = arenaBytes(kFlashNext.group), staged = group + 512 * kMiB;
   inputs.arenaBytes[1] = {group, staged};
   bool whole = false, streams = false;
-  for (inputs.hardBudgetBytes = 40 * kGiB; inputs.hardBudgetBytes < 56 * kGiB; inputs.hardBudgetBytes += kGiB / 4) {
+  for (inputs.hardBudgetBytes = 20 * kGiB; inputs.hardBudgetBytes < 24 * kGiB; inputs.hardBudgetBytes += kGiB / 16) {
     const StreamedMemoryPlan plan = requirePlan(inputs);
     require(same(plan, planned(inputs, plan.tableBytes ? staged : group)),
             "a plan's table was sized beside the arenas of another");
@@ -785,7 +812,9 @@ void testArenasFollowWhatStreams() {
 // smallest store is refused by name. A loaded store is exactly its size.
 // --sparse-kv-memory raises the hot cache's target, and takes from the
 // experts only what it adds to the readers, which hold the larger of it and
-// the history staging (a buffer of 0.98 GiB on the Studio); it is refused
+// the history staging (a buffer of 0.98 GiB on the Studio), and to their
+// tables: the hot cache's, an entry for each page of its target, and that of
+// the second staging buffer a target past two buffers holds; it is refused
 // below its floor and past what the floors leave. An automatic part whose
 // smallest store takes all it would loads whole.
 void testOverridesAndRefusals() {
@@ -846,8 +875,11 @@ void testOverridesAndRefusals() {
   require(within.spill.hotTargetBytes == 900 * kMiB && within.expertBytes == automatic.expertBytes &&
               within.spill.readerBytes() == staging && raised.spill.hotTargetBytes == staging + kGiB &&
               raised.spill.hotFloorBytes == automatic.spill.hotFloorBytes &&
-              automatic.expertBytes - raised.expertBytes == kGiB && raised.spill.readerBytes() == staging + kGiB,
-          "--sparse-kv-memory did not take from the experts exactly what it adds to the readers");
+              raised.spill.tableBytes > automatic.spill.tableBytes &&
+              automatic.expertBytes - raised.expertBytes ==
+                  kGiB + raised.spill.tableBytes - automatic.spill.tableBytes &&
+              raised.spill.readerBytes() == staging + kGiB,
+          "--sparse-kv-memory did not take from the experts exactly what it adds to the readers and their tables");
   // Below its floor, or beyond what the floors leave, it is refused by name
   // as a setting, never as floors the budget cannot hold.
   for (const auto &[bytes, refusal] : {std::pair<uint64_t, std::string>{300 * kMiB, "is less than"},
@@ -894,30 +926,37 @@ void testSpillNeedsATierAndRoom() {
 }
 
 // A plan that spills holds the arenas of a runtime whose K/V spills, which
-// runs prefill groups and holds where its verifies' blocks are: beside
-// streamed experts what they add comes out of the experts' store, and where
-// the floors hold an empty Spill request only beside the arenas of a runtime
-// whose K/V stays in memory, the plan does not spill.
+// runs prefill groups and holds where its verifies' blocks are, those of
+// what the plan streams: beside streamed experts what they add comes out of
+// the experts' store, and where the floors hold an empty Spill request only
+// beside the arenas of a runtime whose K/V stays in memory, the plan does
+// not spill.
 void testSpillHoldsTheArenasOfASpillingRuntime() {
   constexpr uint64_t kExtra = 256 * kMiB;
   StreamedMemoryInputs inputs = kFlashNext.inputs(kStudio);
   const StreamedMemoryPlan resident = requirePlan(inputs);
   const uint64_t group = arenaBytes(kFlashNext.group);
-  inputs.spillArenaBytes = {group + kExtra, group + kExtra};
+  // The arenas of a spilling runtime whose experts stream, which Flash-Next's
+  // plan streams on the Studio, hold more; those of one whose experts load
+  // whole do not count.
+  inputs.spillArenaBytes = {{{group, group}, {group + kExtra, group + kExtra}}};
   const StreamedMemoryPlan spilling = requirePlan(inputs);
   require(resident.spill.enabled && spilling.spill.enabled && resident.expertBytes - spilling.expertBytes == kExtra,
-          "a plan that spills did not hold the arenas of a runtime whose K/V spills");
+          "a plan that spills did not hold the arenas of a runtime whose K/V spills and whose experts stream");
+  inputs.spillArenaBytes = {{{group + kExtra, group + kExtra}, {group, group}}};
+  require(requirePlan(inputs).expertBytes == resident.expertBytes,
+          "a plan whose experts stream held the arenas of a spilling runtime whose experts load whole");
 
   inputs = kFlashNext.inputs(kM6);
   inputs.experts.setting = inputs.table.setting = {StreamedSetting::Mode::Off, 0};
   const uint64_t chunk = arenaBytes(kFlashNext.chunk);
-  inputs.spillArenaBytes = {chunk, chunk};
+  inputs.spillArenaBytes.fill({chunk, chunk});
   const uint64_t base = inputs.fixedBytes + chunk + inputs.laneStateBytes +
-                        256 * test::sparseKvLayout().bytesPerModelPage() + kFlashNext.experts.allBytes +
-                        kFlashNext.table.allBytes;
+                        256 * (test::sparseKvLayout().bytesPerModelPage() + 32 * model::kLookupIndexTokenBytes) +
+                        kFlashNext.experts.allBytes + kFlashNext.table.allBytes;
   for (inputs.hardBudgetBytes = base; !requirePlan(inputs).spill.enabled; inputs.hardBudgetBytes += 16 * kMiB)
     require(inputs.hardBudgetBytes < base + 4 * kGiB, "no budget let the target spill");
-  inputs.spillArenaBytes = {chunk + kExtra, chunk + kExtra};
+  inputs.spillArenaBytes.fill({chunk + kExtra, chunk + kExtra});
   require(!requirePlan(inputs).spill.enabled, "spilling was planned beside arenas its runtime does not run");
   inputs.hardBudgetBytes += kExtra;
   require(requirePlan(inputs).spill.enabled, "the spilling runtime's arenas took more than they add");
@@ -928,11 +967,11 @@ void testSpillHoldsTheArenasOfASpillingRuntime() {
 // keeps its first engine's context.
 void testDiskBoundsTheSpilledContext() {
   StreamedMemoryInputs inputs = kFlashNext.inputs(kStudio);
-  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
+  inputs.activeLimitBytes = model::ExecutionLimits::maximumBatchWidth * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
   const StreamedMemoryPlan plan = requirePlan(inputs);
   require(plan.spill.diskTokens == 32'000 && plan.spill.floorTokens == 32'000,
           "the disk bound is not the room's slots beside every lane's state");
-  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes;
+  inputs.activeLimitBytes = model::ExecutionLimits::maximumBatchWidth * inputs.stateSlotBytes;
   require(requirePlan(inputs).spill.diskTokens == 0, "a full SSD cache bounded nothing");
   // An explicit context is held at its own length.
   inputs = kFlashNext.inputs(kStudio);
@@ -942,23 +981,24 @@ void testDiskBoundsTheSpilledContext() {
   // room the volume has left since; more room serves more.
   inputs = kFlashNext.inputs(kStudio);
   inputs.relaunchContextTokens = 300'000;
-  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
+  inputs.activeLimitBytes = model::ExecutionLimits::maximumBatchWidth * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
   const StreamedMemoryPlan relaunched = requirePlan(inputs);
   require(relaunched.spill.diskTokens == 300'000 && relaunched.spill.floorTokens == 300'000,
           "a relaunch served less than its first engine's context for want of SSD room");
-  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 20'000 * inputs.kvSlotBytes;
+  inputs.activeLimitBytes = model::ExecutionLimits::maximumBatchWidth * inputs.stateSlotBytes + 20'000 * inputs.kvSlotBytes;
   require(requirePlan(inputs).spill.diskTokens == 640'000, "a relaunch did not take the SSD's room past its context");
 }
 
 // A second staging buffer goes where the readers' memory holds it already,
-// and costs the plan nothing then: on a tight M6 with a 128K-token context,
-// whose two buffers the hot cache's floor holds, also where the limit holds
-// the stores at their smallest, and beside a hot cache target that holds
-// them. Otherwise one buffer where a store binds, which keeps the
-// second's room, also where the table's share above its smallest would hold
-// it (the M6 at a 256K-token context), and two where none does, the second
-// taking its room from the KV kept resident beyond the first 64K tokens: on
-// the M5 Pro under --max-memory 44G, which loads the experts whole.
+// and costs the plan only its page table then: on a tight M6 with a
+// 128K-token context, whose two buffers the hot cache's floor holds, also
+// where the limit holds the stores at their smallest, and beside a hot cache
+// target that holds them. Otherwise one buffer where a store binds, which
+// keeps the second's room, also where the table's share above its smallest
+// would hold it (the M6 at a 384K-token context, whose two buffers exceed the
+// hot block cache's floor), and two where none does, the second taking its
+// room from the KV kept resident beyond the first 64K tokens: on the M5 Pro
+// under --max-memory 44G, which loads the experts whole.
 void testSecondStagingBufferOnlyWhereFree() {
   StreamedMemoryInputs inputs = kFlashNext.inputs(kM6);
   inputs.hardBudgetBytes = 14 * kGiB;
@@ -980,10 +1020,10 @@ void testSecondStagingBufferOnlyWhereFree() {
               free(context) && free(smallest) && free(target),
           "a second staging buffer the readers' memory holds was not planned");
   StreamedMemoryInputs longer = kFlashNext.inputs(kM6);
-  longer.requestedContextTokens = 262'144;
+  longer.requestedContextTokens = 393'216;
   const KvSpillPlan bound = requirePlan(longer).spill;
   require(bound.stagingBuffers == 1 && bound.readerBytes() == bound.hotTargetBytes,
-          "the M6 at a 256K-token context staged a second buffer in the table's share");
+          "the M6 at a 384K-token context staged a second buffer in the table's share");
   StreamedMemoryInputs capped = kFlashNext.inputs(kM5Pro);
   capped.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(kM5Pro.workingSet, 44 * kGiB);
   const StreamedMemoryPlan whole = requirePlan(capped);
@@ -1091,6 +1131,39 @@ void testEnginePlanServesTheSpilledContext() {
           "a request's KV is not its pages, Full or Index");
 }
 
+// The resident context is the one a lone start takes: one request's KV in
+// whole extents beside its lane's state and what a target that spills holds
+// from its start whatever its requests, the Index runway and the readers'
+// page tables (KvSpillPlan::heldBytes), which runtime-resources finds as the
+// start allocates them. Across the budgets that leave the room past eight
+// extents beside the state anything from nothing to an extent less a byte,
+// Flash-Next keeps its eighth extent exactly where that room holds what it
+// holds: beside the state alone, the plan advertised the extent there too,
+// which no lone start could take, wherever the room was short of the
+// 6,881,280 bytes it holds with two staging buffers.
+void testResidentContextIsWhatALoneStartTakes() {
+  const kv::Layout layout = test::sparseKvLayout();
+  for (const Mac &mac : {kStudio, kM5Pro}) {
+    const StreamedMemoryPlan streamed = requirePlan(kFlashNext.inputs(mac));
+    const KvSpillPlan &spill = streamed.spill;
+    const uint64_t held = spill.heldBytes();
+    const ModelMemoryProfile profile = kFlashNext.profile(streamed.expertBytes, streamed.tableBytes, spill);
+    // An extent's pages with their tokens' lookup index.
+    const uint64_t extent = 256 * (layout.bytesPerModelPage() + 32 * model::kLookupIndexTokenBytes);
+    const uint64_t eight = profile.fixedRuntimeBytes() + kFlashNext.chunk.laneStatePlannedAllocatedBytes + 8 * extent;
+    for (const uint64_t room : {uint64_t{0}, held - 1, held, extent / 2, extent - 1}) {
+      const EngineMemoryBreakdown budget =
+          test::requireMemoryPlan(deviceOf(mac), profile, eight + room).breakdown();
+      const uint64_t extents = room < held ? 7 : 8;
+      require(budget.hardBudgetBytes == eight + room &&
+                  budget.contextBounds.resident == extents * 8'192 - model::ExecutionLimits::speculativeScratchTokens,
+              std::string("Flash-Next on the ") + mac.name + " with " + std::to_string(room) +
+                  " bytes past eight extents beside its state advertised " +
+                  std::to_string(budget.contextBounds.resident) + " resident tokens, not what a lone start takes");
+    }
+  }
+}
+
 // A disk bound below the resident context leaves the resident context, and
 // names what bounds the maximum.
 void testContextBoundNames() {
@@ -1162,8 +1235,17 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
           "an older macOS was not named against the macOS required");
 }
 
-int main() {
+int main(int argc, char **argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--m2") {
+      testUnifiedElasticBudget();
+      testContinuationStateFitsBesideFullKv();
+      testUserCeilingAndFailure();
+      testHardBudgetBoundaries();
+      testDeviceValidationMessageNamesWhatTheMacHas();
+      std::cout << "PASS execution width, continuation, overflow, native hard ceiling and Apple7 floor\n";
+      return 0;
+    }
     testUnifiedElasticBudget();
     testBf16BudgetAndStatus();
     testContinuationStateFitsBesideFullKv();
@@ -1181,6 +1263,7 @@ int main() {
     testExtentSizeFollowsThePool();
     testHotBlockCacheIsDefinedOnce();
     testFlashNextOnTheThreeMacs();
+    testAutoStreamsTheTableWhereMemoryHoldsIt();
     testSpillAllowanceFollowsASmallerRequestedContext();
     testDense35BKeepsMainsPlan();
     testDenseExplicitContextKeepsMainsExperts();
@@ -1195,6 +1278,7 @@ int main() {
     testServedPlanStagesAsTheSizedPlan();
     testPlanSetsTheStoresFloor();
     testEnginePlanServesTheSpilledContext();
+    testResidentContextIsWhatALoneStartTakes();
     testContextBoundNames();
     testDeviceValidationNamesTheMacosFloor();
     testDeviceValidationNamesTheThreadgroupWidth();

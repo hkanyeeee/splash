@@ -1,18 +1,22 @@
-// GPU time of one GGUF projection through ops::Linear on both decode tiles (the Apple9 register tile and the staged
-// tile, on the device policy's walk, one lane on its 8- and 16-row tiles, a gate/up pair in two passes and, where the
-// walks spread, in one: pair) at one to four lanes and every K split, the measurements behind the tile rule and split
-// law of runtime/ops/KernelCalibration.hpp:
+// GPU time of one GGUF projection through ops::Linear on the decode tiles at the row counts their plans step by: the
+// column tile at one and two rows, and at 8 to 64 rows (R8-R64) the Apple9 register tile where it holds them (up to 32)
+// and the staged tile (on the device policy's walk, a plan of 8 rows on its 8- and 16-row tiles, a gate/up pair in two
+// passes and, where the walks spread and the one-pass tile holds the rows, in one: pair), at every K split, the
+// measurements behind the tile rule and split law of runtime/ops/KernelCalibration.hpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
-// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
-// columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
-// decode tiles run the smaller chunks) of a single segment, and for R up to 64 the staged 64-row tile at every K
-// split; gateup is then the up projection's gated epilogue. The
-// weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
-// next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the activation table its
-// producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
-// ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
-// policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per core.
+// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64 columns.
+// With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32), for R up to 64
+// the staged 64-row tile at every K split on the lockstep walk too, and for segments the int8 prefill tile takes
+// (af4g64, af5g64) that tile (prefill int8) and its GEMM alone on the codes the scratch holds (int8 codes, as a
+// SwiGLU's up runs on its gate's); gateup is then the up projection's gated epilogue. The weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each
+// projection with the next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the
+// activation table its producers write alongside their output (LinearBuffers::prepared), prepared once and not timed.
+// The cases run in ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection,
+// the device policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per
+// core.
+// PQ2_0 projections of whole rotation blocks run rotated, as Prism's are stored, their decode cases also on the int8
+// tiles of 16 to 64 rows (int8, int8pair: LinearConfig::decodeInt8), each time including the input's rotation.
 // The float formats float-bf16 and float-f32, and float-<fmt> for the native rows of a quantized format (an MLX
 // checkpoint's quantized router), time the float projection (ops::addGgufFloat: the router's, the QSA indexer's, F32
 // alpha/beta) instead, one tensor per width of any multiple of 8 columns, two in one dispatch as the
@@ -22,6 +26,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
+#include "ops/KernelSelection.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -66,12 +71,14 @@ MetalBuffer upload(MetalBackend &backend, const std::vector<uint8_t> &bytes) {
   return buffer;
 }
 
-// One plan, printed on its line (L<lanes> or R<rows>) under its label.
+// One plan, printed on its line (L<lanes> or R<rows>) under its label; an int8 prefill plan on the codes the scratch
+// already holds when `codes` (LinearInput::PrefillInt8, as a SwiGLU's up runs after its gate).
 struct Case {
   std::string line, label;
   LinearPlan plan;
   bool chosen;
   std::vector<double> ms;
+  bool codes = false;
 };
 
 // One float projection's tile at `rows` rows, printed as a Case.
@@ -161,7 +168,7 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
       segments.push_back(QuantizedSegment::rows(type, sizes[i], K, upload(backend, tensors[i])));
       segments.back().columnOffset = offset;
     }
-  const Linear linear(backend.capabilities());
+  const Linear linear(backend.capabilities(), Int8Activations::On);
   std::vector<FloatCase> cases;
   std::vector<uint32_t> lines = prefillRows;
   if (lines.empty())
@@ -220,12 +227,12 @@ int main(int argc, char **argv) {
                                   : prefill                    ? LinearEpilogue::UpWithGate
                                                                : LinearEpilogue::GateUp;
     if (formats.size() != widths.size() || formats.size() > 3 ||
-        (formats.size() > 1 && (epilogue != LinearEpilogue::None || prefill)) ||
+        (formats.size() > 1 && epilogue != LinearEpilogue::None) ||
         (epilogue == LinearEpilogue::None && epilogueName != "none") || !rounds ||
         (prefill && (prefillRows.empty() ||
                      std::any_of(prefillRows.begin(), prefillRows.end(), [](uint32_t r) { return r <= 32; })))) {
-      std::cerr << "one format per width, at most three, fused projections take no epilogue; prefill takes one "
-                   "format and chunks of more than 32 rows\n";
+      std::cerr << "one format per width, at most three, fused projections take no epilogue; prefill takes chunks "
+                   "of more than 32 rows\n";
       return 2;
     }
     try {
@@ -252,6 +259,15 @@ int main(int argc, char **argv) {
           bytes += plane->size();
       }
       const uint32_t copies = ringCopies(bytes);
+      // Rotated PQ2_0 projections (InputRotation), random signs.
+      const bool rotated = K % GGUF_ROTATION_BLOCK == 0 &&
+                           std::all_of(images.begin(), images.end(), [](const Image &i) { return i.format == PQ20; });
+      MetalBuffer signs;
+      if (rotated) {
+        signs = backend.allocateBuffer(K, metal::BufferStorage::Shared, "rotation signs");
+        auto *d = static_cast<int8_t *>(signs.contents());
+        for (uint32_t k = 0; k < K; ++k) d[k] = rng() & 1 ? 1 : -1;
+      }
       std::vector<Projection> ring;
       for (uint32_t c = 0; c < copies; ++c) {
         BlockWeights weights;
@@ -264,17 +280,27 @@ int main(int argc, char **argv) {
           weights.segments.back().columnOffset = image.offset;
         }
         ring.emplace_back(N, K, std::move(weights));
+        ring.back().rotation.signs = signs;
       }
-      const Linear linear(backend.capabilities());
+      const Linear linear(backend.capabilities(), Int8Activations::On);
       std::vector<Case> cases;
       for (const uint32_t rows : prefillRows) {
-        const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue};
+        const LinearWorkload w{{N, K}, rows, epilogue};
         const LinearConfig policy = linear.plan(w, ring.front()).configuration();
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == policy, {}});
-        // Chunks of up to kMaximumStagedPrefillRows rows also on the staged 64-row tile, at every split.
-        for (uint32_t splits = 1; rows <= kMaximumStagedPrefillRows && splits <= LinearConfig::kMaximumSplits;
+        if (std::all_of(images.begin(), images.end(),
+                        [](const Image &i) { return quant_prefill_int8_format(i.format); })) {
+          const LinearConfig int8{.tile = LinearTile::GgufPrefillInt8};
+          cases.push_back({"R" + std::to_string(rows), "prefill int8", Linear::plan(w, int8, FloatOutput::BFloat16),
+                           int8 == policy, {}});
+          cases.push_back({"R" + std::to_string(rows), "int8 codes", Linear::plan(w, int8, FloatOutput::BFloat16),
+                           false, {}, true});
+        }
+        // Chunks of up to kMaximumDecodeTileRows rows also on the staged 64-row tile on the lockstep walk, at every
+        // split.
+        for (uint32_t splits = 1; rows <= kMaximumDecodeTileRows && splits <= LinearConfig::kMaximumSplits;
              splits *= 2) {
           if ((K / 32) % splits) continue;
           const LinearConfig staged{.tile = LinearTile::GgufStaged, .splits = splits};
@@ -282,37 +308,59 @@ int main(int argc, char **argv) {
                            Linear::plan(w, staged, FloatOutput::BFloat16), staged == policy, {}});
         }
       }
-      for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
-        const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};
-        const LinearConfig policy =
-            linear.plan(w, ring.front(), epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr).configuration();
-        // The staged tile walks K and runs gate/up as the policy's staged plans do (where the device registers a
-        // step, those it runs on more lanes).
+      // The decode tiles at the row counts their plans step by.
+      const Projection *pairGate = epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr;
+      for (const uint32_t rows : prefill ? std::vector<uint32_t>{} : std::vector<uint32_t>{1, 2, 8, 16, 24, 32, 40, 48,
+                                                                                            56, 64}) {
+        const LinearWorkload w{{N, K}, rows, epilogue};
+        const std::string line = "R" + std::to_string(rows);
+        const LinearConfig policy = linear.plan(w, ring.front(), pairGate).configuration();
+        if (rows <= GGUF_COLUMN_ROWS) {
+          const LinearConfig column{.tile = LinearTile::GgufColumn, .oneGateUpPass = pairGate != nullptr};
+          cases.push_back({line, "column", Linear::plan(w, column, FloatOutput::BFloat16), column == policy, {}});
+          continue;
+        }
+        // The staged tile walks K as the policy's staged plans do (where the device registers a plan, those it
+        // runs on more rows).
         const LinearConfig wide =
-            linear.plan({{N, K}, kMaximumDecodeTileRows, LinearPhase::Decode, epilogue}, ring.front(),
-                        epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr).configuration();
+            linear.plan({{N, K}, kMaximumDecodeTileRows, epilogue}, ring.front(), pairGate).configuration();
         for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             const bool registerTile = tile == LinearTile::GgufRegister;
-            // The register tile takes the weights of quant_register_tensor only, a coefficient unit of each format
-            // per split (quant_register_unit); the staged tile whole 32-input groups.
-            if (registerTile && !std::all_of(images.begin(), images.end(), [&](const Image &i) {
-                  return quant_register_tensor(i.format, K) && K / quant_register_unit(i.format) >= splits;
-                }))
+            // The register tile holds up to four table tiles and takes the weights of quant_register_tensor only, a
+            // coefficient unit of each format per split (quant_register_unit); the staged tile whole 32-input groups.
+            if (registerTile && (rows > kMaximumRegisterRows || !std::all_of(images.begin(), images.end(),
+                                                                             [&](const Image &i) {
+                                                                               return quant_register_tensor(i.format, K) &&
+                                                                                      K / quant_register_unit(i.format) >=
+                                                                                          splits;
+                                                                             })))
               continue;
             if (!registerTile && (K / 32) % splits) continue;
-            // One lane stages on the 8-row tile and on the 16-row tile (staged16); a gate/up pair on the staged tile
-            // runs as two passes and, where the walks spread, also in one pass (pair).
+            // A plan of 8 rows stages on the 8-row tile and on the 16-row tile (staged16); a gate/up pair on the
+            // staged tile runs as two passes and, where the walks spread and the one-pass tile holds the rows, also in
+            // one pass (pair).
             for (const bool onePass : {false, true}) {
-              if (onePass && (registerTile || epilogue != LinearEpilogue::GateUp || !wide.spread)) continue;
+              if (onePass && (registerTile || !pairGate || !wide.spread || rows > kMaximumPairRows)) continue;
               for (const bool sixteenRows : {false, true}) {
-                if (sixteenRows && (registerTile || lanes > 1)) continue;
+                if (sixteenRows && (registerTile || rows > GGUF_TABLE16_ROWS)) continue;
                 const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
                                           .oneGateUpPass = onePass, .sixteenRows = sixteenRows};
-                cases.push_back({"L" + std::to_string(lanes),
+                const LinearPlan plan = Linear::plan(w, config, FloatOutput::BFloat16);
+                cases.push_back({line,
                                  std::string(registerTile ? "register" : onePass ? "pair" : "staged") +
                                      (sixteenRows ? "16" : "") + " S" + std::to_string(splits),
-                                 Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+                                 plan, config == policy, {}});
+                // The int8 tiles at the same plan where they take it: 16 to 32 rows, whole PQ2_0 blocks per split.
+                if (rotated && !registerTile && decodeInt8TakesSplits(K, splits) && plan.storageRows() >= 16 &&
+                    plan.storageRows() <= kMaximumInt8Rows) {
+                  LinearConfig int8 = config;
+                  int8.decodeInt8 = true;
+                  cases.push_back({line,
+                                   std::string(onePass ? "int8pair" : "int8") + (sixteenRows ? "16" : "") + " S" +
+                                       std::to_string(splits),
+                                   Linear::plan(w, int8, FloatOutput::BFloat16), int8 == policy, {}});
+                }
               }
             }
           }
@@ -337,7 +385,12 @@ int main(int argc, char **argv) {
         auto *x = static_cast<__bf16 *>(input.contents());
         for (uint64_t i = 0; i < rows * K; ++i) x[i] = __bf16(unit(rng));
       }
-      const LinearScratch scratch{zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters)};
+      // A rotated projection's rotated rows, as production sizes them.
+      const ProjectionShape shape = ring.front().shape();
+      const LinearScratch scratch{
+          zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters),
+          rotated ? zeros(prefill ? linear.scratchSize(shape, SPLASH_PREFILL_TOKEN_BUDGET).rotated : linear.scratchSize(shape, kMaximumDecodeTileRows).rotated)
+                  : MetalBuffer{}};
       // The register tile's table, prepared by its widest plan, whose plans of fewer rows read its leading tiles.
       PreparedInput table;
       const Case *widest = nullptr;
@@ -357,7 +410,9 @@ int main(int argc, char **argv) {
         const LinearBuffers b{.input = input, .output = output,
                               .residual = epilogue == LinearEpilogue::Residual ? residual : MetalBuffer{},
                               .gateScratch = gate, .scratch = scratch,
-                              .prepared = c.plan.input() == LinearInput::Table16 ? table : PreparedInput{}};
+                              .prepared = c.codes ? PreparedInput{input, LinearInput::PrefillInt8}
+                                          : c.plan.input() == LinearInput::Table16 ? table
+                                                                                   : PreparedInput{}};
         const uint32_t step = epilogue == LinearEpilogue::GateUp ? 2 : 1;
         for (uint32_t i = 0; i < copies / step; ++i, next += step)
           static_cast<void>(linear.add(graph, b, ring[next % copies], c.plan,

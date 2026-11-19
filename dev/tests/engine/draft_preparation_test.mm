@@ -112,7 +112,7 @@ void checkMaskEmbedding(MetalBackend &backend, const std::filesystem::path &root
   check(draft.maskEmbedding && bytesOf(model::contentsOf(draft.maskEmbedding)) == mask,
         "the draft reads the mask embedding as shipped");
   // Two lanes of poisoned draft input rows.
-  const uint32_t lanes = 2, rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t lanes = 2, rows = lanes * SPLASH_DRAFT_QUERY_ROWS;
   const auto input =
       backend.allocateBuffer(rows * rowBytes, splash::metal::BufferStorage::Shared, "draft input rows");
   std::memset(input.contents(), 0xA5, rows * rowBytes);
@@ -123,7 +123,7 @@ void checkMaskEmbedding(MetalBackend &backend, const std::filesystem::path &root
   bool set = true;
   for (uint32_t row = 0; row < rows; ++row) {
     const auto begin = written.begin() + row * rowBytes;
-    set = set && (row % SPLASH_TARGET_VERIFY_ROWS
+    set = set && (row % SPLASH_DRAFT_QUERY_ROWS
                       ? std::equal(mask.begin(), mask.end(), begin)
                       : std::all_of(begin, begin + rowBytes, [](uint8_t byte) { return byte == 0xA5; }));
   }
@@ -171,8 +171,7 @@ int main(int argc, char **argv) {
         checkGolden(hashes, std::string(image.component), image.bytes, std::string(image.component) + ": golden");
       }
       images.release();
-      while (!images.restore(splash::test::admitAll)) {
-      }
+      splash::test::restoreWeights(images);
       for (size_t index = 0; index < loaded.size(); ++index)
         check(bytesOf(images.contents()[index].bytes) == loaded[index],
               std::string(images.contents()[index].component) + ": restored");

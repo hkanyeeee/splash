@@ -32,7 +32,7 @@ using splash::metal::MetalBuffer;
 using namespace splash::ops;
 using namespace splash::test;
 
-constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kRows = GGUF_TABLE16_ROWS;
 
 class Random final {
 public:

@@ -1,6 +1,5 @@
 import array
 import dataclasses
-import io
 import itertools
 import math
 import queue
@@ -20,8 +19,10 @@ from dev.tests.server_fixtures import (
     READY,
     FakeFactory,
     FakeRuntime,
+    StalledConsole,
     byte_alphabet,
     byte_backend,
+    console_written,
     interface_drift,
     make_frontend,
     make_job,
@@ -72,12 +73,12 @@ class FakeConstraint:
         self.committed = []
         self.finish_calls = 0
 
-    def masks(self, simulation_tokens):
+    def masks(self, simulation_tokens, parents):
         simulation_tokens = tuple(simulation_tokens)
-        self.mask_calls.append(simulation_tokens)
+        self.mask_calls.append((simulation_tokens, tuple(parents)))
         rows = len(simulation_tokens) + 1
         words = tuple(range(1, rows * self.words_per_mask + 1))
-        return struct.pack(f"<{len(words)}I", *words)
+        return struct.pack(f"<{len(words)}I", *words), ()
 
     def commit(self, token_ids):
         if self.commit_error is not None:
@@ -212,11 +213,14 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(frame.constraint, wire.ConstraintMode.TOKEN_MASK)
         self.assertEqual(request.deadline, job.deadline)
 
-        event = wire.MaskRequestEvent(runtime.calls[0].request_id, 91, 2, (5, 6))
-        self.assertEqual(
-            request.mask_provider(event), array.array("I", (1, 2, 3, 4, 5, 6)).tobytes()
+        event = wire.MaskRequestEvent(
+            runtime.calls[0].request_id, 91, 2, (5, 6), (wire.NO_PARENT, 0)
         )
-        self.assertEqual(constraint.mask_calls, [(5, 6)])
+        self.assertEqual(
+            request.mask_provider(event),
+            (array.array("I", (1, 2, 3, 4, 5, 6)).tobytes(), ()),
+        )
+        self.assertEqual(constraint.mask_calls, [((5, 6), (wire.NO_PARENT, 0))])
 
     def test_mask_simulation_empty_and_eight_tokens_produce_one_and_nine_rows(self):
         constraint = FakeConstraint(words_per_mask=2)
@@ -224,15 +228,18 @@ class NativeBackendContractTests(unittest.TestCase):
             make_job(constraint=constraint)
         )
 
-        initial = wire.MaskRequestEvent(1, 20, 2, ())
-        simulation = wire.MaskRequestEvent(1, 21, 2, tuple(range(8)))
-        self.assertEqual(provider(initial), array.array("I", (1, 2)).tobytes())
-        self.assertEqual(provider(simulation), array.array("I", range(1, 19)).tobytes())
-        self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
+        chain = (wire.NO_PARENT, *range(7))
+        initial = wire.MaskRequestEvent(1, 20, 2, (), ())
+        simulation = wire.MaskRequestEvent(1, 21, 2, tuple(range(8)), chain)
+        self.assertEqual(provider(initial), (array.array("I", (1, 2)).tobytes(), ()))
+        self.assertEqual(
+            provider(simulation), (array.array("I", range(1, 19)).tobytes(), ())
+        )
+        self.assertEqual(constraint.mask_calls, [((), ()), (tuple(range(8)), chain)])
 
         with self.assertRaises(api_errors.ConstraintError):
-            generation_constraints.TokenConstraint(None, None, READY).masks(
-                tuple(range(9))
+            generation_constraints.TokenConstraint(None, READY).masks(
+                tuple(range(9)), (wire.NO_PARENT, *range(8))
             )
 
     def test_release_weights_asks_the_engine_and_returns_its_status(self):
@@ -407,19 +414,24 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(request.constraint, wire.ConstraintMode.TOKEN_MASK)
         process.send(wire.StartEvent(request.request_id, 0, 0))
 
-        process.send(wire.MaskRequestEvent(request.request_id, 71, 2, ()))
+        process.send(wire.MaskRequestEvent(request.request_id, 71, 2, (), ()))
         initial = process.stdin.wait_for(wire.MaskResponseFrame)[0]
         self.assertEqual(initial.request_id, request.request_id)
         self.assertEqual(initial.mask_request_id, 71)
         self.assertEqual(initial.mask_words, array.array("I", (1, 2)).tobytes())
 
+        # A verify block's tree: the anchor's two children, the first with a
+        # subtree of its own, travel with their parents.
         simulation = tuple(range(100, 108))
-        process.send(wire.MaskRequestEvent(request.request_id, 72, 2, simulation))
+        parents = (wire.NO_PARENT, 0, 1, 1, 3, 0, 5, 6)
+        process.send(
+            wire.MaskRequestEvent(request.request_id, 72, 2, simulation, parents)
+        )
         verify = process.stdin.wait_for(wire.MaskResponseFrame, count=2)[1]
         self.assertEqual(verify.request_id, request.request_id)
         self.assertEqual(verify.mask_request_id, 72)
         self.assertEqual(verify.mask_words, array.array("I", range(1, 19)).tobytes())
-        self.assertEqual(constraint.mask_calls, [(), simulation])
+        self.assertEqual(constraint.mask_calls, [((), ()), (simulation, parents)])
 
         process.send(
             wire.DoneEvent(
@@ -464,18 +476,13 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.finish_calls, 1)
         self.assertFalse(transport.active)
 
-    def test_a_console_that_stops_draining_does_not_stall_the_reader(self):
-        # A request's Started line is printed when the engine starts it. On a
-        # console that stops draining (a paused terminal, an unread pipe) the
-        # write blocks; the finalizer makes it, as it does the Done line's,
-        # so the reader thread still delivers every request's tokens.
+    def test_a_console_that_stops_draining_holds_up_no_request(self):
+        # A request's Started line is printed when the engine starts it, its
+        # Done line when it completes. On a console that stops draining (a
+        # paused terminal, an unread pipe) a write blocks; the console thread
+        # makes it, so the reader thread still delivers every request's tokens
+        # and the finalizer every request's completion.
         drained = threading.Event()
-
-        class Console(io.StringIO):
-            def write(self, text):
-                drained.wait(5.0)
-                return super().write(text)
-
         factory = FakeFactory()
         native = runtime.MultiplexedRuntime(
             process_factory=factory, pending_limit=4, eager_start=True
@@ -486,7 +493,7 @@ class NativeBackendContractTests(unittest.TestCase):
         self.addCleanup(transport.close)
         # A failed assertion leaves the console drained for close.
         self.addCleanup(drained.set)
-        console = Console()
+        console = StalledConsole(drained)
         job = make_job()
         with mock.patch("sys.stdout", console):
             transport.submit(job)
@@ -501,12 +508,17 @@ class NativeBackendContractTests(unittest.TestCase):
                     frame.request_id, wire.FinishReason.STOP, 4, 1, 100, 200, 350, ()
                 )
             )
-            drained.set()
             self.assertEqual(self.terminal(job)[0], "done")
+            drained.set()
+            console_written()
         lines = [line.split(" ", 1)[1] for line in console.getvalue().splitlines()]
         self.assertEqual(len(lines), 2)
-        self.assertEqual(lines[0], "Started · input 4 · cached 0")
-        self.assertTrue(lines[1].startswith("Done · input 4 · cached 0 · output 1"))
+        # Both name the request as the engine knows it.
+        request = f"request {frame.request_id}"
+        self.assertEqual(lines[0], f"Started · {request} · input 4 · cached 0")
+        self.assertTrue(
+            lines[1].startswith(f"Done · {request} · input 4 · cached 0 · output 1")
+        )
 
     def test_inline_completion_cannot_leave_stale_active_job(self):
         transport, _runtime = self.make_transport(DrivenRuntime("complete_inline"))
@@ -637,7 +649,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
         matcher = FakeMatcher()
-        constraint = generation_constraints.TokenConstraint(matcher, None, READY)
+        constraint = generation_constraints.TokenConstraint(matcher, READY)
         constraint.commit((7, 8))
         constraint.commit((9,))
         self.assertEqual(matcher.consumed, [])
@@ -724,6 +736,48 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(kind, "error")
         self.assertEqual((error.status, error.code), (503, "server_shutdown"))
         self.assertFalse(transport.active)
+
+    def test_a_request_the_engines_stop_ended_says_so_through_the_close(self):
+        # A server whose engine stopped for good exits, and its close claims
+        # the calls the failure is ending: their clients are owed why.
+        transport, driven = self.make_transport()
+        job = make_job()
+        transport.submit(job)
+        call = driven.calls[0]
+        transport.stop_reason = "Splash stopped restarting the engine"
+        original_close = driven.close
+
+        def close_after_failure():
+            call.complete(error=runtime.EngineUnhealthy("native protocol reached EOF"))
+            original_close()
+
+        driven.close = close_after_failure
+        transport.close()
+
+        kind, error = self.terminal(job)
+        self.assertEqual(
+            (kind, error.status, error.code, error.message),
+            ("error", 500, "engine_failed", "Splash stopped restarting the engine"),
+        )
+
+    def test_a_request_not_yet_admitted_hears_why_the_engine_stopped(self):
+        # The server closes as its engine's stop tells it to exit: a request
+        # that arrives then is owed the reason too, not a retry.
+        transport, _driven = self.make_transport()
+        transport.stop_reason = "Splash stopped restarting the engine"
+        transport.closing = True
+        self.addCleanup(setattr, transport, "closing", False)
+        refusal = transport.refusal()
+        self.assertEqual((refusal.status, refusal.code), (500, "engine_failed"))
+        job = make_job()
+        transport.submit(job)
+        kind, error = self.terminal(job)
+        self.assertEqual(
+            (kind, error.status, error.code), ("error", 500, "engine_failed")
+        )
+        with self.assertRaises(api_errors.APIError) as released:
+            transport.release_weights()
+        self.assertEqual(released.exception.code, "engine_failed")
 
     def test_close_does_not_wait_for_a_frame_being_written(self):
         # A writer stuck mid-frame holds the write lock for up to its write
@@ -1103,7 +1157,7 @@ class NativeBackendContractTests(unittest.TestCase):
             transport.close()
             # Keep this regression's fixture bounded even if close regresses.
             if transport.finalizer.is_alive():
-                transport.finalizer_queue.put(None)
+                transport.terminals.put(None)
                 transport.finalizer.join(1.0)
 
     def test_failed_status_thread_start_releases_refresh_ownership(self):

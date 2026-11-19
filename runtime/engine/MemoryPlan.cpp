@@ -27,18 +27,12 @@ BudgetValidationStatus failure(BudgetErrorCode code, std::string message,
 
 std::string_view budgetErrorCodeName(BudgetErrorCode code) {
   switch (code) {
-  case BudgetErrorCode::None:
-    return "none";
-  case BudgetErrorCode::InvalidDeviceCapabilities:
-    return "invalid_device_capabilities";
-  case BudgetErrorCode::InvalidModelSpec:
-    return "invalid_model_spec";
-  case BudgetErrorCode::WorkingSetTooSmall:
-    return "working_set_too_small";
-  case BudgetErrorCode::ArithmeticOverflow:
-    return "arithmetic_overflow";
-  case BudgetErrorCode::KvPoolDoesNotFit:
-    return "kv_pool_does_not_fit";
+  case BudgetErrorCode::None: return "none";
+  case BudgetErrorCode::InvalidDeviceCapabilities: return "invalid_device_capabilities";
+  case BudgetErrorCode::InvalidModelSpec: return "invalid_model_spec";
+  case BudgetErrorCode::WorkingSetTooSmall: return "working_set_too_small";
+  case BudgetErrorCode::ArithmeticOverflow: return "arithmetic_overflow";
+  case BudgetErrorCode::KvPoolDoesNotFit: return "kv_pool_does_not_fit";
   }
   return "unknown";
 }
@@ -173,7 +167,7 @@ std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
   uint64_t runwayBytes = 0;
   uint64_t dynamicBytes = 0;
   uint64_t result = 0;
-  if (!checkedMultiply(layout.bytesPerModelPage(),
+  if (!checkedMultiply(layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes,
                        kvRunwayPages(layout.minimumExtentPages()), runwayBytes) ||
       !checkedAdd(laneStateBytes, runwayBytes, dynamicBytes) ||
       !checkedAdd(fixedBytes, dynamicBytes, result))
@@ -201,10 +195,11 @@ uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t floorPa
 }
 
 uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorPages, uint32_t extentPages) noexcept {
+  const uint64_t index = uint64_t{kv::kPageTokens} * model::kLookupIndexTokenBytes;
   const auto whole = [&](uint64_t room, kv::PageForm form) {
-    return room / (extentPages * layout.bytesPerModelPage(form)) * extentPages;
+    return room / (extentPages * (layout.bytesPerModelPage(form) + index)) * extentPages;
   };
-  const uint64_t floorBytes = kvPagesBytes(layout, floorPages, floorPages, extentPages);
+  const uint64_t floorBytes = kvPagesBytes(layout, floorPages, floorPages, extentPages) + floorPages * index;
   if (!layout.slimmable() || bytes < floorBytes) return whole(bytes, kv::PageForm::Full);
   return floorPages + whole(bytes - floorBytes, kv::PageForm::Slim);
 }
@@ -434,14 +429,11 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.kvWindowFloorPages = kvWindowFloorPages(kvLayout, model.commandPages);
   if (kvLayout.slimmable())
     breakdown.kvSlimPageBytes = kvLayout.bytesPerModelPage(kv::PageForm::Slim);
-  // Page ids stay 32-bit. One request's KV capacity is the whole extents of
-  // the size that leaves the fewest of the budget's pages, priced one by one,
-  // unused; a windowed layout's Full and Slim pages take extents of their
-  // own (kvPagesWithin).
+  // Advertise the whole Full/Slim extents that a lone start can admit beside
+  // its live state, one continuation and the spill runway (Engine::residentRoom).
   const uint64_t availableForOneRequestKv =
-      breakdown.dynamicBudgetBytes > requestStateBytes
-          ? breakdown.dynamicBudgetBytes - requestStateBytes
-          : 0;
+      saturatingSubtract(saturatingSubtract(breakdown.dynamicBudgetBytes, requestStateBytes),
+                         model.spill.enabled ? model.spill.heldBytes() : 0);
   const auto pagesWithin = [&](uint32_t extentPages) {
     return std::min<uint64_t>(
         kvPagesWithin(kvLayout, availableForOneRequestKv, breakdown.kvWindowFloorPages, extentPages),

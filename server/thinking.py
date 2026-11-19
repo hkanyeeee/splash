@@ -40,6 +40,8 @@ def _read_key(path):
 
 
 def load_thinking_key(path=None):
+    if path is None and (root := os.environ.get("SPLASH_ISOLATED_STATE_DIR")):
+        path = Path(root) / "thinking.key"
     path = (
         Path.home() / "Library/Application Support/Splash/thinking.key"
         if path is None

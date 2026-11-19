@@ -60,13 +60,10 @@ void HyperConnection::addNorm(metal::CommandGraph &graph, metal::MetalBuffer str
   std::vector<metal::MetalBuffer> bindings{std::move(streams), norm.buffer, injects ? inject : norm.buffer,
                                            std::move(normalized), injects ? weights : norm.buffer};
   // An injecting mix of decode's few rows runs a threadgroup of a quarter per
-  // stream each (staged on Apple7/8 at few enough rows), the rest one of
-  // kThreads (kernels/shared/hyper_connection.metal).
+  // stream each, the rest one of kThreads (kernels/shared/hyper_connection.metal).
   const bool quarters = injects && rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
-  const char *kernel = !quarters ? "hyper_connection_norm_loaded"
-                       : staged  ? "hyper_connection_norm_staged"
-                                 : "hyper_connection_norm_quarters";
-  graph.add(kernel, std::move(bindings), hyperParams(shape, rows, injects), {rows, 1, 1},
+  graph.add(!quarters ? "hyper_connection_norm_loaded" : staged ? "hyper_connection_norm_staged" : "hyper_connection_norm_quarters", std::move(bindings),
+            hyperParams(shape, rows, injects), {rows, 1, 1},
             {quarters ? HYPER_CONNECTION_NORM_QUARTER_THREADS : kThreads, 1, 1});
 }
 

@@ -28,7 +28,7 @@ from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
 from dev.tests import native_peer
 from install import families, launcher
 from server import backend as backend_api
-from server import documents, images, serve_options
+from server import diagnostics, documents, images, serve_options
 from server import errors as api_errors
 from server import frontend as request_frontend
 from server import protocol as wire
@@ -250,6 +250,9 @@ class TemplateTokenizer(FakeTokenizer):
 class CharTokenizer(FakeTokenizer):
     """One token per character, so single-letter answer slots are exact."""
 
+    def __call__(self, text, **kwargs):
+        return {"input_ids": self.encode(text)}
+
     def encode(self, text, **kwargs):
         return [ord(char) for char in text]
 
@@ -261,21 +264,11 @@ class ImagePadTokenizer(FakeTokenizer):
     """Renders one image placeholder per image part like the pinned
     Qwen template, with pad id 50."""
 
-    # Stands for the template: rendering emits the source per image part,
-    # so the frontend's image render marker appears where it replaced it.
+    # Stands for the template: rendering emits the source per image part.
     chat_template = QWEN.image_pad
 
     def __call__(self, text, **kwargs):
-        count = text.count(QWEN.image_pad)
-        width = len(QWEN.image_pad)
-        return {
-            "input_ids": [101, *([50] * count), 102],
-            "offset_mapping": [
-                (0, 1),
-                *((1 + i * width, 1 + (i + 1) * width) for i in range(count)),
-                (len(text) - 1, len(text)),
-            ],
-        }
+        return {"input_ids": [101, *([50] * text.count(QWEN.image_pad)), 102]}
 
     def apply_chat_template(self, messages, **kwargs):
         self.templates.append((messages, kwargs))
@@ -582,6 +575,43 @@ class FakeRuntime:
         self.ready = False
 
 
+def console_written():
+    """Wait for the console lines printed so far to be written
+    (diagnostics.flush_console); a failure once 5 s pass first."""
+    if not diagnostics.flush_console(5.0):
+        raise AssertionError("the console did not write its lines within 5 s")
+
+
+def full_pipe():
+    """A pipe that takes nothing more, as one whose reader stalled: its read
+    end, its write end, blocking, and the bytes it holds."""
+    unread, written = os.pipe()
+    os.set_blocking(written, False)
+    held = 0
+    try:
+        while True:
+            held += os.write(written, b"x" * 65536)
+    except BlockingIOError:
+        os.set_blocking(written, True)
+    return unread, written, held
+
+
+class StalledConsole(io.StringIO):
+    """A console that stops draining, as a pipe whose reader stalled: each
+    write waits until `drained` is set, or 10 s; `writing` is set once one
+    began."""
+
+    def __init__(self, drained):
+        super().__init__()
+        self.drained = drained
+        self.writing = threading.Event()
+
+    def write(self, text):
+        self.writing.set()
+        self.drained.wait(10.0)
+        return super().write(text)
+
+
 class FakeOutput:
     def __init__(self):
         self._condition = threading.Condition()
@@ -692,6 +722,8 @@ class FakeProcess:
         self.input_handler = input_handler
         self.stdout = FakeOutput()
         self.stdin = FakeInput(self)
+        # It writes nothing to its stderr.
+        self.stderr = io.BytesIO()
         self._condition = threading.Condition()
         self._exit_code = None
         # The fault signal it is dying by (crash), which no other signal
@@ -862,9 +894,11 @@ def main_args(**overrides):
             "model": "test-model",
             "served_model_name": [],
             "announce_served_name": False,
+            "reasoning_effort": None,
             "default_reasoning_effort": None,
             "thinking_token_budget": None,
             "thinking_end_text": None,
+            "chat_template_file": None,
             "max_context": None,
             "max_memory": None,
             "idle_release": None,
@@ -874,6 +908,7 @@ def main_args(**overrides):
             "cache_dir": None,
             "decode_share": None,
             "disable_ane": False,
+            "activations": "auto",
             "verify_rows": "auto",
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
@@ -892,6 +927,7 @@ def main_args(**overrides):
             "sparse_kv_memory": None,
             "kv_format": "int8",
             "state_format": "fp32",
+            "cached_states": "int8",
             "serve_record": None,
             **overrides,
         }
@@ -922,6 +958,7 @@ def make_frontend(
     constraint_factory=None,
     thinking_codec=None,
     chat_format=QWEN,
+    chat_templates=None,
     **options,
 ):
     """A frontend over the tokenizer, with its chat templates probed as
@@ -929,8 +966,8 @@ def make_frontend(
     for `max_context` tokens with or without `vision`: the Ready its
     backend's runtime holds, or a stand-in backend's where the test passes
     none. Unless a test passes its own, generation is unconstrained, thinking
-    is signed with a fresh key and the output is read in the Qwen families'
-    chat format."""
+    is signed with a fresh key, the templates are the tokenizer's and the
+    output is read in the Qwen families' chat format."""
     if constraint_factory is None:
         constraint_factory = PassThroughConstraintFactory()
     if thinking_codec is None:
@@ -946,13 +983,15 @@ def make_frontend(
     # Unless a test passes its own, requests get the sampling the Qwen
     # families publish, as the server serving one does.
     options.setdefault("sampling_defaults", dataclasses.asdict(families.QWEN_SAMPLING))
+    if chat_templates is None:
+        chat_templates = ChatTemplates(tokenizer)
     return request_frontend.Frontend(
         tokenizer,
         backend,
         model,
         request_timeout,
         constraint_factory=constraint_factory,
-        chat_templates=ChatTemplates(tokenizer),
+        chat_templates=chat_templates,
         chat_format=chat_format,
         thinking_codec=thinking_codec,
         response_store=responses_dialect.ResponseStore(),

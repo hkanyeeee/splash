@@ -148,11 +148,11 @@ void printUsage(std::string_view executable) {
       "usage: " + command +
       " serve-native MODEL_DIRECTORY"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-      " [--kv-format int8|bf16] [--state-format fp32|bf16] [--decode-share SHARE]"
+      " [--kv-format int8|bf16] [--state-format fp32|bf16] [--cached-states int8|exact] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
-      " [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
+      " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
@@ -204,6 +204,8 @@ std::filesystem::path executablePath() {
 
 // Splash's caches in the home directory; empty without one.
 std::filesystem::path splashCaches() {
+  if (const char *root = std::getenv("SPLASH_ISOLATED_STATE_DIR"); root && *root)
+    return std::filesystem::path(root) / "caches";
   const char *home = std::getenv("HOME");
   return home && *home ? std::filesystem::path(home) / "Library/Caches/Splash"
                        : std::filesystem::path();
@@ -227,6 +229,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
     config.resources.cacheRoot = caches / "prefix-cache";
   config.resources.kvFormat = arguments.kvFormat;
   config.resources.stateFormat = arguments.stateFormat;
+  config.resources.exactCachedStates = arguments.exactCachedStates;
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
@@ -237,6 +240,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
   config.resources.kvWindowTrim = arguments.kvWindowTrim;
   config.resources.verifyRows = arguments.verifyRows;
+  config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

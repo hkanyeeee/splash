@@ -3,6 +3,7 @@ handler; each API's handlers, request conversion and answers live in its
 module in dialects/."""
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -28,7 +29,7 @@ from transformers import AutoTokenizer
 from install import assembly
 from install.models import ModelError
 
-from . import dialects, json_codec, serve_options, serve_record
+from . import dialects, json_codec, serve_options, serve_record, unix_socket
 from . import runtime as engine_runtime
 from .backend import (
     NativeBackend,
@@ -36,7 +37,7 @@ from .backend import (
     ThinkingEndError,
     thinking_end_tokens,
 )
-from .chat_templates import ChatTemplateError, ChatTemplates
+from .chat_templates import ChatTemplateError, ChatTemplates, read_template_file
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
 from .constraints import (
     ConstraintFactory,
@@ -44,7 +45,8 @@ from .constraints import (
     check_capabilities,
     validate_tokenizer,
 )
-from .diagnostics import log_unexpected, print_request, print_status
+from .diagnostics import console_stats, log_unexpected, print_request, print_status
+from .documents import MAX_PAGES, MAX_PDF_BYTES
 from .errors import (
     OPENAI_ERRORS,
     RETRY_STATUSES,
@@ -59,8 +61,10 @@ from .http_security import (
     OriginRefused,
     RefusedOriginLog,
     authenticate,
+    socket_hosts,
     validate_headers,
 )
+from .images import MAX_IMAGE_BYTES
 from .latency import RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
@@ -69,6 +73,7 @@ from .output import (
     StreamingToolCallProjector,
     validate_response_content,
 )
+from .protocol import MAX_IMAGE_SPANS
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
 # Request bodies held at once, from upload through preparation and, for what
@@ -87,7 +92,21 @@ ANSWERED_LINGER_SECONDS = 2.0
 # lingering after a burst and the engine's pipes and files can need. 10240 is
 # macOS's OPEN_MAX.
 DESCRIPTOR_LIMIT = 10240
+# The status of a server that stopped restarting its engine, apart from a
+# stop's 0 and a failed start's 1: what supervises the server, as launchd's
+# KeepAlive does, decides whether to start it again. 69 is sysexits'
+# EX_UNAVAILABLE.
+ENGINE_STOPPED_STATUS = os.EX_UNAVAILABLE
 SSE_KEEPALIVE_SECONDS = 2.0
+# A client gone without a FIN or RST (a Mac asleep, off its network) sends
+# nothing a non-streaming request reads; keepalive probes the idle connection
+# and drops it once its peer stops answering, 60 s after its last data.
+TCP_KEEPALIVE_OPTIONS = (
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+)
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 CHAT_ASSETS = {
@@ -216,7 +235,24 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # passed validate_headers.
         self._allow_origin = None
         self._unread_body = 0
+        # The native job submitted last, which a failure cancels.
+        self._submitted = None
         self._last_sse_write = time.monotonic()
+        # A UNIX socket's peer is a process on this Mac, whose end closes the
+        # connection, and macOS refuses the TCP options on one.
+        keepalive = (
+            () if self.request.family == socket.AF_UNIX else TCP_KEEPALIVE_OPTIONS
+        )
+        try:
+            for level, option, value in keepalive:
+                self.request.setsockopt(level, option, value)
+        except OSError as error:
+            # macOS refuses options on a connection its client reset before
+            # it was served (EINVAL): it ends as any reset does. Any other
+            # refusal is the server's to report.
+            if error.errno != errno.EINVAL:
+                raise
+            raise ConnectionResetError from error
         super().setup()
         self.connection.settimeout(HTTP_IO_TIMEOUT)
 
@@ -270,9 +306,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             min(self._unread_body, self.server.max_request_bytes)
         )
         try:
-            allowed_hosts = self.server.allowed_hosts | {
-                self.connection.getsockname()[0].lower()
-            }
+            allowed_hosts = self.server.allowed_hosts | socket_hosts(
+                self.connection.getsockname()
+            )
             self._allow_origin = validate_headers(
                 self.headers, allowed_hosts, self.server.allowed_origins
             )
@@ -360,15 +396,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _log_api_error(self, code):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
-        print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
+        # A request the engine took is named as the backend's lines name it,
+        # so that the app joins them.
+        job = self._submitted
+        engine_id = job.engine_request_id if job is not None else None
+        request = "" if engine_id is None else f"request {engine_id} · "
+        print_status(
+            f"Error · {request}{code} · {self.command} {path[:256]}", error=True
+        )
 
     def safe_error(self, error, *, log=True):
         """Answer with `error` as its path's API answers it, unless the
-        response has begun."""
+        response has begun. `log` prints its line unless the backend has:
+        one line ends a request."""
         if self.response_started:
             return
         status, code, payload = self.errors.answer(error)
-        if log:
+        if log and not error.logged:
             self._log_api_error(code)
         try:
             self.send_json(status, payload, error.retry_after)
@@ -527,6 +571,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "context_length": self.app.max_context,
                 "vision": self.app.vision,
                 "input_modalities": self.app.input_modalities,
+                "limits": self._limits(),
                 "reasoning": self.app.reasoning,
                 **(
                     {"root": self.app.response_model}
@@ -536,6 +581,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
             }
             for name in self.app.model_names
         ]
+
+    def _limits(self):
+        """What a request may carry, which a client can check an attachment
+        against before it sends: its bytes (--max-request-size); its images,
+        a PDF's pages counted among them; an image's bytes; a PDF's bytes,
+        which the request's PDFs share, and its pages."""
+        return {
+            "request_bytes": self.server.max_request_bytes,
+            "images": MAX_IMAGE_SPANS,
+            "image_bytes": MAX_IMAGE_BYTES,
+            "pdf_bytes": MAX_PDF_BYTES,
+            "pdf_pages": MAX_PAGES,
+        }
 
     def _get_models(self):
         models = self._models()
@@ -581,8 +639,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return
         self._body_reservation = None
-        # The native job submitted last, which a failure cancels.
-        self._submitted = None
         try:
             generation = self._serve(route, started_at)
             if generation is not None:
@@ -595,8 +651,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.safe_error(error, log=self._submitted is None)
         except APIError as error:
             self._cancel_submitted()
-            # The native outcome was already logged; a server-side failure
-            # after submission must still reach the console.
+            # A failure the backend ended the request with is logged, under
+            # the engine's id; another server-side failure after submission
+            # must still reach the console.
             self.safe_error(error, log=self._submitted is None or error.status >= 500)
         except Exception as error:
             self._cancel_submitted()
@@ -724,7 +781,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         except BlockingIOError:
             return False
-        except ConnectionError:
+        except (ConnectionError, TimeoutError):
+            # A connection keepalive dropped fails its read with ETIMEDOUT.
             return True
 
     def _finalize_content(self, content, job, result, projector, cut_in_call):
@@ -874,7 +932,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.app.backend.cancel(job)
             if not self.response_started:
                 raise
-            if error.status >= 500:
+            if error.status >= 500 and not error.logged:
                 self._log_api_error(error.code)
             try:
                 send_error(error)
@@ -1017,9 +1075,21 @@ class FrontendServer(HTTPServer):
         )
         self.api_key = api_key
         self.webui = webui
+        path = unix_socket.path(address[0])
+        if path is not None:
+            self.address_family = socket.AF_UNIX
+            address = path
+        # A UNIX socket's hold on its path, from its bind until it closes.
+        self._claim = None
         self.allowed_hosts = {
             host.lower().rstrip(".")
-            for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
+            for host in (
+                *allowed_hosts,
+                *socket_hosts(address),
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            )
             if host not in ("0.0.0.0", "::")
         }
         # As serve_options.parse_allowed_origin returns them.
@@ -1044,8 +1114,8 @@ class FrontendServer(HTTPServer):
             "id": self.instance_id,
             "pid": os.getpid(),
             "model": self.app.model,
-            "host": self.server_address[0],
-            "port": self.server_address[1],
+            "host": self.host,
+            "port": self.server_port,
             "started_at": self.started_at,
         }
         status["http"] = {
@@ -1055,7 +1125,24 @@ class FrontendServer(HTTPServer):
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
         }
+        status["console"] = console_stats()
         return status
+
+    @property
+    def host(self):
+        """Where it listens, as --host names it: the address it bound, or a
+        UNIX socket's unix:PATH."""
+        if self.address_family == socket.AF_UNIX:
+            return unix_socket.PREFIX + self.server_address
+        return self.server_address[0]
+
+    def server_bind(self):
+        if self.address_family != socket.AF_UNIX:
+            return super().server_bind()
+        self._claim = unix_socket.Claim(self.server_address)
+        self._claim.bind(self.socket)
+        # A UNIX socket has no port, which /status reports as none.
+        self.server_port = None
 
     def server_activate(self):
         super().server_activate()
@@ -1108,14 +1195,18 @@ class FrontendServer(HTTPServer):
 
     def server_close(self):
         super().server_close()
+        if self._claim is not None:
+            self._claim.close()
         self.connections.stop()
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
     def handle_error(self, request, client_address):
+        # A client that left is no error. Any other is one console line, as a
+        # request's unexpected error is: socketserver's own writes a traceback
+        # straight to stderr, on the connection worker.
         error = sys.exc_info()[1]
-        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
-            return
-        super().handle_error(request, client_address)
+        if not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            log_unexpected(error)
 
 
 def parse_args(argv=None):
@@ -1206,6 +1297,10 @@ class ListenError(Exception):
     """The HTTP server cannot listen at its address."""
 
 
+class OptionError(Exception):
+    """An option the served model's family cannot follow."""
+
+
 def _start_failed(args, error, failure):
     """End a start that failed, saying why in the log and, for the app, in
     the launcher's serve record (serve_record)."""
@@ -1219,6 +1314,14 @@ def main():
     server = None
     runtime = None
     backend = None
+    # Why the backend stopped restarting the engine, once it has.
+    stopped = None
+
+    def stop_serving(reason):
+        nonlocal stopped
+        stopped = reason
+        os.kill(os.getpid(), signal.SIGTERM)
+
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -1270,6 +1373,23 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        if args.reasoning_effort is not None and not (
+            family.chat_format.reasoning_switch
+        ):
+            # No effort reaches a model that opens its reasoning itself, so
+            # the server cannot set every request's.
+            raise OptionError(
+                f"--reasoning-effort cannot set how {args.model} reasons: a "
+                f"{family.name} model decides each turn whether to reason, "
+                "whatever effort its prompt names"
+            )
+        # A file that cannot be read stops the start before the tokenizer
+        # loads; whether its template serves requests is found with the
+        # tokenizer (ChatTemplates).
+        custom = None
+        if args.chat_template_file is not None:
+            custom = read_template_file(args.chat_template_file)
+            print_status(f"Chat template file · {args.chat_template_file}")
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.
@@ -1286,7 +1406,7 @@ def main():
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
         )
-        chat_templates = ChatTemplates(tokenizer)
+        chat_templates = ChatTemplates(tokenizer, override=custom)
         print_status(f"Chat template · {chat_templates.describe()}")
         # Unset, a budget ends thinking as the template closes it, so that the
         # next request renders that close back as the tokens the reply ended
@@ -1303,13 +1423,38 @@ def main():
             ),
             pending_limit=args.queue_size,
         )
-        runtime.on_warming = lambda: serve_record.entered(args.serve_record, "warming")
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        runtime.on_warming = warming
+
+        def engine_recovering(recovering):
+            # The record follows the engine once the server is ready, for
+            # what supervises it by the file (serve_record). It runs on the
+            # thread the change came on, which must not block (follow): a
+            # record that cannot be written is a queued warning line.
+            if recovering:
+                serve_record.recovering(args.serve_record)
+            else:
+                serve_record.recovered(args.serve_record)
+
         backend = NativeBackend(
             runtime,
             tokenizer,
             request_logger=print_request,
             thinking_end=thinking_end,
         )
+        # A server that serves nothing more stops as on SIGTERM and exits
+        # ENGINE_STOPPED_STATUS below.
+        backend.on_stopped = stop_serving
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
         # The engine is authoritative for what it serves: it refuses a
@@ -1332,6 +1477,7 @@ def main():
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
+            reasoning_effort=args.reasoning_effort,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
         )
@@ -1340,7 +1486,13 @@ def main():
         # The app takes the server for ready from its record alone: one that
         # cannot say so has not started (serve_record).
         serve_record.ready(args.serve_record)
-        address = f"http://{args.host}:{server.server_port}"
+        # Told at once of an engine that failed since its Ready.
+        backend.follow(engine_recovering)
+        address = (
+            server.host
+            if server.address_family == socket.AF_UNIX
+            else f"http://{args.host}:{server.server_port}"
+        )
         tokens = served.max_context_tokens
         context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
         mode = "" if served.vision else " · text only"
@@ -1350,6 +1502,10 @@ def main():
         _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
     except ListenError as error:
         _start_failed(args, error, serve_record.failure(serve_record.PORT, str(error)))
+    except OptionError as error:
+        _start_failed(
+            args, error, serve_record.failure(serve_record.CONFIGURATION, str(error))
+        )
     except (
         ModelError,
         ChatTemplateError,
@@ -1403,6 +1559,11 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
+    if stopped is not None:
+        serve_record.failed(
+            args.serve_record, serve_record.failure(serve_record.STOPPED, stopped)
+        )
+        raise SystemExit(ENGINE_STOPPED_STATUS)
 
 
 if __name__ == "__main__":

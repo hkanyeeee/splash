@@ -61,7 +61,7 @@ __attribute__((always_inline)) inline void sparse_tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table, SplashKvLayer kv, uint kv_head,
     uint first_position, uint active_rows, device const uint *list, uint count, device const uint *locations,
     device const SplashKvPage *location_pages, uint splits, uint split, device float *partials,
-    device float *statistics, ulong slot, threadgroup SparseScratch<CacheElement> &scratch, uint sg, uint lane) {
+    device float *statistics, ulong slot, threadgroup SparseScratch<CacheElement> &scratch, SplashAttentionTree tree, device const uint *attended, uint sg, uint lane) {
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint M = 8 * G;
@@ -71,7 +71,7 @@ __attribute__((always_inline)) inline void sparse_tile(
   constexpr uint PageBlocks = SplashKvPageTokens / BlockTokens;
   constexpr uint AllRows = (1u << 8) - 1u;
   static_assert(D == 256, "fragment maps assume D = 256");
-  static_assert(SPLASH_TARGET_VERIFY_ROWS == 8 && SPLASH_PREFILL_ATTENTION_TILE_ROWS == 8 &&
+  static_assert(SPLASH_ATTENTION_TILE_ROWS == 8 &&
                     SPLASH_ATTENTION_BLOCK_ROW_BITS == 8,
                 "one simdgroup per G fused rows of an eight-row tile");
   const uint per_split = splash_sparse_split_entries(count, splits);
@@ -88,6 +88,11 @@ __attribute__((always_inline)) inline void sparse_tile(
   const uint row = sg * 8 + fn;
   const uint2 tile_row(min(row / G, active_rows - 1), min((row + 1) / G, active_rows - 1));
   const uint2 causal_end = first_position + tile_row + 1;
+  const auto sees = [&](uint token, uint r) {
+    if (!tree.rows || token < tree.anchor) return true;
+    const uint path = tree.rows[r].ancestors & (attended ? attended[r] : ~0u);
+    return ((path >> min(token - tree.anchor, 31u)) & 1u) != 0;
+  };
 
   uint queries[4][8];
   {
@@ -145,8 +150,8 @@ __attribute__((always_inline)) inline void sparse_tile(
       const uint entry = scratch.entries[slot_index];
       const bool valid = entry != SplashSparseNoEntry;
       const uint position = (entry >> SPLASH_ATTENTION_BLOCK_ROW_BITS) * BlockTokens + token % BlockTokens;
-      allowed[s] = bool2(valid && ((entry >> tile_row.x) & 1u) && position < causal_end.x,
-                         valid && ((entry >> tile_row.y) & 1u) && position < causal_end.y);
+      allowed[s] = bool2(valid && ((entry >> tile_row.x) & 1u) && position < causal_end.x && sees(position, tile_row.x),
+                         valid && ((entry >> tile_row.y) & 1u) && position < causal_end.y && sees(position, tile_row.y));
       key_rows[s] = nullptr;
       if (valid) {
         const SplashKvPageTensors<CacheElement> tensors = addressing.page(scratch.pages[slot_index]);

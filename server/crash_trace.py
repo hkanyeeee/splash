@@ -38,7 +38,11 @@ MAX_TRACE_FILES = 4
 MAX_TRACE_DISK_BYTES = 64 * 1024 * 1024
 REPLAY_TIMEOUT_SECONDS = 600
 SHUTDOWN_GRACE_SECONDS = 15.0
-DEFAULT_TRACE_DIRECTORY = Path.home() / "Library" / "Logs" / "Splash" / "crash"
+DEFAULT_TRACE_DIRECTORY = (
+    Path(root) / "crash"
+    if (root := os.environ.get("SPLASH_ISOLATED_STATE_DIR"))
+    else Path.home() / "Library" / "Logs" / "Splash" / "crash"
+)
 
 
 @dataclass(frozen=True, slots=True)
