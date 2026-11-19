@@ -446,6 +446,9 @@ public:
   QwenTarget(const QwenTarget &) = delete;
   QwenTarget &operator=(const QwenTarget &) = delete;
   virtual ~QwenTarget();
+  void beginWarmupTrace(const char *phase);
+  void finishWarmupTrace();
+  void discardWarmupTrace();
 
   // The step scratch the target allocated itself (qwenTargetScratchBytes).
   [[nodiscard]] virtual QwenTargetScratchBytes allocatedScratchBytes() const noexcept;
@@ -719,6 +722,12 @@ protected:
                                           uint32_t width) const {
     return backend_.view(buffer, uint64_t{begin} * width * sizeof(T), uint64_t{count} * width * sizeof(T));
   }
+
+  struct WarmupTrace;
+  std::unique_ptr<WarmupTrace> warmupTrace_;
+  void observe(metal::CommandGraph &graph, const char *stage, const metal::MetalBuffer &buffer,
+               uint32_t rows, uint32_t width, uint32_t bytes = 2, uint32_t routes = 1,
+               const metal::MetalBuffer &routeRows = {}) const;
 
   const QwenTargetWeightsBase &weightsBase_;
   QwenTargetGeometry geometry_;

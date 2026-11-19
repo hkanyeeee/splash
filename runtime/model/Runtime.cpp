@@ -4359,6 +4359,10 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   if (!width || width > ExecutionLimits::maximumBatchWidth) {
     throw std::invalid_argument("invalid decode warmup width");
   }
+  const char *setting = std::getenv("SPLASH_NAN_TRACE");
+  const bool trace = width == 1 && setting && std::string_view(setting) == "1" &&
+                     impl_->backend.capabilities().appleGpuFamily == 8 &&
+                     impl_->model.descriptor.family() == "Qwen3.6-35B-A3B";
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 110;
   // Plan order is deliberately unrelated to state-lane order: DecodeArena
   // lanes follow the BatchPlan, while recurrent and KV state stay addressed
@@ -4383,8 +4387,10 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                             .decodeStage = DecodeStage::Regular};
       ModelBatchItem item = warmupItem(request.id, 0, 1, pages[lane]);
       item.inputTokens = request.prompt;
-      requireLanesSucceeded(
-          prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1)));
+      if (trace) impl_->targetModel->beginWarmupTrace("B1-seed-prefill");
+      auto seeded = prefill(prefillPlan, std::span<const ModelBatchItem>(&item, 1));
+      if (trace) impl_->targetModel->finishWarmupTrace();
+      requireLanesSucceeded(seeded);
       prepareWarmupDecode(request.id, warmupPrompt.back());
     }
     BatchPlan plan;
@@ -4404,7 +4410,9 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       ~Forcing() { step = before; }
     } forcing{impl_->forcedStep, std::exchange(impl_->forcedStep, Impl::ForcedStep{width * kDraftRows, std::nullopt})};
     const auto phaseStart = AwakeClock::now();
+    if (trace) impl_->targetModel->beginWarmupTrace("B1-tree-verify");
     auto decoded = decode(plan, items);
+    if (trace) impl_->targetModel->finishWarmupTrace();
     wallSeconds = std::chrono::duration<double>(AwakeClock::now() - phaseStart).count();
     requireLanesSucceeded(decoded);
     bool committedEveryLane = decoded.size() == width;
@@ -4442,6 +4450,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       end(firstId + lane);
     }
   } catch (...) {
+    if (trace) impl_->targetModel->discardWarmupTrace();
     for (uint32_t lane = 0; lane < width; ++lane)
       end(firstId + lane);
     throw;

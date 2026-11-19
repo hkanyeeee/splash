@@ -1,5 +1,6 @@
 #include "model/QwenTarget.hpp"
 
+#include "StderrLine.hpp"
 #include "model/Flint.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
@@ -73,7 +74,60 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
     throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
 }
 
+struct QwenTarget::WarmupTrace {
+  struct Point { const char *stage; uint32_t layer, width, routes; };
+  static constexpr uint32_t capacity = 1024;
+  const char *phase;
+  metal::MetalBuffer results, laneRows;
+  uint32_t layer = 0;
+  std::vector<Point> points;
+};
+
 QwenTarget::~QwenTarget() = default;
+
+void QwenTarget::beginWarmupTrace(const char *phase) {
+  warmupTrace_ = std::make_unique<WarmupTrace>();
+  auto &trace = *warmupTrace_;
+  trace.phase = phase;
+  trace.results = backend_.allocateBuffer(WarmupTrace::capacity * sizeof(uint32_t),
+                                          metal::BufferStorage::Shared, "B1 warmup nonfinite locations");
+  std::fill_n(static_cast<uint32_t *>(trace.results.contents()), WarmupTrace::capacity, UINT32_MAX);
+}
+
+void QwenTarget::observe(metal::CommandGraph &graph, const char *stage, const metal::MetalBuffer &buffer,
+                         uint32_t rows, uint32_t width, uint32_t bytes, uint32_t routes,
+                         const metal::MetalBuffer &routeRows) const {
+  if (!warmupTrace_) return;
+  auto &trace = *warmupTrace_;
+  const uint64_t count = uint64_t{rows} * routes * width;
+  const auto slot = static_cast<uint32_t>(trace.points.size());
+  if (!count || count > UINT32_MAX || slot >= WarmupTrace::capacity || count * bytes > buffer.sizeBytes() ||
+      (routeRows && uint64_t{rows} * routes * sizeof(uint32_t) > routeRows.sizeBytes()))
+    throw std::logic_error("invalid B1 warmup trace extent");
+  trace.points.push_back({stage, trace.layer, width, routes});
+  const std::array<uint32_t, 7> params{width, routes, rows, bytes, uint32_t(bool(trace.laneRows)),
+                                       uint32_t(bool(routeRows)), slot};
+  graph.add("warmup_first_nonfinite", {buffer, trace.results, trace.laneRows ? trace.laneRows : buffer,
+                                       routeRows ? routeRows : buffer},
+            params, {(count + 127) / 128, 1, 1}, {128, 1, 1});
+}
+
+void QwenTarget::finishWarmupTrace() {
+  if (!warmupTrace_) return;
+  const auto trace = std::move(warmupTrace_);
+  const auto *first = static_cast<const uint32_t *>(trace->results.contents());
+  for (size_t i = 0; i < trace->points.size(); ++i) {
+    if (first[i] == UINT32_MAX) continue;
+    const auto &p = trace->points[i];
+    logLine("NAN_TRACE phase=", trace->phase, " layer=", p.layer, " stage=", p.stage, " checkpoint=", i,
+            " row=", first[i] / p.width / p.routes, " route=", first[i] / p.width % p.routes,
+            " element=", first[i] % p.width);
+    return;
+  }
+  logLine("NAN_TRACE phase=", trace->phase, " finite_checkpoints=", trace->points.size());
+}
+
+void QwenTarget::discardWarmupTrace() { warmupTrace_.reset(); }
 
 QwenTargetScratchBytes QwenTarget::allocatedScratchBytes() const noexcept { return {}; }
 
@@ -212,6 +266,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
              {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
               .prepared = std::move(normalized)},
              mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
+  observe(step.graph, "gdn_packed", b.gdnPacked, step.rows, geometry_.packedGdnWidth);
   const ops::LinearPlan outputPlan = linear.plan(
       mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   ops::PreparedInput hidden;
@@ -246,8 +301,16 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
            mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
           geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures,
           geometry_.stateLayout.cachedCodes);
+      if (warmupTrace_) {
+        const auto &state = geometry_.stateLayout;
+        observe(step.graph, "seed_gdn_conv_state", sequence.convolutionOut[layer], 1,
+                state.convolutionHistory * state.convolutionChannels);
+        observe(step.graph, "seed_gdn_recurrent_state", sequence.recurrentOut[layer], 1,
+                state.recurrentGroups * state.recurrentRows * state.recurrentColumns, ops::elementBytes(state.format));
+      }
     }
   }
+  observe(step.graph, "gdn_gated_hidden", b.gdnHidden, step.rows, geometry_.attentionWidth);
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
               .scratch = b.linearScratch, .prepared = std::move(hidden)},
@@ -279,6 +342,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
              {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
               .prepared = std::move(normalized)},
              mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
+  observe(step.graph, "attention_qkv_packed", b.fullPacked, step.rows, geometry_.packedFullWidth);
   // The q/k projection stores each row's key and value in its page slot.
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
                                      b.fullQueries, step.kvLayers[layer], pageTables, sequences, rows,
@@ -331,6 +395,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
       {b.fullPacked, b.attentionHidden, lastRows ? ops::AttentionOutput::Last : ops::AttentionOutput::Every,
        b.linearScratch, lastRows ? ops::LinearInput::Plain : outputPlan.input()},
       mixer.sinks);
+  observe(step.graph, "attention_gated_hidden", b.attentionHidden, step.outputRows(), geometry_.attentionWidth);
   // The read rows' residual rows, gathered into the normalized rows the
   // input projection has read.
   metal::MetalBuffer residual = std::move(output.residual);
@@ -373,12 +438,14 @@ void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights 
                                       metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.outputRows());
+  observe(step.graph, "moe_norm", b.normalized, step.outputRows(), geometry_.hiddenSize);
   step.ffn = {.input = b.normalized, .residual = std::move(residual), .output = std::move(output), .scratch = b.moe};
   if (const QwenTargetDecodeBuffers *d = step.decode) {
     step.ffn.lanes = d->step.lanes;
     step.ffn.laneRows = b.laneRows;
   }
   ops::MoE::addRouting(step.graph, step.ffn, ffn, *step.moe);
+  observe(step.graph, "moe_route_weights", b.moe.routingWeights, step.outputRows(), step.moe->shape().routesPerToken(), 4);
 }
 
 void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm,
@@ -388,10 +455,12 @@ void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWe
   const ops::LinearPlan plan = linear.plan(vocabularyProjection(), rows);
   const ops::PreparedInput normalized = ops::Normalization::addRms(
       graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize, rows, scratch, plan.input());
+  observe(graph, "head_norm", finalHidden, rows, geometry_.hiddenSize);
   linear.add(graph,
-             {.input = std::move(finalHidden), .output = std::move(logits), .scratch = scratch,
+             {.input = finalHidden, .output = logits, .scratch = scratch,
               .prepared = normalized},
              vocabularyProjection(), plan);
+  observe(graph, "target_logits", logits, rows, geometry_.vocabularySize, 4);
 }
 
 void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,
@@ -458,23 +527,38 @@ private:
     const Layer &layer = weights_.layers[index];
     const QwenTargetPrefillBuffers &b = step.buffers;
     const metal::MetalBuffer input = b.hidden[index & 1];
+    if (warmupTrace_) {
+      warmupTrace_->layer = index;
+      warmupTrace_->laneRows = step.decode ? b.laneRows : metal::MetalBuffer{};
+      observe(step.graph, "layer_input", input, step.rows, geometry_.hiddenSize);
+    }
     planOutputRows(step, index);
     const metal::MetalBuffer residual = std::visit(
         [&](const auto &mixer) {
           const ops::PreparedInput normalized = ops::Normalization::addRms(
               step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch,
               operators_.linear().plan(mixer.inputProjection, step.rows).input());
+          observe(step.graph, "mixer_norm", b.normalized, step.rows, geometry_.hiddenSize);
           const BlockOutput block{mixerOutput(b, mixer), input};
           addPrefillMixer(step, mixer, normalized, block);
           return block.rows;
         },
         layer.mixer);
+    observe(step.graph, "mixer_residual", residual, step.outputRows(), geometry_.hiddenSize);
     addPrefillFfn(step, index, layer, residual, step.readRows.empty() ? b.hidden[(index & 1) ^ 1] : input);
   }
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const { return qwenMoeBlock(weights_.layers[index]); }
   void addPrefillExperts(PrefillStep &step, uint32_t index) const {
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
+    if (warmupTrace_ && step.moe) {
+      const auto shape = step.moe->shape();
+      const auto routes = shape.routesPerToken(), rows = step.outputRows();
+      observe(step.graph, "moe_grouped_input", b.moe.groupedInput, rows, shape.hiddenSize, 2, routes, b.moe.routeRows);
+      observe(step.graph, "moe_gate_up", b.moe.expertIntermediate, rows, shape.expertIntermediateSize, 2, routes, b.moe.routeRows);
+      observe(step.graph, "moe_down", b.moe.expertOutput, rows, shape.hiddenSize, 2, routes, b.moe.routeRows);
+      observe(step.graph, "moe_combine", step.ffn.output, rows, shape.hiddenSize);
+    }
     addReadRows(step, b.hidden[index & 1], b.hidden[(index & 1) ^ 1]);
     // The draft reads a decode step's every row of the layers it captures.
     if (step.decode) {
