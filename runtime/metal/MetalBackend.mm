@@ -1348,9 +1348,19 @@ struct MetalBackend::Impl {
                     item.pipeline =
                         pipelines.find(PipelineKeyView{item.source->pipelineName, item.source->constants})->second;
         }
-        for (const PreparedDispatch &item : dispatches)
-            if (item.threadCount > item.pipeline.maxTotalThreadsPerThreadgroup)
-                throw MetalBackendError("threadsPerThreadgroup exceeds pipeline capability");
+        for (const PreparedDispatch &item : dispatches) {
+            const NSUInteger maximum = item.pipeline.maxTotalThreadsPerThreadgroup;
+            if (item.threadCount > maximum) {
+                std::ostringstream message;
+                message << "threadsPerThreadgroup exceeds pipeline capability for '" << item.source->pipelineName
+                        << "': requested " << item.threads.width << 'x' << item.threads.height << 'x'
+                        << item.threads.depth << " (" << item.threadCount << "), maxTotalThreadsPerThreadgroup="
+                        << maximum << ", threadExecutionWidth=" << item.pipeline.threadExecutionWidth;
+                for (size_t i = 0; i < item.source->constants.size(); ++i)
+                    message << ", constant[" << i << "]=" << item.source->constants[i];
+                throw MetalBackendError(message.str());
+            }
+        }
     }
 
     // Creates the pipelines of `keys`, none of them cached, together
