@@ -20,10 +20,12 @@
 #include <array>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <map>
 #include <optional>
+#include <random>
 #include <ranges>
 #include <set>
 #include <span>
@@ -132,10 +134,11 @@ std::vector<uint32_t> prompt(uint64_t seed, uint32_t tokens) {
   return result;
 }
 
-protocol::RequestFrame frame(uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+protocol::RequestFrame frame(uint64_t id, std::vector<uint32_t> tokens, uint32_t output,
+                             engine::RequestPriority priority = engine::RequestPriority::Normal) {
   protocol::RequestFrame result;
   result.requestId = id;
-  result.priority = engine::RequestPriority::Normal;
+  result.priority = priority;
   result.constraint = ConstraintMode::None;
   // An hour, on the fixture's unix clock (1 s).
   result.absoluteDeadlineUnixMicros = 1'000'000 + 3'600'000'000ULL;
@@ -145,9 +148,10 @@ protocol::RequestFrame frame(uint64_t id, std::vector<uint32_t> tokens, uint32_t
   return result;
 }
 
-// Three workers' prompts: 59,043 tokens first and 12,200 more a round, the
+// Three workers' prompts: `first` tokens first and `step` more a round, the
 // workers a few tokens apart; every fourth round resends the previous
-// conversation and 8 tokens more. Output: 1504 tokens, whole commands.
+// conversation and 8 tokens more. Output: `output` tokens. By default 59,043,
+// 12,200 and 1504, whole commands.
 struct ChurnPrompts final {
   uint32_t first = 59'043, step = 12'200;
   std::array<int32_t, 3> offsets{-23, 11, 0};
@@ -235,9 +239,10 @@ struct Serving final {
   }
 
   // Sends a request now.
-  void submit(uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+  void submit(uint64_t id, std::vector<uint32_t> tokens, uint32_t output,
+              engine::RequestPriority priority = engine::RequestPriority::Normal) {
     submittedAt[id] = fixture.monotonic;
-    require(fixture.loop.receive(protocol::peer::serialize(frame(id, std::move(tokens), output))),
+    require(fixture.loop.receive(protocol::peer::serialize(frame(id, std::move(tokens), output, priority))),
             "a request frame was refused");
   }
   [[nodiscard]] bool active(uint64_t id) const { return submittedAt.contains(id) && !ended.contains(id); }
@@ -248,6 +253,7 @@ struct Serving final {
     for (const protocol::EngineEvent &event : reader.feed(fixture.output)) {
       if (const auto *done = std::get_if<protocol::DoneEvent>(&event)) {
         ended.insert(done->requestId);
+        endings[done->requestId] = {done->completionTokens, done->reason};
       } else if (const auto *error = std::get_if<protocol::ErrorEvent>(&event)) {
         ended.insert(error->requestId);
         errors.push_back(std::to_string(error->requestId) + " " + error->code + ": " + error->message);
@@ -306,14 +312,17 @@ struct Serving final {
   double lastCommandEnd = 0.0;
   std::map<uint64_t, double> submittedAt;
   std::set<uint64_t> ended;
+  // How each request that completed ended: its output and finish reason.
+  std::map<uint64_t, std::pair<uint32_t, engine::EngineFinishReason>> endings;
   std::vector<std::string> errors;
   protocol::peer::EventReader reader;
 };
 
-// Three closed-loop workers arriving in `order` 0.6 s apart, until
-// `endMilliseconds`; each step observed.
+// Three closed-loop workers sending `prompts`, arriving in `order` 0.6 s
+// apart, until `endMilliseconds`; each step observed.
 struct Churn final {
-  Churn(Serving &serving, std::array<uint32_t, 3> order) : serving(serving) {
+  Churn(Serving &serving, std::array<uint32_t, 3> order, const ChurnPrompts &prompts)
+      : serving(serving), prompts(prompts) {
     for (uint32_t rank = 0; rank < 3; ++rank)
       next[order[rank]] = serving.now() + 600.0 * rank;
   }
@@ -371,15 +380,23 @@ struct Churn final {
 // One decode command of `decoders` lanes at the experts' `share`,
 // `spillLanes` of them reading spilled K/V.
 double decodeCommand(const test::TimingProfile &profile, uint32_t decoders, double share, uint32_t spillLanes) {
-  return test::decodeTimes(profile, decoders, decoders * model::ExecutionLimits::targetVerifyRows, share, spillLanes)
+  return test::decodeTimes(profile, decoders, decoders * model::ExecutionLimits::draftQueryRows, share, spillLanes)
       .wallMilliseconds;
 }
 
 // --- Scenarios -----------------------------------------------------------------------------------------------
 
-// A 15-minute churn through a host episode short of critical pressure keeps
-// the store, turning it at most once a host level, with bounded gaps and waits.
-void testChurnKeepsTheStoreThroughAHostEpisode() {
+// What one churn through the host episode found: its checks' failures, and
+// its requests and longest decode gap against the run's bound.
+struct ChurnEpisode final {
+  std::string failures;
+  size_t finished = 0;
+  double longestGap = 0.0, gapLimit = 0.0;
+};
+
+// A 15-minute churn of `prompts` through a host episode short of critical
+// pressure.
+ChurnEpisode churnThroughAHostEpisode(const ChurnPrompts &prompts) {
   const Machine &machine = kStudio18G;
   constexpr double episode = 300'000.0, warningEnd = 420'000.0, release = 600'000.0, end = 900'000.0;
   constexpr double episodeEnd = release + 60'000.0;
@@ -390,7 +407,7 @@ void testChurnKeepsTheStoreThroughAHostEpisode() {
   Serving serving(machine, {{episode, episodeOther, engine::MemoryPressure::Warning},
                             {warningEnd, episodeOther, engine::MemoryPressure::Normal},
                             {release, machine.otherBytes, engine::MemoryPressure::Normal}});
-  Churn churn(serving, {2, 0, 1});
+  Churn churn(serving, {2, 0, 1}, prompts);
   uint64_t last = serving.experts->state().currentBytes;
   int direction = 0;
   std::map<int, uint32_t> turnsByLevel;  // per level of the host: 1 warning, 2 short, 3 the minute after
@@ -410,22 +427,101 @@ void testChurnKeepsTheStoreThroughAHostEpisode() {
     oldestClaim = std::max(oldestClaim, serving.memory().claims.oldestMilliseconds);
   });
   const engine::EngineSnapshot counts = serving.fixture.loop.statusSnapshot();
-  const double gapLimit = counts.scheduler.decodeGapTargetMilliseconds +
-                          decodeCommand(*machine.profile, 3, double(machine.store.floor) / machine.store.whole, 3);
-  const double longestGap = serving.fixture.loop.metricsSnapshot().decodeGap.maximumMilliseconds;
-  require(churn.finished.size() >= 6, at(machine) + "the churn finished " + std::to_string(churn.finished.size()) +
-                                          " requests in 15 minutes");
-  require(longestGap <= gapLimit, at(machine) + "a decode gap of " + std::to_string(longestGap) +
-                                      " ms passed the run's bound and a decode command, " + std::to_string(gapLimit) +
-                                      " ms");
-  require(oldestClaim < engine::kResourceWaitTimeoutMilliseconds && counts.failed == 0,
-          at(machine) + "a request waited " + std::to_string(oldestClaim) + " ms for memory, or failed");
+  ChurnEpisode result{.finished = churn.finished.size(),
+                      .longestGap = serving.fixture.loop.metricsSnapshot().decodeGap.maximumMilliseconds,
+                      .gapLimit = counts.scheduler.decodeGapTargetMilliseconds +
+                                  decodeCommand(*machine.profile, 3,
+                                                double(machine.store.floor) / machine.store.whole, 3)};
+  const auto check = [&](bool held, const std::string &failure) {
+    if (!held)
+      result.failures += "; " + failure;
+  };
+  check(result.finished >= 6, "the churn finished " + std::to_string(result.finished) + " requests in 15 minutes");
+  check(result.longestGap <= result.gapLimit, "a decode gap of " + std::to_string(result.longestGap) +
+                                                  " ms passed the run's bound and a decode command, " +
+                                                  std::to_string(result.gapLimit) + " ms");
+  check(oldestClaim < engine::kResourceWaitTimeoutMilliseconds && counts.failed == 0,
+        "a request waited " + std::to_string(oldestClaim) + " ms for memory, or failed");
   for (const auto &[level, turns] : turnsByLevel)
-    require(turns <= 1, at(machine) + "the store changed direction " + std::to_string(turns) +
-                            " times at one host level (" + std::to_string(level) + ")");
-  require(!episodeShrank, at(machine) + "the host's episode took a store unit short of critical pressure");
-  note(at(machine) + std::to_string(churn.finished.size()) + " requests, longest decode gap " +
-       std::to_string(longestGap) + " ms of " + std::to_string(gapLimit));
+    check(turns <= 1, "the store changed direction " + std::to_string(turns) + " times at one host level (" +
+                          std::to_string(level) + ")");
+  check(!episodeShrank, "the host's episode took a store unit short of critical pressure");
+  return result;
+}
+
+// A workload of the churn, for a failure's message and a note.
+std::string describe(const ChurnPrompts &prompts) {
+  return "a first prompt of " + std::to_string(prompts.first) + " tokens, rounds of " + std::to_string(prompts.step) +
+         ", outputs of " + std::to_string(prompts.output);
+}
+
+// The churn through the host episode in each of `workloads` keeps the store, turning it at most once a host level,
+// with bounded gaps and waits; a failure names every workload that broke a check.
+void churnsKeepTheirBounds(std::span<const ChurnPrompts> workloads) {
+  const Machine &machine = kStudio18G;
+  std::string failures;
+  ChurnEpisode longest;
+  ChurnPrompts most;
+  for (const ChurnPrompts &prompts : workloads) {
+    const ChurnEpisode run = churnThroughAHostEpisode(prompts);
+    if (!run.failures.empty())
+      failures += "\n  " + describe(prompts) + run.failures;
+    if (run.longestGap > longest.longestGap) {
+      longest = run;
+      most = prompts;
+    }
+  }
+  require(failures.empty(), at(machine) + "the churn broke its bounds at" + failures);
+  note(at(machine) + std::to_string(workloads.size()) + " workloads, the longest decode gap " +
+       std::to_string(longest.longestGap) + " ms of " + std::to_string(longest.gapLimit) + " at " + describe(most) +
+       ", " + std::to_string(longest.finished) + " requests");
+}
+
+// A 15-minute churn through a host episode short of critical pressure keeps
+// the store, turning it at most once a host level, with bounded gaps and
+// waits, in a workload where a lane converts to Spill owing its copies
+// (testChurnKeepsItsBoundsWhereLanesConvert): the cheapest of four under
+// ThreadSanitizer, which runs this scenario alone of the churn's, 115 s
+// against 117 for the churn's own workload.
+void testChurnKeepsTheStoreThroughAHostEpisode() {
+  constexpr ChurnPrompts kWorkload{.first = 56'043};
+  churnsKeepTheirBounds(std::span(&kWorkload, 1));
+}
+
+// The same churn in its own workload, which converts no lane, and in each
+// workload around it where 1.6.1 broke the decode gap bound as a lane
+// converted to Spill, the decision at the memory wall the bound guards there:
+// of the 45 of rounds of 10,700 to 13,700 tokens and the 40 of first prompts
+// of 53,043 to 65,043, both with outputs of 904 to 2,404, a lane converts in
+// 19 and 1.6.1 broke the bound in 12, at up to 1,069 ms against 838: in the 7
+// here whose lane's history had its copies, as the lane sat out the command
+// it converted in, and in 5 owing them, the 4 here and the one above, as the
+// next pass ran before the copies landed. The other 7 take the same two paths
+// within the bound and are left out, 36 s of this scenario's 98.
+// What the bound guards here now is the wait of the prefill's next unit for a
+// decoder whose memory lands (Scheduler::waitsUntil): without it the 5 owing
+// their copies break the bound again, at 1,063 to 1,069 ms. The wait covers
+// the 7 whose history had its copies too: they pass, at the same longest
+// gaps, without the conversion's release of its landed pages
+// (Engine::EngineVictims::take), by which the lane runs in the command it
+// converts for. That release is engine's to guard
+// (testAConversionWithCopiesRunsInTheCommandItConvertsFor), as the wait's end
+// with its lanes and its time is (testAUnitsWaitEndsWithItsLanes,
+// testAUnitsWaitRunsOutWithoutACommand).
+void testChurnKeepsItsBoundsWhereLanesConvert() {
+  constexpr std::array<ChurnPrompts, 12> kWorkloads{{{},
+                                                     {.step = 11'200, .output = 1504},
+                                                     {.step = 11'600, .output = 1504},
+                                                     {.step = 11'900, .output = 1504},
+                                                     {.step = 12'500, .output = 1204},
+                                                     {.step = 13'200, .output = 1904},
+                                                     {.first = 53'043, .output = 1204},
+                                                     {.first = 54'543, .output = 1204},
+                                                     {.first = 57'543, .output = 1204},
+                                                     {.first = 57'543, .output = 1504},
+                                                     {.first = 63'543, .output = 1204},
+                                                     {.first = 65'043, .output = 1904}}};
+  churnsKeepTheirBounds(kWorkloads);
 }
 
 // The engine harness running `profile`'s commands on its clock, a pass a
@@ -760,18 +856,130 @@ void testAColdPromptStartsWithinTheOvertakesAmidCachedResends() {
        " cached resends");
 }
 
+// Guard: random schedules of four requests on the Studio at 1 GiB less than 18G: prompts of 80K to 110K tokens, which
+// memory holds only in part, as a conversation tree (each of the later three, in half the cases, an earlier one's
+// conversation up to a random page of it and 2,000 to 20,000 tokens of its own), outputs of 64 to 1,504 tokens, each
+// priority, arrivals within 2 s, and three seconds of macOS's critical pressure between the first minute and the
+// third; then a short Normal turn on the first conversation's opening pages, 10 to 60 s after it arrived, which
+// placement may start Resident on a Spill lane's prefix. Spill lanes keep their pages Full, so the lanes' growth and
+// reads, the starts and the host's critical passes release the pages whose copies landed, between commands. Nothing
+// breaks an engine rule (std::logic_error), the cache's invariants hold after every step, no claim's count of what it
+// takes covered its need where its takes then did not (MemoryLedger::CountChecks), no lane yields outside the
+// critical pressure and the 5 s after it where none yields at twice the limit, and each request ends as it does where
+// the limit and the host hold every request, at twice the limit: with the same output and finish reason (the fake
+// model's tokens do not depend on the K/V it reads). SPLASH_SIM_RELEASE_SEEDS runs more seeds than the four.
+void testRandomSchedulesWithReleasesEndAsWithoutThem() {
+  Machine tight = kStudio18G;
+  tight.name = "studio-17g";
+  tight.limitBytes -= 1ULL << 30;
+  Machine ample = kStudio18G;
+  ample.name = "studio-ample";
+  ample.limitBytes *= 2;
+  ample.hostBytes *= 2;
+  uint64_t releases = 0;
+  const char *seeds = std::getenv("SPLASH_SIM_RELEASE_SEEDS");
+  const uint32_t count = seeds ? static_cast<uint32_t>(std::stoul(seeds)) : 4;
+  for (uint32_t seed = 1; seed <= count; ++seed) {
+    std::mt19937 random(seed);
+    const auto pick = [&](uint32_t first, uint32_t last) {
+      return std::uniform_int_distribution<uint32_t>(first, last)(random);
+    };
+    struct Arrival final {
+      double at = 0.0;
+      uint64_t id = 0;
+      std::vector<uint32_t> tokens;
+      uint32_t output = 0;
+      engine::RequestPriority priority = engine::RequestPriority::Normal;
+    };
+    std::vector<Arrival> schedule;
+    for (uint64_t id = 1; id <= 4; ++id) {
+      Arrival arrival{.at = double(pick(0, 20)) * 100.0,
+                      .id = id,
+                      .tokens = prompt(1'000 * seed + id, pick(80'000, 110'000)),
+                      .output = 8 * pick(8, 188),
+                      .priority = static_cast<engine::RequestPriority>(pick(0, 2))};
+      if (id > 1 && pick(0, 1)) {
+        const Arrival &parent = schedule[pick(0, static_cast<uint32_t>(id) - 2)];
+        const uint32_t pages = pick(1, static_cast<uint32_t>(parent.tokens.size() / engine::KvCache::pageTokens));
+        arrival.at = std::max(arrival.at, parent.at);
+        std::vector<uint32_t> tokens(parent.tokens.begin(),
+                                     parent.tokens.begin() + pages * engine::KvCache::pageTokens);
+        const std::vector<uint32_t> more = prompt(9'000 + 10 * seed + id, pick(2'000, 20'000));
+        tokens.insert(tokens.end(), more.begin(), more.end());
+        arrival.tokens = std::move(tokens);
+      }
+      schedule.push_back(std::move(arrival));
+    }
+    Arrival turn{.at = schedule.front().at + double(pick(10, 60)) * 1'000.0, .id = 5, .output = 64};
+    turn.tokens.assign(schedule.front().tokens.begin(),
+                       schedule.front().tokens.begin() + pick(32, 256) * engine::KvCache::pageTokens);
+    const std::vector<uint32_t> question = prompt(9'500 + seed, 1'000);
+    turn.tokens.insert(turn.tokens.end(), question.begin(), question.end());
+    schedule.push_back(std::move(turn));
+    std::ranges::sort(schedule, {}, &Arrival::at);
+    const double critical = double(pick(60, 180)) * 1'000.0;
+    const std::vector<test::HostEvent> script{
+        {critical, kStudio18G.otherBytes, engine::MemoryPressure::Critical},
+        {critical + 3'000.0, kStudio18G.otherBytes, engine::MemoryPressure::Normal}};
+    // The tight run's yields outside the critical pressure and the 5 s after it.
+    size_t calmYields = 0;
+    const auto run = [&](const Machine &machine) {
+      Serving serving(machine, &machine == &tight ? script : std::vector<test::HostEvent>{});
+      size_t next = 0, yields = 0;
+      calmYields = 0;
+      const auto observe = [&] {
+        if (!serving.fixture.loop.commandInFlight())
+          serving.fixture.cache.checkInvariants();
+        const size_t now = serving.fixture.executor.suspendedIds.size();
+        if (now != yields && (serving.now() < critical || serving.now() > critical + 8'000.0))
+          calmYields += now - yields;
+        yields = now;
+      };
+      while (serving.ended.size() < schedule.size()) {
+        for (; next < schedule.size() && schedule[next].at <= serving.now(); ++next)
+          serving.submit(schedule[next].id, schedule[next].tokens, schedule[next].output, schedule[next].priority);
+        const double arrival = next < schedule.size() ? schedule[next].at : std::numeric_limits<double>::infinity();
+        const size_t ended = serving.ended.size();
+        serving.run([&] { return serving.ended.size() != ended || serving.now() >= arrival; }, observe,
+                    "the schedule did not move", 1'800'000.0);
+        require(serving.now() < 1'800'000.0, at(machine) + "seed " + std::to_string(seed) +
+                                                  ": the requests did not end within 30 minutes");
+      }
+      require(serving.errors.empty(), at(machine) + "seed " + std::to_string(seed) + ": a request failed: " +
+                                          (serving.errors.empty() ? std::string() : serving.errors.front()));
+      const engine::MemoryLedger::CountChecks checks = serving.fixture.governor->snapshot().countChecks;
+      require(checks.overcountedRuns == 0,
+              at(machine) + "seed " + std::to_string(seed) + ": " + std::to_string(checks.overcountedRuns) + " of " +
+                  std::to_string(checks.coveredRuns) + " claims whose count covered their need took less");
+      releases += serving.fixture.cache.spillSnapshot().releases;
+      return serving.endings;
+    };
+    const auto ends = run(tight);
+    const size_t tightYields = calmYields;
+    require(ends == run(ample), "seed " + std::to_string(seed) +
+                                    ": a request ended otherwise than where the limit and the host hold them all");
+    require(calmYields != 0 || tightYields == 0,
+            "seed " + std::to_string(seed) + ": " + std::to_string(tightYields) +
+                " lanes yielded at the tight limit outside the critical pressure, none at twice the limit");
+  }
+  require(releases != 0, "no schedule released a lane's pages");
+  note("random schedules with " + std::to_string(releases) + " releases ended as where nothing was short");
+}
+
 } // namespace
 
 std::span<const test::TestCase> simTests() {
   static constexpr test::TestCase kTests[] = {
       {"testLongPromptBesideTwoDecoders", testLongPromptBesideTwoDecoders},
       {"testChurnKeepsTheStoreThroughAHostEpisode", testChurnKeepsTheStoreThroughAHostEpisode},
+      {"testChurnKeepsItsBoundsWhereLanesConvert", testChurnKeepsItsBoundsWhereLanesConvert},
       {"testRegrowthAfterABurstTakesOnlyCacheThatFreesNow", testRegrowthAfterABurstTakesOnlyCacheThatFreesNow},
       {"testCriticalTakesTheMarginASecondAndKeepsTheResumePoint",
        testCriticalTakesTheMarginASecondAndKeepsTheResumePoint},
       {"testAResendStartsBesideARefusedLongerPrompt", testAResendStartsBesideARefusedLongerPrompt},
       {"testAColdPromptStartsWithinTheOvertakesAmidCachedResends",
        testAColdPromptStartsWithinTheOvertakesAmidCachedResends},
+      {"testRandomSchedulesWithReleasesEndAsWithoutThem", testRandomSchedulesWithReleasesEndAsWithoutThem},
   };
   return kTests;
 }

@@ -5,11 +5,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// The column tile of kernels/shared/moe_gguf.metal: a GEMV of few rows in registers. Lane l of a simdgroup owns
-// output column `column`, decodes its column's groups of 32 into registers (dequant32_chunks) and multiplies each
-// weight into the fp32 sums of its rows: no stage, no barrier, Rows FMAs per weight. The staged tile runs a
-// dequantize, barrier and matmul chain per 32-input step on padded 8-row MPP tiles, which bounds it at few rows, not
-// DRAM, so the column tile runs the MoE expert tiles of one or two live rows (moe_column_tile). Includers set
+// The column tile of kernels/shared/moe_gguf.metal and kernels/decode/linear_gguf_column.metal: a GEMV of few rows
+// in registers. Lane l of a simdgroup owns output column `column`, decodes its column's groups of 32 into registers
+// (dequant32_chunks) and multiplies each weight into the fp32 sums of its rows: no stage, no barrier, Rows FMAs per
+// weight. The staged tile runs a dequantize, barrier and matmul chain per 32-input step on padded 8-row MPP tiles,
+// which bounds it at few rows, not DRAM, so the column tile runs the MoE expert tiles and the decode projections of at
+// most GGUF_COLUMN_ROWS live rows (moe_column_tile, ops::LinearTile::GgufColumn). Includers set
 // `#pragma clang fp reassociate(off)` first.
 
 // Each row's sum over groups [g_begin, g_end) of K, of its first `rows` rows (at most Rows): per group one fp32 chain
@@ -65,13 +66,14 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
   }
 }
 
-// column_dot in the run-time format `format` (uniform per threadgroup), after its pair table, which every thread of
-// the threadgroup fills.
-template <ushort Rows>
+// column_dot in the run-time format `format` (uniform per threadgroup), for each format `formats` switches to, after
+// its pair table, which every thread of the threadgroup fills.
+template <ushort Rows, class Formats>
 inline void column_dot_any(uint format, device const bfloat *x, uint rows, uint input_size, device uchar *w0,
                            device uchar *w1, device uchar *meta, uint column, uint g_begin, uint g_end,
-                           threadgroup half2 *tl, uint thread_index, uint threads, thread float (&sums)[Rows]) {
-  quant_format_switch(format, [&](auto f) {
+                           threadgroup half2 *tl, uint thread_index, uint threads, thread float (&sums)[Rows],
+                           Formats formats) {
+  formats(format, [&](auto f) {
     typedef decltype(f) F;
     quant_pair_table<F>(tl, thread_index, threads);
     column_dot<F, Rows>(x, rows, input_size, w0, w1, meta, column, g_begin, g_end, tl, sums);

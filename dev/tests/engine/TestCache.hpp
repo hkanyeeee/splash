@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace splash::test {
@@ -54,7 +55,11 @@ inline std::vector<uint64_t> indexBlocks(engine::Cache &cache, uint64_t requestI
 // no lane in service (MemoryLedger::free).
 inline engine::VictimQuery query(const engine::ClaimSpec &spec, const engine::Need &need, bool critical = false,
                                  const engine::RestoredChains *kept = nullptr) {
-  return {.rights = engine::takeRights(spec, need, critical, std::nullopt), .need = need, .kept = kept};
+  return {.rights = engine::takeRights(spec, need,
+                                       critical ? engine::MemoryPressure::Critical : engine::MemoryPressure::Normal,
+                                       std::nullopt),
+          .need = need,
+          .kept = kept};
 }
 
 // What the ledger takes of the cache for a claim of `spec` that lacks
@@ -76,7 +81,7 @@ inline engine::FreeResult freeFromCache(engine::Cache &cache, const engine::Clai
   ledger.setReturning([&cache] { return cache.returning(); },
                       [&cache](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
   const engine::ClaimId claim = ledger.open(spec);
-  const engine::FreeResult result = ledger.free(claim, need, 0, false);
+  const engine::FreeResult result = ledger.free(claim, need, 0, engine::MemoryPressure::Normal);
   ledger.close(claim);
   return result;
 }
@@ -119,6 +124,17 @@ inline engine::FreeResult releaseStep(engine::Cache &cache, engine::ReclaimClass
 }
 inline engine::FreeResult stateStep(engine::Cache &cache, engine::ReclaimClass reach = engine::ReclaimClass::Ordinary) {
   return takeStep(cache, {.cls = engine::ClaimClass::InService, .reach = reach}, {.stateBuffers = 1});
+}
+// Every state's buffers a claim of `spec` takes of the cache, a state at a
+// time as the ledger frees one for it (freeFromCache), until one gives
+// nothing: Pending once a write it waits for starts. Returns the states
+// taken.
+inline uint32_t takeStates(engine::Cache &cache, const engine::ClaimSpec &spec) {
+  uint32_t taken = 0;
+  while (freeFromCache(cache, spec, {.stateBuffers = 1}).gave())
+    if (++taken > cache.snapshot().stateCache.entries + 1000)
+      throw std::logic_error("taking states did not end");
+  return taken;
 }
 
 } // namespace splash::test

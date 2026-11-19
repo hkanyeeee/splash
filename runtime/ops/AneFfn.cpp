@@ -109,6 +109,16 @@ uint32_t AneFfn::units(std::span<const SwiGluProjections> layers) {
   return layers.front().gate->outputSize / kChannelUnit;
 }
 
+std::string AneFfn::calibrationKey(std::span<const SwiGluProjections> layers, const Linear &linear) {
+  if (const char *reason = unsupported(layers)) throw std::invalid_argument(reason);
+  std::string key = "ane-ffn calibration";
+  for (const SwiGluProjections &layer : layers)
+    for (const Projection *projection : {layer.gate, layer.up, layer.down})
+      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":g" +
+             std::to_string(projection->blocks().segments.front().formatId);
+  return key + " int8-activations " + (linear.int8Activations() == Int8Activations::On ? "on" : "off");
+}
+
 namespace {
 
 // The rotation a weight kernel applies: over gate's and up's hidden inputs,
@@ -394,13 +404,13 @@ std::string AneFfn::program(const Shape &shape, std::span<const Input> inputs, c
   return text + "}\n";
 }
 
-AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-               std::function<bool()> interrupted)
-    : AneFfn(backend, layers, aneUnits, std::move(interrupted), functionRows()) {}
+AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
+               uint32_t aneUnits, std::function<bool()> interrupted)
+    : AneFfn(backend, linear, layers, aneUnits, std::move(interrupted), functionRows()) {}
 
-AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-               std::function<bool()> interrupted, std::span<const uint32_t> functionRows)
-    : backend_(backend), linear_(backend.capabilities()), shape_(shapeOf(layers, aneUnits)),
+AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<const SwiGluProjections> layers,
+               uint32_t aneUnits, std::function<bool()> interrupted, std::span<const uint32_t> functionRows)
+    : backend_(backend), linear_(linear), shape_(shapeOf(layers, aneUnits)),
       handoff_(backend, kHandoffBound) {
   // What Metal allocates, which the memory audit compares with the plan.
   memory_ = allocate(
@@ -421,8 +431,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
 
   for (const SwiGluProjections &source : layers)
     layers_.push_back({{Planes(*source.gate), Planes(*source.up), Planes(*source.down)},
-                       source.gate->leadingRows(backend_, shape_.gpu),
-                       source.up->leadingRows(backend_, shape_.gpu),
+                       source.gate->rows(backend_, {{0, shape_.gpu}}),
+                       source.up->rows(backend_, {{0, shape_.gpu}}),
                        source.down->leadingInputs(shape_.gpu)});
 
   const std::vector<Input> inputs = programInputs(shape_, memory_);
@@ -559,7 +569,7 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
   }
   const uint64_t ready = ane ? handoff_.next() : 0;
   if (ane) graph.signal(handoff_.event(), ready);
-  linear_.addPrefillSwiGlu(graph, {&current.gate, &current.up, &current.down}, ffn, residual, output, rows);
+  linear_.addSwiGlu(graph, {&current.gate, &current.up, &current.down}, ffn, residual, output, rows);
   if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
   const uint64_t done = ane ? handoff_.next() : 0;
   if (ane) graph.wait(handoff_.event(), done);
@@ -700,14 +710,14 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
     for (uint32_t layer = 0; layer < count; ++layer) {
       const metal::MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
       if (way == Way::Gpu)
-        linear_.addPrefillSwiGlu(graph, layers[layer], ffn, residual, output, rows);
+        linear_.addSwiGlu(graph, layers[layer], ffn, residual, output, rows);
       else
         encode(graph, layer, ffn, residual, output, rows, way == Way::Split ? Parts::Both : Parts::Gpu);
     }
     if (way == Way::Split) {
       static_cast<void>(commit(graph, {}).wait());
       if (!completed())
-        throw std::runtime_error("ANE FFN split of " + std::to_string(rows) + " rows failed (" + reason() + ")");
+        throw ane::Refused("ANE FFN split of " + std::to_string(rows) + " rows failed (" + reason() + ")");
     } else {
       static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
     }
@@ -725,7 +735,7 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
     const std::vector<float> split = forward(Way::Split, count, rows);
     const auto fail = [&](const std::string &why) {
       handoff_.retire("its output of " + std::to_string(rows) + " rows " + why);
-      throw std::runtime_error("ANE FFN split's output of " + std::to_string(rows) + " rows " + why);
+      throw ane::Refused("ANE FFN split's output of " + std::to_string(rows) + " rows " + why);
     };
     double difference = 0.0, contribution = 0.0;
     for (size_t i = 0; i < split.size(); ++i) {

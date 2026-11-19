@@ -175,6 +175,9 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
       Executor &executor = h.model;
       Events &events = h.events;
       engine::Engine &engine = h.engine;
+      // The test counts every state's buffers taken; a decode that captures
+      // states takes those of the page the 4127-token prompt's output reaches.
+      executor.decodeStateCaptures = false;
       if (disk) {
         executor.deniedReservations = 1000;
         executor.stateTier = std::make_shared<OffloadControl>();
@@ -962,6 +965,9 @@ void suspendWithoutTheReplayPoint(test::EngineHarness &h, double &now, const std
   Executor &executor = h.model;
   Events &events = h.events;
   engine::Engine &engine = h.engine;
+  // Its decode captures no state (Model::capturesInDecode), so the deepest
+  // state it holds is its replay point.
+  executor.decodeStateCaptures = false;
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
   executor.beginGrowthBlocked = [&executor] {
     return executor.lastBeginId == 2 && executor.requests.at(1).resident;
@@ -1193,150 +1199,6 @@ void testCheckpointsSkipNearResumeAndReplayBoundaries() {
           "a request checkpointed within a chunk of the state it resumed from");
 }
 
-void testGenerationCheckpointLifecycle() {
-  test::TestKvStorage storage(128, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  Executor executor(1);
-  executor.decodeFinishes = false;
-  executor.decodeTokens = 8;
-  executor.captureGenerationState = true;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
-  std::vector<uint32_t> prompt(64, 7);
-  double now = 1;
-  for (uint64_t id : {1ULL, 2ULL}) {
-    auto input = request(id, prompt);
-    input.maxNewTokens = 192;
-    engine.submit(input);
-    test::tickUntil(engine, now, [&] { return idle(engine); },
-              "generation did not finish");
-    require(events.outputs[id].size() == 192 && events.completedCount == id &&
-                events.failedCount == 0,
-            "generation checkpoint changed output or failed duplicate request");
-    const auto snapshot = engine.snapshot();
-    require(snapshot.resources.stateCache.checkpointEntries == 1,
-            "rolling generation checkpoints accumulated");
-    require(snapshot.checkpointPublications == (id == 1 ? 4U : 7U),
-            "duplicate generation state was published instead of reused");
-  }
-  auto next = prompt;
-  next.insert(next.end(), 192, 42);
-  next.push_back(17);
-  require(cache.probe(next, {}).cachedTokens() == 224,
-          "generation checkpoint missing at exact last page");
-  const uint32_t computed = executor.prefillRows;
-  engine.submit(request(3, next));
-  test::tickUntil(engine, now, [&] { return idle(engine); }, "follow-up did not finish");
-  require(events.starts.back() == 224 && executor.prefillRows - computed == 33 &&
-              events.failedCount == 0,
-          "follow-up did not restore the generated prefix exactly");
-
-  auto input = request(4, std::vector<uint32_t>(64, 19));
-  input.maxNewTokens = 192;
-  engine.submit(input);
-  test::tickUntil(engine, now, [&] { return events.outputs[4].size() >= 64; },
-            "cancel fixture never decoded");
-  const uint64_t published = engine.snapshot().checkpointPublications;
-  auto held = std::make_shared<std::atomic<bool>>(false);
-  executor.holdDecodeUntil = held;
-  test::tickUntil(engine, now, [&] { return engine.commandInFlight(); },
-            "cancel fixture has no command");
-  engine.cancel(4);
-  held->store(true);
-  test::tickUntil(engine, now, [&] { return idle(engine); },
-            "cancelled capture did not drain");
-  require(engine.snapshot().checkpointPublications == published &&
-              engine.snapshot().cancelled == 1,
-          "cancelled decode published its captured state");
-}
-
-void testAlignedGenerationCheckpointLifecycle() {
-  test::TestKvStorage storage(128, 4096, 4);
-  KvPool pool(storage, 0);
-  engine::Cache cache(pool, nullptr, nullptr);
-  Executor executor(1);
-  executor.decodeFinishes = false;
-  executor.decodeTokens = 7;
-  executor.captureAlignedGenerationState = true;
-  Events events;
-  engine::Engine engine(test::engineConfig(), cache, executor, events);
-  guardReleases(storage, engine);
-  std::vector<uint32_t> prompt(64, 7);
-  double now = 1;
-  for (uint64_t id : {1ULL, 2ULL}) {
-    auto input = request(id, prompt);
-    input.maxNewTokens = 224;
-    engine.submit(input);
-    test::tickUntil(engine, now, [&] { return idle(engine); },
-              "generation did not finish");
-    require(events.outputs[id].size() == 224 && events.completedCount == id &&
-                events.failedCount == 0,
-            "generation checkpoint changed output or failed duplicate request");
-    const auto snapshot = engine.snapshot();
-    require(snapshot.resources.stateCache.checkpointEntries == 1,
-            "rolling generation checkpoints accumulated");
-    require(snapshot.checkpointPublications == (id == 1 ? 7U : 13U),
-            "duplicate generation state was published instead of reused");
-  }
-  auto next = prompt;
-  next.insert(next.end(), 224, 42);
-  next.push_back(17);
-  require(cache.probe(next, {}).cachedTokens() == 288,
-          "generation checkpoint missing at exact last page");
-  const uint32_t computed = executor.prefillRows;
-  engine.submit(request(3, next));
-  test::tickUntil(engine, now, [&] { return idle(engine); }, "follow-up did not finish");
-  require(events.starts.back() == 288 && executor.prefillRows - computed == 1 &&
-              events.failedCount == 0,
-          "follow-up did not restore the generated prefix exactly");
-
-  auto input = request(4, std::vector<uint32_t>(64, 19));
-  input.maxNewTokens = 224;
-  engine.submit(input);
-  test::tickUntil(engine, now, [&] { return events.outputs[4].size() >= 91; },
-            "cancel fixture never decoded");
-  const uint64_t published = engine.snapshot().checkpointPublications;
-  auto held = std::make_shared<std::atomic<bool>>(false);
-  executor.holdDecodeUntil = held;
-  test::tickUntil(engine, now, [&] { return engine.commandInFlight(); },
-            "cancel fixture has no command");
-  engine.cancel(4);
-  held->store(true);
-  test::tickUntil(engine, now, [&] { return idle(engine); },
-            "cancelled capture did not drain");
-  require(engine.snapshot().checkpointPublications == published &&
-              engine.snapshot().cancelled == 1,
-          "cancelled decode published its captured state");
-}
-
-void testGeneratedCaptureUsesClaimAndSurvivesRefusal() {
-  for (const bool refuse : {false, true}) {
-    test::EngineHarness h({.pages = 128, .memory = test::FakeMemory::Config{},
-                           .shape = [](Executor &model) {
-                             model.maximumLanes = 1;
-                             model.decodeFinishes = false;
-                             model.decodeTokens = 7;
-                             model.captureAlignedGenerationState = true;
-                           }});
-    // Actual fake allocations use the real governor. A reservation during
-    // submit(), without a claim, fails just as the real model did. Refusing
-    // generated captures must leave the same complete output and no wait.
-    if (refuse)
-      h.model.reservationRoom = [&] { return h.model.requests.at(1).generated == 0; };
-    auto input = h.request(1, std::vector<uint32_t>(64, 7));
-    input.maxNewTokens = 224;
-    h.engine.submit(input);
-    h.runUntilIdle();
-    require(h.events.outputs[1].size() == 224 && h.events.completedCount == 1 && h.events.failedCount == 0,
-            "optional generated capture changed output or stalled on refusal");
-    require(h.model.reservationAttempts > 1, "generated state admission was not exercised");
-    require((h.engine.snapshot().checkpointPublications != 0) == !refuse,
-            "generated state was published without admitted buffers, or was never captured");
-  }
-}
-
 void testMessageCheckpointRetainsRecoveryPoint() {
   struct Environment final {
     std::optional<std::string> previous;
@@ -1428,7 +1290,6 @@ void probeMessageOffload(bool enabled, bool pressure, unsigned backing) {
     require(held.state.has_value(), "checkpoint lease absent");
     block = held.state->kvBlock();
   }
-  bool wrote = false;
   auto control = std::make_shared<OffloadControl>();
   control->ready = true;
   if (backing == 1) {
@@ -1441,24 +1302,24 @@ void probeMessageOffload(bool enabled, bool pressure, unsigned backing) {
               return std::make_unique<OffloadTicket>(control);
             }, true), "fixture disk publication refused");
     cache.publishCompositeState(block, std::make_shared<State>(executor.evictedStateBytes), true);
-    require(!cache.recycleMessageCheckpoint(cache.checkpointState(block), wrote) && !wrote,
+    require(!cache.recycleMessageCheckpoint(cache.checkpointState(block)),
             "pending disk copy was treated as durable");
     control->ready = true;
     require(cache.pollTransfers(), "fixture disk copy did not finish");
     require(cache.snapshot().stateCache.diskBytes == 64, "fixture disk copy absent");
   }
   const auto checkpoint = cache.checkpointState(block);
-  require(!cache.recycleMessageCheckpoint({}, wrote) && !wrote, "empty handle changed cache");
-  require(!cache.recycleMessageCheckpoint({block, checkpoint.publication + 1}, wrote) && !wrote,
+  require(!cache.recycleMessageCheckpoint({}), "empty handle changed cache");
+  require(!cache.recycleMessageCheckpoint({block, checkpoint.publication + 1}),
           "stale handle changed cache");
   {
     auto held = cache.lookup(fork, {});
     require(held.state.has_value(), "pin fixture absent");
-    require(!cache.recycleMessageCheckpoint(checkpoint, wrote) && !wrote,
+    require(!cache.recycleMessageCheckpoint(checkpoint),
             "pinned RAM checkpoint was recycled");
   }
   if (backing == 0)
-    require(!cache.recycleMessageCheckpoint(checkpoint, wrote) && !wrote,
+    require(!cache.recycleMessageCheckpoint(checkpoint),
             "unwritable checkpoint was recycled");
   const bool retained = !pressure || (enabled && backing != 0);
   const auto before = engine.snapshot();
@@ -1526,11 +1387,7 @@ void testMessageOffloadLifecycle() {
 std::span<const test::TestCase> checkpointsTests() {
   static constexpr test::TestCase kTests[] = {
       {"testMessageOffloadLifecycle", testMessageOffloadLifecycle},
-      {"testGenerationCheckpointLifecycle", testGenerationCheckpointLifecycle},
-      {"testAlignedGenerationCheckpointLifecycle", testAlignedGenerationCheckpointLifecycle},
-      {"testGeneratedCaptureUsesClaimAndSurvivesRefusal", testGeneratedCaptureUsesClaimAndSurvivesRefusal},
       {"testMessageCheckpointRetainsRecoveryPoint", testMessageCheckpointRetainsRecoveryPoint},
-
       {"testConcurrentProgressRetainsAtMostOnePointPerLane", testConcurrentProgressRetainsAtMostOnePointPerLane},
       {"testSharedCheckpointSurvivesPeerRollingReplacement", testSharedCheckpointSurvivesPeerRollingReplacement},
       {"testRepeatedRetriesRollTheRestoredCheckpoint", testRepeatedRetriesRollTheRestoredCheckpoint},

@@ -1,5 +1,3 @@
-#include <cstdlib>
-#include <cstdio>
 #include "engine/StateCache.hpp"
 
 #include "engine/DiskLabels.hpp"
@@ -112,6 +110,7 @@ bool StateCache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
     throw std::logic_error("composite state outlived its target KV block");
   }
   Entry &entry = found->second;
+  // A checkpoint's reuse leaves its reply as it was; makeOrdinary clears an ordinary one's.
   if (!checkpoint)
     makeOrdinary(kvBlock, entry);
   if (!entry.pins)
@@ -228,6 +227,25 @@ bool StateCache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   return erase(checkpoint.kvBlock, true).evicted;
 }
 
+void StateCache::markReply(StateCheckpoint checkpoint) noexcept {
+  const auto found = entries_.find(checkpoint.kvBlock);
+  if (found == entries_.end() || !found->second.checkpoint || found->second.publication != checkpoint.publication)
+    return;
+  found->second.reply = Reply::Opportunistic;
+  kv_.noteReply(checkpoint.kvBlock);
+  // A reclaim no longer writes it: it leaves its order of writes.
+  reindex(checkpoint.kvBlock, found->second);
+}
+
+void StateCache::keepReply(StateCheckpoint checkpoint) noexcept {
+  const auto found = entries_.find(checkpoint.kvBlock);
+  if (found == entries_.end() || found->second.publication != checkpoint.publication ||
+      found->second.reply != Reply::Opportunistic)
+    return;
+  found->second.reply = Reply::Kept;
+  reindex(checkpoint.kvBlock, found->second);
+}
+
 bool StateCache::checkpointPinned(StateCheckpoint checkpoint) const noexcept {
   const auto found = entries_.find(checkpoint.kvBlock);
   return found != entries_.end() && found->second.checkpoint &&
@@ -241,6 +259,7 @@ void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   --checkpointEntries_;
   checkpointBytes_ -= entry.ram ? entry.ram->bytes() : 0;
   entry.checkpoint = false;
+  entry.reply = Reply::None;
   // A crash before the next clean stop must not leave it a checkpoint the
   // next process retires.
   if (entry.disk && !entry.invalid)
@@ -393,8 +412,7 @@ uint64_t StateCache::lastUsed(uint64_t kvBlock) const noexcept {
 
 bool StateCache::reclaimWrites(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
-  return found != entries_.end() && found->second.ram && !found->second.disk &&
-         found->second.ram->canOffload(inUse(kvBlock));
+  return found != entries_.end() && writer(found->second) && found->second.ram->canOffload(inUse(kvBlock));
 }
 
 bool StateCache::takesWrite(bool inUse) const noexcept {
@@ -419,7 +437,7 @@ StateCache::Reclaims StateCache::reclaims(bool inUse, std::span<const uint64_t> 
     if (found == entries_.end() || !candidate(kvBlock, found->second) || this->inUse(kvBlock))
       continue;
     --candidates;
-    writers -= result.writes && !found->second.disk && found->second.ram->writable() ? 1 : 0;
+    writers -= result.writes && writer(found->second) ? 1 : 0;
   }
   // The walk's order: checkpoints, ordinary states, states in use.
   if (!pending_ && writers) {
@@ -457,7 +475,7 @@ KvCache::StateMarks StateCache::marks(uint64_t kvBlock, const Entry &target) con
   // does it need its KV as it is.
   const bool leaves = candidate(kvBlock, target) && !target.disk;
   KvCache::Keeps keeps = used ? KvCache::keepBit(Keep::Used) : 0;
-  if (leaves && target.ram->writable())
+  if (leaves && writer(target))
     keeps |= KvCache::keepBit(used ? Keep::UsedWriter : Keep::Writer);
   return {.keeps = keeps, .needed = !leaves, .candidate = candidate(kvBlock, target)};
 }
@@ -565,9 +583,6 @@ bool StateCache::pollOffload() {
   PendingOffload done = std::move(*pending_);
   pending_.reset();
   const bool written = done.transfer->finish();
-  if (std::getenv("SPLASH_LOCAL_OPTIMIZATION_TRACE"))
-    std::fprintf(stderr, "LOCAL_STATE_OFFLOAD_FINISHED block=%llu success=%u\n",
-      (unsigned long long)done.kvBlock, unsigned(written));
   // A failure counts even when its entry left or changed meanwhile.
   if (!written)
     ++offloadFailures_;
@@ -746,8 +761,8 @@ void StateCache::labelDisk(uint64_t kvBlock, const Entry &target) const {
 }
 
 // RAM copies wait for eviction in one order per class: checkpoints,
-// ordinary states, states in use, the writable ones without a disk copy in
-// an order of the class's writes too. Disk copies wait for replacement as
+// ordinary states, states in use, those a reclaim writes (writer) in an
+// order of the class's writes too. Disk copies wait for replacement as
 // redundant copies or as the only copy, of a state in use or not. A pinned
 // or invalid entry, a copy being written, or a RAM copy a write reads, is in
 // no order.
@@ -758,7 +773,7 @@ void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
   const bool used = inUse(kvBlock);
   if (candidate(kvBlock, target)) {
     (used ? inUse_ : target.checkpoint ? checkpoints_ : ordinary_).link(target.ramNode, target.lastUsed, kvBlock);
-    if (!target.disk && target.ram->writable())
+    if (writer(target))
       (used ? inUseWrites_ : target.checkpoint ? checkpointWrites_ : ordinaryWrites_)
           .link(target.writeNode, target.lastUsed, kvBlock);
   }

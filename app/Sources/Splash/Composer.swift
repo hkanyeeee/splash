@@ -1,20 +1,68 @@
 import AppKit
+import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The message being written: its text and the images attached to it.
+/// The message being written in each chat, the open one's in the composer: its text and what is
+/// attached to it, kept as files in the store's attachments folder as it attaches
+/// (`ChatStore.attachments`), which become the message's once it is taken; one taken off goes.
+/// Each chat has its own, so that what one holds, a message the server holds or one that comes
+/// back, never shows in another's composer, to be sent there or mixed with what is written there.
 @MainActor @Observable
 final class Draft {
-    var text = ""
-    private(set) var images: [Data] = []
-    /// How many attached images are still being encoded, which join `images` once they are.
-    private(set) var attaching = 0
-    /// The attachment that joins `images` last, which the next one waits for.
+    /// What a chat's draft holds.
+    private struct Kept {
+        /// Which draft it is, for what is attached to it to join it wherever it has gone by the
+        /// time it is kept (`carry`).
+        let id = UUID()
+        var text = ""
+        var attachments: [Attachment] = []
+        var thumbnails: [UUID: NSImage] = [:]
+        var attaching = 0
+        var notice: String?
+
+        /// Whether it holds no message, nor one being attached.
+        var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty && attaching == 0 }
+    }
+
+    /// The drafts, by their chat's conversation, nil for a new chat.
+    private var drafts: [UUID?: Kept] = [:]
+    /// The open chat, whose draft the composer shows.
+    private let chat: @MainActor () -> UUID?
+
+    var text: String {
+        get { drafts[chat()]?.text ?? "" }
+        set {
+            guard newValue != text else { return }
+            drafts[chat(), default: Kept()].text = newValue
+            drafts[chat()]?.notice = nil
+        }
+    }
+    var attachments: [Attachment] { drafts[chat()]?.attachments ?? [] }
+    /// The images attached, as the composer shows them, by attachment.
+    var thumbnails: [UUID: NSImage] { drafts[chat()]?.thumbnails ?? [:] }
+    /// How many attached images are still being encoded and kept, which join `attachments` once
+    /// they are.
+    var attaching: Int { drafts[chat()]?.attaching ?? 0 }
+    /// The attachment that joins its draft last, which the next one waits for.
     private var lastAttachment: Task<Void, Never>?
     /// Asks the text field for the keyboard; counts the requests.
     private(set) var focusRequests = 0
+    /// What the composer says over the message until the draft changes or its message is taken:
+    /// why the server refused what the draft holds or a reply asked again (`restore`), or a file
+    /// that couldn't be attached. A message sent again says it until the server answers, rather
+    /// than taking it away for the frames a refusal takes to say it again.
+    var notice: String? { drafts[chat()]?.notice }
+    /// Where attachments are kept.
+    let files: URL
 
-    var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && images.isEmpty }
+    /// `chat` tells the open chat, nil for a new one.
+    init(files: URL, chat: @escaping @MainActor () -> UUID? = { nil }) {
+        self.files = files
+        self.chat = chat
+    }
+
+    var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty }
 
     func focus() { focusRequests += 1 }
 
@@ -22,25 +70,147 @@ final class Draft {
     /// limit is about four million pixels), PNG when they have transparency and JPEG otherwise.
     /// They are encoded away from the main thread, which a photo would hold for a tenth of a second
     /// or more, and join the draft in the order they were attached.
-    func attach(_ images: [NSImage]) {
+    func attach(_ images: [NSImage], unreadable: Int = 0) {
         let sources = images.compactMap { $0.cgImage(forProposedRect: nil, context: nil, hints: nil) }
-        guard !sources.isEmpty else { return }
-        attaching += sources.count
-        let encoding = Task.detached(priority: .userInitiated) { sources.compactMap(Self.encoded) }
+        let missed = images.count - sources.count + unreadable
+        guard !sources.isEmpty else {
+            if missed > 0 { drafts[chat(), default: Kept()].notice = Self.unattached(missed) }
+            return
+        }
+        let draft = startAttaching(sources.count)
+        let files = files
+        let encoding = Task.detached(priority: .userInitiated) {
+            sources.compactMap { source in Self.encoded(source).flatMap { Self.kept($0, in: files) } }
+        }
         let previous = lastAttachment
         lastAttachment = Task {
             await previous?.value
-            self.images += await encoding.value
-            attaching -= sources.count
+            let encoded = await encoding.value
+            update(draft) { draft in
+                for (attachment, data) in encoded {
+                    draft.attachments.append(attachment)
+                    draft.thumbnails[attachment.id] = NSImage(data: data)
+                }
+                draft.attaching -= sources.count
+                let failed = missed + sources.count - encoded.count
+                if failed > 0 { draft.notice = Self.unattached(failed) }
+            }
         }
     }
 
-    func remove(at index: Int) { images.remove(at: index) }
+    private static func unattached(_ failed: Int) -> String {
+        failed == 1 ? "An image couldn’t be attached" : "\(failed) images couldn’t be attached"
+    }
 
-    /// Takes the message, leaving the draft empty.
-    func take() -> (text: String, images: [Data]) {
-        defer { text = ""; images = [] }
-        return (text.trimmingCharacters(in: .whitespacesAndNewlines), images)
+    /// Attaches the PDFs at `urls` as they are, with their names and pages, read and kept away from
+    /// the main thread, in the order they were attached; one PDFKit can't open still attaches, for
+    /// the server to say why.
+    func attach(pdfs urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        let draft = startAttaching(urls.count)
+        let files = files
+        let reading = Task.detached(priority: .userInitiated) { urls.map { ($0, Self.keptPDF($0, in: files)) } }
+        let previous = lastAttachment
+        lastAttachment = Task {
+            await previous?.value
+            let read = await reading.value
+            update(draft) { draft in
+                draft.attachments += read.compactMap(\.1)
+                draft.attaching -= urls.count
+                let failed = read.filter { $0.1 == nil }.map { $0.0.lastPathComponent }
+                if let first = failed.first {
+                    draft.notice = failed.count == 1 ? "“\(first)” couldn’t be read" : "\(failed.count) PDFs couldn’t be read"
+                }
+            }
+        }
+    }
+
+    /// Counts `count` attachments under way in the open chat's draft, and names the draft, which
+    /// they join once kept, in whichever chat it is by then (`update`).
+    private func startAttaching(_ count: Int) -> UUID {
+        var draft = drafts[chat()] ?? Kept()
+        draft.attaching += count
+        drafts[chat()] = draft
+        return draft.id
+    }
+
+    /// Changes draft `id` in whichever chat it is now, a new chat it went with (`carry`) or its
+    /// own; nothing where it is gone, with its chat deleted (`forget`).
+    private func update(_ id: UUID, _ change: (inout Kept) -> Void) {
+        guard let found = drafts.first(where: { $0.value.id == id }) else { return }
+        change(&drafts[found.key]!)
+    }
+
+    /// The record of the PDF at `url`, kept as a file in `files`; nil where it can't be read or
+    /// kept.
+    nonisolated private static func keptPDF(_ url: URL, in files: URL) -> Attachment? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let attachment = Attachment(kind: .pdf, type: "application/pdf", bytes: data.count, name: url.lastPathComponent,
+                                    pages: PDFDocument(data: data)?.pageCount)
+        return attachment.write(data, in: files) ? attachment : nil
+    }
+
+    /// Takes attachment `index` off, and its file.
+    func remove(at index: Int) {
+        let chat = chat()
+        guard let attachment = drafts[chat]?.attachments.remove(at: index) else { return }
+        drafts[chat]?.thumbnails[attachment.id] = nil
+        drafts[chat]?.notice = nil
+        let file = files.appending(path: attachment.file)
+        Task.detached { try? FileManager.default.removeItem(at: file) }
+    }
+
+    /// The message as it is sent: the text without the space around it, and what is attached.
+    var message: (text: String, attachments: [Attachment]) {
+        (text.trimmingCharacters(in: .whitespacesAndNewlines), attachments)
+    }
+
+    /// Takes the message out of `chat`'s draft, the chat it was sent in, leaving the draft empty:
+    /// it is its conversation's from then on (`AppState.sendDraft`), and its attachments' files
+    /// with it.
+    func take(from chat: UUID?) {
+        drafts[chat] = nil
+    }
+
+    /// Takes `chat`'s draft into the new chat, without what the composer said of it there, as a
+    /// draft its chat's context cannot hold goes with a new chat (`AppState.newChat`). A new chat
+    /// that holds a draft of its own keeps it, and `chat` its own: neither is lost or joined.
+    func carry(from chat: UUID?) {
+        guard let chat, var draft = drafts[chat], drafts[nil].map(\.isEmpty) ?? true else { return }
+        draft.notice = nil
+        drafts[chat] = nil
+        drafts[nil] = draft
+    }
+
+    /// Forgets the drafts of `chats`, deleted (`AppState.delete`). An attachment of theirs still
+    /// being encoded joins no draft once kept (`update`), and its file goes as the next launch
+    /// finds no chat naming it (`ChatStore.adoptFiles`).
+    func forget(_ chats: Set<UUID>) {
+        for chat in chats { drafts[chat] = nil }
+    }
+
+    /// Takes back `refused`, what a request that came to nothing gives back, in its chat's draft:
+    /// the text the draft gave up before what was typed there since, a blank line apart, its
+    /// attachments before those attached since, and why, where there is a why.
+    func restore(_ refused: ChatStore.Refused) {
+        var draft = drafts[refused.conversation] ?? Kept()
+        if !refused.text.isEmpty {
+            draft.text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? refused.text : "\(refused.text)\n\n\(draft.text)"
+        }
+        draft.attachments.insert(contentsOf: refused.attachments, at: 0)
+        for attachment in refused.attachments where attachment.kind == .image {
+            draft.thumbnails[attachment.id] = NSImage(contentsOf: files.appending(path: attachment.file))
+        }
+        draft.notice = refused.reason
+        drafts[refused.conversation] = draft
+        focus()
+    }
+
+    /// The record of image `data`, kept as a file in `files`, with the data; nil where it can't be
+    /// written.
+    nonisolated private static func kept(_ data: Data, in files: URL) -> (Attachment, Data)? {
+        let attachment = Attachment.image(data)
+        return attachment.write(data, in: files) ? (attachment, data) : nil
     }
 
     nonisolated private static func encoded(_ source: CGImage) -> Data? {
@@ -60,9 +230,15 @@ final class Draft {
     }
 }
 
-/// Where a message is written: the text and the images attached; under them what the Server runs,
-/// how much of the model's context the next prompt takes, how much the model thinks, and Send, or
-/// Stop while a reply streams.
+/// Where a message is written, the open chat's draft: the text and the images attached; under them
+/// what the Server runs, how much of the model's context the next prompt takes, how much the model
+/// thinks, and Send, or Stop while the open chat's request is under way. While the server has yet
+/// to take a new chat's first message (`AppState.sendDraft`), the new chat's composer holds the
+/// message as it was sent: its text and attachments stay and take no change, by typing, pasting,
+/// dropping or their buttons, so that what the chat opens with, or a refusal leaves, is what was
+/// sent, and an attachment's file is there for the request to read; Stop gives the message back to
+/// edit. The composer looks as it did, but for Stop: dimmed meanwhile, its controls would blink at
+/// each message the server takes or refuses at once.
 struct Composer: View {
     @Environment(AppState.self) private var state
     @Environment(\.colorScheme) private var colorScheme
@@ -71,28 +247,47 @@ struct Composer: View {
 
     var body: some View {
         let images = state.server.acceptsImages
+        let held = state.chats.sendingFirstMessage
         VStack(alignment: .leading, spacing: 10) {
-            if !draft.images.isEmpty {
-                Attachments(draft: draft)
+            if let notice = draft.notice {
+                // As a reply says why it stopped short.
+                Label {
+                    Text(notice).foregroundStyle(.secondary)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
+                }
+                .font(.system(size: 12))
             }
-            ComposerField(text: $draft.text, focusRequests: draft.focusRequests,
-                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images,
-                          attach: draft.attach)
+            if !draft.attachments.isEmpty {
+                Attachments(draft: draft, held: held)
+            }
+            ComposerField(text: $draft.text, chat: state.chats.selection, focusRequests: draft.focusRequests,
+                          yields: state.terminalShows, held: held,
+                          placeholder: "Message Splash", submit: state.sendDraft, cancel: stop, acceptsImages: images && !held,
+                          attach: { draft.attach($0, unreadable: $1) }, attachPDFs: { draft.attach(pdfs: $0) })
+                .alignmentGuide(.composerPlain) { $0[.top] - Self.inset }
+            // As the server's stage changes them (`MainView`), a control that goes goes at once, and
+            // one that comes fades in once those beside it have moved, as a row of a page does: as
+            // a switch began, the model's words slid over Attach Images fading out.
             HStack(spacing: 6) {
-                // Only for a model that sees images.
+                // Only for a model that sees images and reads PDFs.
                 if images {
-                    Button { picking = true } label: { Image(systemName: "plus") }
+                    Button { if !held { picking = true } } label: { Image(systemName: "plus") }
                         .foregroundStyle(.secondary)
-                        .help("Attach Images")
-                        .accessibilityLabel("Attach Images")
+                        .help("Attach Images or PDFs")
+                        .accessibilityLabel("Attach Images or PDFs")
+                        .transition(Motion.comingAndGoing)
                 }
                 EngineSlot()
                 Spacer(minLength: 12)
-                if let usage = state.contextUsage {
-                    ContextRing(usage: usage)
-                        .transition(.opacity)
+                if state.showsContext {
+                    ContextRing(usage: state.contextUsage)
+                        .transition(Motion.comingAndGoing)
                 }
                 EffortMenu()
+                // Send turns into Stop at once, as a control's title changes, or as the composer moves
+                // with a new chat's first message: on an animation of its own, the button moved
+                // apart from the composer, ahead of it.
                 Button { if streaming { state.chats.stop() } else { state.sendDraft() } } label: {
                     Image(systemName: streaming ? "stop.fill" : "arrow.up")
                         .font(.system(size: streaming ? 10 : 13, weight: streaming ? .bold : .semibold))
@@ -103,21 +298,33 @@ struct Composer: View {
                 .keyboardShortcut(streaming ? KeyboardShortcut(".", modifiers: .command) : nil)
                 .help(streaming ? "Stop" : help)
                 .accessibilityLabel(streaming ? "Stop" : "Send")
-                .animation(Motion.quick, value: streaming)
             }
             .buttonStyle(.hover)
             // The first control's glyph on the text's edge.
             .padding(.leading, -6)
-            .animation(Motion.settle, value: state.contextUsage == nil)
+            .animation(Motion.settle, value: state.showsContext)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, Self.inset)
         .background(colorScheme == .dark ? AnyShapeStyle(.fill.tertiary) : AnyShapeStyle(.background),
                     in: .rect(cornerRadius: 22))
         .overlay { RoundedRectangle(cornerRadius: 22).strokeBorder(.separator) }
         .shadow(color: .black.opacity(0.06), radius: 14, y: 4)
-        .fileImporter(isPresented: $picking, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
-            draft.attach(((try? result.get()) ?? []).compactMap(NSImage.init(contentsOf:)))
+        .alignmentGuide(.composerTop) { $0[.top] }
+        // What it holds comes and goes at once, and its height with it, whatever else moves: as it
+        // travels between a new chat and a conversation, it is as tall as what it holds then, and
+        // what it holds travels with it. Coming once it had moved, the line that says why left an
+        // empty row as the composer travelled to a new chat opened again, 25 points over its text.
+        .transaction(value: Contents(text: draft.text, attachments: draft.attachments.map(\.id), notice: draft.notice)) {
+            $0.animation = nil
+        }
+        .fileImporter(isPresented: $picking, allowedContentTypes: [.image, .pdf], allowsMultipleSelection: true) { result in
+            let urls = (try? result.get()) ?? []
+            let pdfs = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .pdf) == true }
+            let files = urls.filter { !pdfs.contains($0) }
+            let images = files.compactMap(NSImage.init(contentsOf:))
+            draft.attach(images, unreadable: files.count - images.count)
+            draft.attach(pdfs: pdfs)
         }
         // The ring counts the next prompt as it is written.
         .onChange(of: state.contextRequest, initial: true) { _, request in
@@ -125,19 +332,34 @@ struct Composer: View {
         }
     }
 
-    /// Whether the open conversation's reply streams.
-    private var streaming: Bool {
-        state.chats.streaming != nil && state.chats.streaming == state.chats.current?.id
+    /// The room the composer leaves over what it holds and under its controls: over its text
+    /// where nothing is over it (`VerticalAlignment.composerPlain`). No actor's: the guide reads
+    /// it as SwiftUI computes it, which need not be on the main actor.
+    private nonisolated static let inset: CGFloat = 12
+
+    /// What the composer holds, which it takes at once.
+    private struct Contents: Equatable {
+        let text: String
+        let attachments: [UUID]
+        let notice: String?
     }
+
+    /// Whether a request is under way that Stop stops here (`ChatStore.answering`).
+    private var streaming: Bool { state.chats.answering }
 
     private var help: String {
         if !state.server.answers { return "Available once a model is running" }
-        if !draft.images.isEmpty && !state.server.acceptsImages { return "This model can’t see images" }
+        if draft.attaching > 0 { return "Reading the attachments…" }
+        if let streaming = state.chats.streaming, streaming != state.chats.selection {
+            let title = state.chats.conversations.first { $0.id == streaming }?.title ?? ""
+            return title.isEmpty ? "Wait for the reply in another chat" : "Wait for the reply in “\(title)”"
+        }
+        if let problem = state.attachmentProblem { return problem }
         if let note = state.overflow?.note { return note }
         return "Send"
     }
 
-    /// Stops the open conversation's reply, the way Escape cancels; false when none streams.
+    /// Stops the open chat's request, the way Escape cancels; false when none is under way.
     private func stop() -> Bool {
         guard streaming else { return false }
         state.chats.stop()
@@ -147,24 +369,25 @@ struct Composer: View {
 
 /// How much of the model's context the next prompt takes, as a ring filling clockwise: in the
 /// secondary color while it leaves room for a reply, orange once it leaves less than the reply
-/// allowance, red once the context cannot hold it. Its help gives the exact figures.
+/// allowance, red once the context cannot hold it; empty, with no help, until the chat's prompt is
+/// first counted. Its help gives the exact figures.
 private struct ContextRing: View {
-    let usage: ContextUsage
+    let usage: ContextUsage?
 
     var body: some View {
-        Ring(fraction: usage.fraction, tint: tint, size: 14)
+        Ring(fraction: usage?.fraction ?? 0, tint: tint, size: 14)
             // Room around the ring for the pointer to find its help.
             .padding(5)
             .contentShape(.rect)
             .animation(Motion.settle, value: usage)
-            .help(usage.explanation)
+            .help(usage?.explanation ?? "")
             .accessibilityElement()
             .accessibilityLabel("Context")
-            .accessibilityValue(usage.explanation)
+            .accessibilityValue(usage?.explanation ?? "")
     }
 
     private var tint: AnyShapeStyle {
-        switch usage.level {
+        switch usage?.level ?? .normal {
         case .normal: AnyShapeStyle(.secondary)
         case .tight: AnyShapeStyle(.orange)
         case .full: AnyShapeStyle(.red)
@@ -206,9 +429,12 @@ private struct InkCircle: ButtonStyle {
     }
 }
 
-/// What the Server runs, at the composer's start, which opens the Server: the model's name, the
-/// mark showing what it does; or why nothing answers, with Open Server. Models change on the
-/// Server only.
+/// What the Server runs, at the composer's start: the model's name and the mark showing what it
+/// does, or why nothing answers. It opens the models on this Mac, the one that runs checked, to
+/// start one or switch to it, as the menu bar's panel does (`AppState.choose`), each where it can
+/// start now (`AppState.canStart`), and Manage Models…, which opens the Server; with no model on
+/// this Mac, or none it can start now, as while the Keychain refuses the API key, it opens the
+/// Server itself.
 private struct EngineSlot: View {
     @Environment(AppState.self) private var state
 
@@ -220,18 +446,52 @@ private struct EngineSlot: View {
         case .stopped: state.installed.isEmpty ? "No model on this Mac" : "No model running"
         default: state.status
         }
-        let blocked = if case .failed = server.phase { true } else { server.phase == .stopped }
-        Button { state.section = .server } label: {
-            HStack(spacing: 6) {
-                StatusMark(look: state.serverStatus.look, since: server.since, size: 12)
-                Text(words).foregroundStyle(.secondary)
-                if blocked { Text("Open Server").foregroundStyle(.tint) }
+        let mark = StatusMark(look: state.serverStatus.look, since: server.since, size: 12)
+        if !state.installed.contains(where: { state.canStart($0.id) }) {
+            Button { state.section = .server } label: {
+                HStack(spacing: 6) {
+                    mark
+                    Text(words).foregroundStyle(.secondary).contentTransition(.identity)
+                    Text("Open Server").foregroundStyle(.tint)
+                }
+                .font(.callout)
+                .lineLimit(1)
             }
-            .font(.callout)
-            .lineLimit(1)
-            .truncationMode(.middle)
+            .help("Open Server (⌘1)")
+        } else {
+            // The models by their ids, and Manage Models… by an empty one, which no model has.
+            let models = state.installed.map { model in
+                PopupItem(id: model.id, title: state.displayName(of: model.id), disabled: !state.canStart(model.id))
+            }
+            PopupMenu(header: "Model", items: models + [PopupItem(id: "", title: "Manage Models…", separated: true)],
+                      chosen: state.checkedModel, above: true) { choice in
+                if choice.isEmpty { state.section = .server } else { state.choose(choice) }
+            } label: {
+                HStack(spacing: 6) {
+                    mark
+                    // In place, as a control's title changes: cross-faded as the server's stage
+                    // changed, the words of a switch drew over those of the model before.
+                    Text(words).foregroundStyle(.secondary).contentTransition(.identity)
+                    MenuChevron()
+                }
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                // The mark, the words and the chevron change places within the slot at once as
+                // the words change, while the slot moves whole with the controls beside it: on the
+                // server's stage's animation, the chevron trailed words that grew and drew over
+                // them, and the mark trailed words that moved and drew over their first letter.
+                // Only then, so that the mark's pose, which follows in an update of its own, keeps
+                // its animation.
+                .transaction(value: words) { $0.animation = nil }
+                .geometryGroup()
+            }
+            .help("Start or Switch Models")
+            .accessibilityLabel("Model")
+            .accessibilityValue(words)
         }
-        .help("Open Server (⌘1)")
     }
 }
 
@@ -266,6 +526,7 @@ private struct EffortMenu: View {
                 .padding(.vertical, 4)
             }
             .fixedSize()
+            .transition(Motion.comingAndGoing)
             .help("How much the model thinks before it answers")
             .accessibilityLabel("Thinking")
             .accessibilityValue(Self.title(chosen))
@@ -284,33 +545,40 @@ private struct EffortMenu: View {
     }
 }
 
-/// The images attached to a draft, each with a button that takes it off. Each has a hairline, so
-/// that a white one keeps its edge on the composer, and its button a solid disc, which stands out
-/// over any image in either appearance.
+/// What is attached to a draft, each with a button that takes it off, unless the message is held
+/// as it was sent (`Composer`): an image as itself, a PDF as its name and pages, in red where the
+/// model's limits leave it out. Each has a hairline, so that a white one keeps its edge on the
+/// composer, and its button a solid disc, which stands out over any image in either appearance.
 private struct Attachments: View {
+    @Environment(AppState.self) private var state
     let draft: Draft
+    let held: Bool
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(Array(draft.images.enumerated()), id: \.offset) { index, data in
+                ForEach(Array(draft.attachments.enumerated()), id: \.element.id) { index, attachment in
                     ZStack(alignment: .topTrailing) {
-                        if let image = NSImage(data: data) {
-                            Image(nsImage: image)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 56, height: 56)
-                                .clipShape(.rect(cornerRadius: 10))
-                                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
+                        Group {
+                            if attachment.kind == .pdf {
+                                document(attachment)
+                            } else if let image = draft.thumbnails[attachment.id] {
+                                Image(nsImage: image)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 56, height: 56)
+                            }
                         }
-                        Button { draft.remove(at: index) } label: {
+                        .clipShape(.rect(cornerRadius: 10))
+                        .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
+                        Button { if !held { draft.remove(at: index) } } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .symbolRenderingMode(.palette)
                                 .foregroundStyle(.white, .black.opacity(0.6))
                         }
                         .buttonStyle(.borderless)
                         .offset(x: 6, y: -6)
-                        .accessibilityLabel("Remove Image")
+                        .accessibilityLabel(attachment.kind == .pdf ? "Remove PDF" : "Remove Image")
                     }
                 }
             }
@@ -320,18 +588,49 @@ private struct Attachments: View {
     }
 }
 
+extension Attachments {
+    /// A PDF's chip: its glyph, name and pages, which show in red where the model's limits leave
+    /// it out by itself.
+    private func document(_ attachment: Attachment) -> some View {
+        let over = AppState.attachmentProblem([attachment], vision: true, limits: state.server.limits) != nil
+        return HStack(spacing: 8) {
+            Image(systemName: "doc.text").font(.system(size: 22, weight: .light)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.name ?? "PDF").font(.callout).lineLimit(1).truncationMode(.middle)
+                Text(attachment.details)
+                    .font(.caption)
+                    .foregroundStyle(over ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: 200, minHeight: 56, maxHeight: 56, alignment: .leading)
+        .background(.quaternary.opacity(0.5))
+    }
+}
+
 /// The message's text view: Return sends and Shift-Return starts a new line, and Escape stops the
-/// reply, after the input method has finished what it composes; pasted and dropped images attach
-/// when the model sees images. It is as tall as its text, from one line to 220 points, past which
+/// reply, after the input method has finished what it composes; pasted and dropped images and PDF
+/// files attach when the model takes them. It is as tall as its text, from one line to 220 points, past which
 /// the text scrolls.
 private struct ComposerField: NSViewRepresentable {
     @Binding var text: String
+    /// The chat whose draft `text` is, nil for a new chat.
+    let chat: UUID?
     let focusRequests: Int
+    /// Whether a terminal of the drawer shows, which keeps the keyboard as the field shows
+    /// (`AppState.terminalShows`).
+    let yields: Bool
+    /// Whether the text is held as it was sent (`Composer`): it takes no edit, and keeps the
+    /// keyboard, so that Escape stops the request.
+    let held: Bool
     let placeholder: String
     let submit: () -> Void
     let cancel: () -> Bool
+    /// Whether images and PDFs attach: the model takes them, and the message is not held.
     let acceptsImages: Bool
-    let attach: ([NSImage]) -> Void
+    /// Takes images, and how many of those chosen could not be read.
+    let attach: ([NSImage], Int) -> Void
+    let attachPDFs: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -382,28 +681,39 @@ private struct ComposerField: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.field = self
         guard let view = scroll.documentView as? MessageTextView else { return }
-        // Only a change made elsewhere, as sending the message clears it, goes to the view: the
-        // view's own edits are in `text` already, and what the input method composes is in the
-        // view alone until it is committed.
-        if text != context.coordinator.published {
+        // Only a change made elsewhere, as sending the message clears it, or another chat's
+        // draft goes to the view: the view's own edits are in `text` already, and what the input
+        // method composes is in the view alone until it is committed. Another chat's draft goes
+        // even where its text is the same, so that no edit made in one chat is undone in another.
+        if text != context.coordinator.published || chat != context.coordinator.chat {
             context.coordinator.published = text
+            context.coordinator.chat = chat
             // A change made here is no edit to undo.
             view.string = text
             context.coordinator.undo.removeAllActions()
         }
         if context.coordinator.focusRequests != focusRequests {
+            // A request made before the field showed, as for the Chat a window opens on, gives way
+            // to a terminal shown with it; one made since takes the keyboard.
+            let pending = !context.coordinator.shown
             context.coordinator.focusRequests = focusRequests
-            DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+            if !(pending && yields) {
+                DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+            }
         }
+        context.coordinator.shown = true
     }
 
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var field: ComposerField
         var focusRequests = 0
-        /// The text the view and the draft last agreed on.
+        /// Whether the field has shown, past its first update.
+        var shown = false
+        /// The text the view and the draft last agreed on, and the chat whose draft it is.
         var published = ""
-        /// The field's own edits, which a message sent clears.
+        var chat: UUID?
+        /// The field's own edits, which a message sent or another chat opened clears.
         let undo = UndoManager()
 
         init(_ field: ComposerField) {
@@ -418,6 +728,10 @@ private struct ComposerField: NSViewRepresentable {
             field.text = view.string
         }
 
+        func textView(_ view: NSTextView, shouldChangeTextIn range: NSRange, replacementString: String?) -> Bool {
+            !field.held
+        }
+
         func textView(_ view: NSTextView, doCommandBy selector: Selector) -> Bool {
             switch selector {
             case #selector(NSResponder.insertNewline(_:)):
@@ -428,7 +742,9 @@ private struct ComposerField: NSViewRepresentable {
                 }
                 return true
             case #selector(NSResponder.cancelOperation(_:)):
-                return field.cancel()
+                // Stops a reply; else does nothing, rather than open the text view's completions.
+                _ = field.cancel()
+                return true
             default:
                 return false
             }
@@ -464,7 +780,7 @@ private final class MessageTextView: NSTextView {
 
     // A plain-text view turns Paste off for a clipboard of image data alone.
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
-        if item.action == #selector(paste(_:)), holdsImages(.general) { return true }
+        if item.action == #selector(paste(_:)), holdsAttachments(.general) { return true }
         return super.validateUserInterfaceItem(item)
     }
 
@@ -473,44 +789,49 @@ private final class MessageTextView: NSTextView {
         pasteAsPlainText(sender)
     }
 
-    // A text view takes only text it can read; images it takes here, when the model sees them.
+    // A text view takes only text it can read; images and PDFs it takes here, when the model
+    // takes them.
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        holdsImages(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
+        holdsAttachments(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        holdsImages(sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
+        holdsAttachments(sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         attach(from: sender.draggingPasteboard) || super.performDragOperation(sender)
     }
 
-    /// Attaches the images `pasteboard` holds; false when it holds none to attach.
+    /// Attaches what `pasteboard` holds to attach (`holdsAttachments`): its image and PDF files,
+    /// or, with none, its images; false when it holds none.
     private func attach(from pasteboard: NSPasteboard) -> Bool {
-        let images = images(in: pasteboard)
-        guard !images.isEmpty else { return false }
-        coordinator?.field.attach(images)
+        guard holdsAttachments(pasteboard) else { return false }
+        let pdfs = (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.pdfFiles) as? [URL]) ?? []
+        // A file comes with a picture of itself, which is no image to attach.
+        let files = pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.files)
+            ? (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.imageFiles) as? [URL]) ?? []
+            : nil
+        let images = files?.compactMap(NSImage.init(contentsOf:)) ?? (pasteboard.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []
+        let unreadable = (files?.count ?? images.count) - images.count
+        guard !images.isEmpty || !pdfs.isEmpty || unreadable > 0 else { return false }
+        if !images.isEmpty || unreadable > 0 { coordinator?.field.attach(images, unreadable) }
+        if !pdfs.isEmpty { coordinator?.field.attachPDFs(pdfs) }
         return true
     }
 
-    /// Whether `pasteboard` holds images to attach, when the model sees images: image files, or
-    /// images without text, as copied rich text comes with a picture of itself. Told by their
-    /// types alone: Paste's menu item and every move of a drag ask, so nothing is read until they
-    /// are attached.
-    private func holdsImages(_ pasteboard: NSPasteboard) -> Bool {
+    /// Whether `pasteboard` holds something to attach, when the model takes images and PDFs: image
+    /// or PDF files, or images without text, as copied rich text comes with a picture of itself.
+    /// Told by their types alone: Paste's menu item and every move of a drag ask, so nothing is
+    /// read until they are attached.
+    private func holdsAttachments(_ pasteboard: NSPasteboard) -> Bool {
         guard coordinator?.field.acceptsImages == true else { return false }
-        if pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.imageFiles) { return true }
+        if pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.files) { return true }
         return pasteboard.string(forType: .string) == nil && pasteboard.canReadObject(forClasses: [NSImage.self])
     }
 
-    /// The images `pasteboard` holds to attach (`holdsImages`), image files read.
-    private func images(in pasteboard: NSPasteboard) -> [NSImage] {
-        guard holdsImages(pasteboard) else { return [] }
-        let files = (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.imageFiles) as? [URL]) ?? []
-        if !files.isEmpty { return files.compactMap(NSImage.init(contentsOf:)) }
-        return (pasteboard.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []
-    }
-
     private static let imageFiles: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingContentsConformToTypes: [UTType.image.identifier]]
+    private static let pdfFiles: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingContentsConformToTypes: [UTType.pdf.identifier]]
+    private static let files: [NSPasteboard.ReadingOptionKey: Any] =
+        [.urlReadingContentsConformToTypes: [UTType.image.identifier, UTType.pdf.identifier]]
 }

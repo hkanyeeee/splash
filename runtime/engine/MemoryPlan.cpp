@@ -3,7 +3,6 @@
 #include "engine/Json.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -172,7 +171,7 @@ std::optional<uint64_t> minimumRequiredBytes(uint64_t fixedBytes,
   uint64_t runwayBytes = 0;
   uint64_t dynamicBytes = 0;
   uint64_t result = 0;
-  if (!checkedMultiply(layout.bytesPerModelPage(),
+  if (!checkedMultiply(layout.bytesPerModelPage() + kv::kPageTokens * model::kLookupIndexTokenBytes,
                        kvRunwayPages(layout.minimumExtentPages()), runwayBytes) ||
       !checkedAdd(laneStateBytes, runwayBytes, dynamicBytes) ||
       !checkedAdd(fixedBytes, dynamicBytes, result))
@@ -200,10 +199,11 @@ uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t floorPa
 }
 
 uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorPages, uint32_t extentPages) noexcept {
+  const uint64_t index = uint64_t{kv::kPageTokens} * model::kLookupIndexTokenBytes;
   const auto whole = [&](uint64_t room, kv::PageForm form) {
-    return room / (extentPages * layout.bytesPerModelPage(form)) * extentPages;
+    return room / (extentPages * (layout.bytesPerModelPage(form) + index)) * extentPages;
   };
-  const uint64_t floorBytes = kvPagesBytes(layout, floorPages, floorPages, extentPages);
+  const uint64_t floorBytes = kvPagesBytes(layout, floorPages, floorPages, extentPages) + floorPages * index;
   if (!layout.slimmable() || bytes < floorBytes) return whole(bytes, kv::PageForm::Full);
   return floorPages + whole(bytes - floorBytes, kv::PageForm::Slim);
 }
@@ -356,29 +356,6 @@ void writeJson(json::Writer &w, const EngineMemoryPlan &plan) {
   });
 }
 
-uint64_t EngineMemoryPolicy::workingSetMarginBytes(
-    const DeviceCapabilities &device, uint64_t maximumMemoryBytes) noexcept {
-  const char *option = std::getenv("SPLASH_LOCAL_MEMORY_44G");
-  if (option && std::string_view(option) == "1" &&
-      device.deviceName == "Apple M4 Max" && device.appleGpuFamily == 9 &&
-      device.gpuCoreCount == 40 && device.physicalMemoryBytes == 48 * kGiB &&
-      device.recommendedMaxWorkingSetBytes == 44 * kGiB &&
-      maximumMemoryBytes == 44 * kGiB)
-    return 0;
-  return workingSetMarginBytes(device.recommendedMaxWorkingSetBytes);
-}
-
-uint64_t EngineMemoryPolicy::hardBudgetBytes(
-    const DeviceCapabilities &device, uint64_t maximumMemoryBytes) noexcept {
-  const uint64_t margin = workingSetMarginBytes(device, maximumMemoryBytes);
-  const uint64_t automatic = device.recommendedMaxWorkingSetBytes > margin
-                                ? device.recommendedMaxWorkingSetBytes - margin
-                                : 0;
-  return maximumMemoryBytes && maximumMemoryBytes < automatic
-             ? maximumMemoryBytes
-             : automatic;
-}
-
 EngineMemoryPlanResult
 evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          const ModelMemoryProfile &model,
@@ -414,7 +391,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   }
 
   breakdown.workingSetMarginBytes = EngineMemoryPolicy::workingSetMarginBytes(
-      device, maximumMemoryBytes);
+      breakdown.recommendedWorkingSetBytes);
   if (breakdown.recommendedWorkingSetBytes <=
       breakdown.workingSetMarginBytes) {
     return {std::nullopt,
@@ -424,7 +401,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                     std::move(breakdown))};
   }
   breakdown.hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
-      device, maximumMemoryBytes);
+      breakdown.recommendedWorkingSetBytes, maximumMemoryBytes);
 
   breakdown.kvPageBytes = model.targetKvLayout.bytesPerModelPage();
   breakdown.fixedRuntimeBytes = model.fixedRuntimeBytes();
@@ -454,11 +431,17 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   // Page ids stay 32-bit. One request's KV capacity is the whole extents of
   // the size that leaves the fewest of the budget's pages, priced one by one,
   // unused; a windowed layout's Full and Slim pages take extents of their
-  // own (kvPagesWithin).
+  // own (kvPagesWithin). They are what the budget leaves beside its lane's
+  // state and what a spill-capable target holds from its start
+  // (KvSpillPlan::heldBytes), as a lone start's claim counts them
+  // (Engine::residentRoom), so that the context advertised is one a lone
+  // start takes. Beside the state alone, a Qwen3.8-Flash-Next start that can
+  // spill advertised an extent more than a lone start could take wherever
+  // the room past its last extent was less than its 6,881,280 bytes of Index
+  // runway and tables.
   const uint64_t availableForOneRequestKv =
-      breakdown.dynamicBudgetBytes > breakdown.laneStateBytes
-          ? breakdown.dynamicBudgetBytes - breakdown.laneStateBytes
-          : 0;
+      saturatingSubtract(breakdown.dynamicBudgetBytes,
+                         breakdown.laneStateBytes + (model.spill.enabled ? model.spill.heldBytes() : 0));
   const auto pagesWithin = [&](uint32_t extentPages) {
     return std::min<uint64_t>(
         kvPagesWithin(kvLayout, availableForOneRequestKv, breakdown.kvWindowFloorPages, extentPages),

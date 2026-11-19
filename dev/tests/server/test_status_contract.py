@@ -13,7 +13,7 @@ from dev.tests import native_peer
 from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
 from server import backend as backend_api
 from server import protocol as wire
-from server import supervision
+from server import serve_options, supervision
 from server.chat_format import FLINT, QWEN
 from server.metrics import PROMETHEUS_SERIES, prometheus_metrics
 
@@ -66,6 +66,8 @@ class StatusContractTests(unittest.TestCase):
         self.assertIn('splash_disk_writes_gated{state="no"} 0', lines)
         self.assertIn("splash_disk_read_bytes_total 12345", lines)
         self.assertIn("splash_disk_written_bytes_total 67890", lines)
+        self.assertIn("splash_disk_written_last_hour_bytes 16384", lines)
+        self.assertIn("splash_disk_written_last_day_bytes 65536", lines)
 
     def test_required_leaves_are_exported(self):
         status = json.loads(GOLDEN.read_text())
@@ -400,6 +402,17 @@ class StatusRouteTests(HarnessTestCase):
                 for model in models:
                     self.assertIs(model["vision"], vision)
                     self.assertEqual(model["input_modalities"], modalities)
+                    # What a client checks an attachment against.
+                    self.assertEqual(
+                        model["limits"],
+                        {
+                            "request_bytes": serve_options.DEFAULT_MAX_REQUEST_BYTES,
+                            "images": 64,
+                            "image_bytes": 32 * 1024 * 1024,
+                            "pdf_bytes": 64 * 1024 * 1024,
+                            "pdf_pages": 64,
+                        },
+                    )
                     status, _, detail = harness.request(
                         "GET", f"/v1/models/{model['id']}"
                     )

@@ -7,6 +7,8 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,11 +17,15 @@ from unittest import mock
 from dev.tests.installer_fixtures import DENSE, MODEL, family_config
 from dev.tests.server_fixtures import (
     NO_THINKING_END,
+    FakeRuntime,
+    console_written,
     engine_ready,
+    keep_stop_signals,
     main_args,
     unprepared_hold,
 )
 from install import families
+from server import backend as backend_api
 from server import diagnostics
 from server import protocol as native_wire
 from server import server as api
@@ -181,11 +187,12 @@ class ServerMainTests(unittest.TestCase):
                     status.call_args_list,
                 )
 
-    def main_starting(self, args, runtime, tokenizer=None):
-        """main() over a runtime stand-in, its prints captured: its patches."""
+    def main_starting(self, args, runtime, tokenizer=None, family="Qwen3.8-27B"):
+        """main() over a runtime stand-in, serving a model of `family`, its
+        prints captured: its patches."""
         return (
             mock.patch.object(api, "parse_args", return_value=args),
-            unprepared_hold(),
+            unprepared_hold(family),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer or object()
@@ -304,11 +311,13 @@ class ServerMainTests(unittest.TestCase):
 
     def test_a_start_writes_its_serve_record(self):
         """The record says the server is loading while the engine starts,
-        warming once the engine says it warms up, then, for a start the
-        engine refuses, the engine's class and numbers, as the app reads them
-        (serve_record_golden.json); for one the server refuses, its own
-        class."""
+        warming once the engine says it warms up, with the steps of its
+        warm-up done of all (serve_record_warming_golden.json), then, for a
+        start the engine refuses, the engine's class and numbers, as the app
+        reads them (serve_record_golden.json); for one the server refuses, its
+        own class."""
         record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        warming = json.loads((GOLDEN / "serve_record_warming_golden.json").read_text())
         golden = json.loads((GOLDEN / "serve_record_golden.json").read_text())
         failure = golden["failure"]
         event = native_wire.StartFailedEvent(
@@ -350,7 +359,7 @@ class ServerMainTests(unittest.TestCase):
 
                 def refuse(runtime=runtime, phases=phases, error=error):
                     phases.append(json.loads(record.read_text()))
-                    runtime.on_warming()
+                    runtime.on_warming(native_wire.WarmingEvent(**warming["warmup"]))
                     phases.append(json.loads(record.read_text()))
                     raise error
 
@@ -360,16 +369,12 @@ class ServerMainTests(unittest.TestCase):
                         main_args(serve_record=record), runtime
                     ):
                         stack.enter_context(patch)
-                    stack.enter_context(mock.patch.object(api, "print_status"))
+                    status = stack.enter_context(mock.patch.object(api, "print_status"))
                     with self.assertRaises(SystemExit):
                         api.main()
-                self.assertEqual(
-                    phases,
-                    [
-                        {"pid": 4242, "phase": "loading"},
-                        {"pid": 4242, "phase": "warming"},
-                    ],
-                )
+                self.assertEqual(phases, [{"pid": 4242, "phase": "loading"}, warming])
+                # The console says it too, for a start the app does not follow.
+                status.assert_any_call("Warming up · 3 of 9 steps")
                 self.assertEqual(json.loads(record.read_text()), written)
                 self.assertEqual(list(record.parent.iterdir()), [record])
 
@@ -446,6 +451,38 @@ class ServerMainTests(unittest.TestCase):
                     f"error: {failure['message']}", stderr.read_text().splitlines()
                 )
 
+    def test_an_effort_for_every_request_needs_a_model_that_takes_one(self):
+        """--reasoning-effort stops the start of a model that decides itself
+        whether to reason, before its tokenizer loads, as a refusal of the
+        command line; the frontend of a model that takes an effort gets it."""
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        args = main_args(serve_record=record, reasoning_effort="none")
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(args, mock.Mock(), family="Flint"):
+                stack.enter_context(patch)
+            status = stack.enter_context(mock.patch.object(api, "print_status"))
+            with self.assertRaises(SystemExit):
+                api.main()
+            api.AutoTokenizer.from_pretrained.assert_not_called()
+        message = (
+            "--reasoning-effort cannot set how test-model reasons: a Flint model "
+            "decides each turn whether to reason, whatever effort its prompt names"
+        )
+        status.assert_any_call(f"Error · {message}", error=True)
+        self.assertEqual(
+            json.loads(record.read_text())["failure"],
+            {"kind": "configuration", "message": message},
+        )
+        runtime = mock.Mock()
+        runtime.capabilities = engine_ready(131072)
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_starting(args, runtime):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(api, "check_capabilities"))
+            stack.enter_context(mock.patch.object(api, "print_status"))
+            api.main()
+            self.assertEqual(api.Frontend.call_args.kwargs["reasoning_effort"], "none")
+
     def test_a_port_the_server_cannot_bind_is_recorded_as_the_port(self):
         record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
         with contextlib.ExitStack() as stack:
@@ -485,6 +522,206 @@ class ServerMainTests(unittest.TestCase):
             api.main()
         self.assertEqual(phases, [(True, {"pid": 4242, "phase": "ready"})])
 
+    def test_a_server_that_stops_restarting_its_engine_exits_saying_why(self):
+        """A server whose engine fails past restarting stops as SIGTERM stops
+        it, its engine closed, and exits with status 69 (EX_UNAVAILABLE), its
+        record naming why as the app reads it (serve_record_stopped_golden.json),
+        so that what supervises it, launchd's KeepAlive or the app, sees it end
+        (it went on answering /health, every request refused, until someone
+        restarted it)."""
+        keep_stop_signals(self)
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        runtime = FakeRuntime()
+        refused = native_wire.StartFailedEvent(
+            native_wire.StartFailureKind.CONFIGURATION,
+            native_wire.ShortfallBound.DEVICE_MEMORY,
+            0,
+            0,
+            0,
+            b"--kv-format bf16 is refused",
+        )
+        # The first engine is ready; its relaunch is refused, which every
+        # relaunch would be.
+        runtime.wait_ready = mock.Mock(
+            side_effect=[True, api.engine_runtime.EngineStartFailed(refused)]
+        )
+        server = mock.Mock(server_port=8000)
+
+        def serve():
+            runtime.ready = False
+            runtime.on_engine_failure(
+                api.engine_runtime.EngineUnhealthy("native protocol reached EOF"),
+                1.0,
+                frozenset(),
+                lambda: None,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.fail("still serving after its engine stopped")
+
+        server.serve_forever.side_effect = serve
+        with (
+            mock.patch.object(
+                api, "parse_args", return_value=main_args(serve_record=record)
+            ),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend"),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api, "print_status"),
+            mock.patch.object(backend_api, "print_status") as console,
+            self.assertRaises(SystemExit) as ended,
+        ):
+            api.main()
+        self.assertEqual(ended.exception.code, os.EX_UNAVAILABLE)
+        golden = json.loads((GOLDEN / "serve_record_stopped_golden.json").read_text())
+        self.assertEqual(
+            console.call_args_list[-1].args[0],
+            f"Engine stopped · {golden['failure']['message']}",
+        )
+        self.assertTrue(runtime.closed)
+        server.socket.close.assert_called_once_with()
+        server.server_close.assert_called_once_with()
+        self.assertEqual(json.loads(record.read_text()), golden | {"pid": os.getpid()})
+
+    def main_relaunching(self, record, serve, relaunch=lambda: None):
+        """main() over a real backend and a runtime stand-in whose engine is
+        relaunched: its patches. `serve(fail)` runs once the server is ready,
+        where fail() fails the engine that serves; `relaunch()` runs as the
+        engine started in its place loads."""
+        runtime = FakeRuntime()
+        starts = []
+
+        def wait_ready():
+            starts.append(None)
+            if len(starts) > 1:
+                relaunch()
+            runtime.ready = True
+            return True
+
+        def fail():
+            runtime.ready = False
+            runtime.on_engine_failure(
+                api.engine_runtime.EngineUnhealthy("native protocol reached EOF"),
+                1.0,
+                frozenset(),
+                lambda: None,
+            )
+
+        runtime.wait_ready = wait_ready
+        server = mock.Mock(server_port=8000)
+        server.serve_forever.side_effect = lambda: serve(fail)
+        return (
+            mock.patch.object(
+                api, "parse_args", return_value=main_args(serve_record=record)
+            ),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend"),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api, "print_status"),
+            mock.patch.object(backend_api, "print_status"),
+        )
+
+    def wait_until(self, predicate, what):
+        deadline = time.monotonic() + 5
+        while not predicate():
+            if time.monotonic() >= deadline:
+                self.fail(f"{what} within 5 s")
+            time.sleep(0.01)
+
+    def test_the_record_follows_a_relaunch(self):
+        """The record follows the engine's life, not its first start alone:
+        once the engine of a ready server fails it says recovering, as the
+        app reads it (serve_record_recovering_golden.json), while the engine
+        started in its place loads, and ready again once that one serves,
+        under the same pid (it said ready throughout, so that what supervised
+        the server by the file took the relaunch's load for a runaway)."""
+        keep_stop_signals(self)
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        golden = json.loads(
+            (GOLDEN / "serve_record_recovering_golden.json").read_text()
+        )
+        phases = []
+
+        def read():
+            return json.loads(record.read_text())
+
+        def serve(fail):
+            phases.append(read())
+            fail()
+            self.wait_until(
+                lambda: read()["phase"] == "ready", "the record did not say ready"
+            )
+            phases.append(read())
+
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_relaunching(
+                record, serve, relaunch=lambda: phases.append(read())
+            ):
+                stack.enter_context(patch)
+            api.main()
+        ready = {"pid": os.getpid(), "phase": "ready"}
+        self.assertEqual(phases, [ready, golden | {"pid": os.getpid()}, ready])
+        self.assertEqual(list(record.parent.iterdir()), [record])
+
+    def test_a_ready_server_serves_on_when_its_record_cannot_be_written(self):
+        """A record a ready server cannot write, its directory gone, is a
+        warning line and nothing more: through its engine's failure and the
+        relaunch the server serves on and stops as any other does, where the
+        start's ready record that cannot be written ends the start."""
+        keep_stop_signals(self)
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (directory / "run").mkdir()
+        record = directory / "run/s.json"
+        relaunched = threading.Event()
+        log = self.enterContext(mock.patch("sys.stderr", io.StringIO()))
+        warning = (
+            f" Warning · cannot write the serve record {record}: "
+            "No such file or directory"
+        )
+
+        def warnings():
+            console_written()
+            return log.getvalue().count(warning)
+
+        def serve(fail):
+            (directory / "run").rename(directory / "moved")
+            fail()
+            self.assertTrue(relaunched.wait(5))
+            # One for the failure and one for the relaunch that serves.
+            self.wait_until(lambda: warnings() == 2, "two warnings were not written")
+
+        with contextlib.ExitStack() as stack:
+            for patch in self.main_relaunching(record, serve, relaunch=relaunched.set):
+                stack.enter_context(patch)
+            api.main()
+        self.assertEqual(
+            [line.partition(" ")[2] for line in log.getvalue().splitlines()],
+            [warning.strip()] * 2,
+        )
+        self.assertEqual(
+            json.loads((directory / "moved/s.json").read_text()),
+            {"pid": os.getpid(), "phase": "ready"},
+        )
+
     def test_a_failed_start_whose_record_cannot_be_written_ends_as_it_would(self):
         """With the record's directory gone, a start the server refuses still
         exits with status 1 and an error it does not expect still raises
@@ -519,6 +756,7 @@ class ServerMainTests(unittest.TestCase):
                         api.main()
                 if ends is SystemExit:
                     self.assertEqual(ended.exception.code, 1)
+                console_written()
                 self.assertIn(
                     f"Warning · cannot write the serve record {record}: "
                     "No such file or directory",
@@ -550,6 +788,7 @@ class ServerMainTests(unittest.TestCase):
                 api.main()
         self.assertEqual(ended.exception.code, 1)
         server.serve_forever.assert_not_called()
+        console_written()
         (line,) = log.getvalue().splitlines()
         self.assertTrue(
             line.endswith(
@@ -644,6 +883,7 @@ class ServerMainTests(unittest.TestCase):
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
         backend.close.assert_called_once()
+        console_written()
         self.assertIn("Error · late", stderr.getvalue())
 
     def test_main_rejects_an_unservable_chat_template_before_starting_native(self):
@@ -669,6 +909,7 @@ class ServerMainTests(unittest.TestCase):
         runtime.assert_not_called()
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
+        console_written()
         self.assertIn(
             "Error · the tokenizer defines no chat template", stderr.getvalue()
         )
@@ -691,6 +932,7 @@ class ServerMainTests(unittest.TestCase):
         runtime.assert_not_called()
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
+        console_written()
         self.assertIn("Address already in use", stderr.getvalue())
 
     def test_main_holds_and_serves_the_assembly_its_model_directory_names(self):
@@ -823,7 +1065,105 @@ class ServerMainTests(unittest.TestCase):
         tokenizer.assert_not_called()
         runtime.assert_not_called()
         server.server_close.assert_called_once_with()
+        console_written()
         return stderr.getvalue()
+
+
+class CustomTemplateStartupTests(unittest.TestCase):
+    """main()'s custom chat template, the file --chat-template-file names,
+    read before the tokenizer and the engine."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    def template(self, name, data):
+        path = self.root / name
+        path.write_bytes(data)
+        return path
+
+    def start(self, args):
+        """main() on args up to serving: the ChatTemplates, tokenizer and
+        runtime types it called, and its status lines."""
+        runtime = mock.Mock()
+        runtime.capabilities = engine_ready(131072)
+        with (
+            mock.patch.object(api, "parse_args", return_value=args),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.AutoTokenizer, "from_pretrained", return_value=object()
+            ) as tokenizer,
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END) as templates,
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ) as runtime_type,
+            mock.patch.object(api, "NativeBackend"),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend"),
+            mock.patch.object(
+                api, "FrontendServer", return_value=mock.Mock(server_port=8000)
+            ),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch.object(api, "print_status") as status,
+            contextlib.suppress(SystemExit),
+        ):
+            api.main()
+        return templates, tokenizer, runtime_type, status
+
+    def file_lines(self, status):
+        return [
+            entry.args[0]
+            for entry in status.call_args_list
+            if entry.args[0].startswith("Chat template file")
+        ]
+
+    def test_a_template_file_is_rendered_with(self):
+        data = b"{% for m in messages %}{{ m.content }}{% endfor %}\n"
+        path = self.template("custom template.jinja", data)
+        templates, tokenizer, _, status = self.start(main_args(chat_template_file=path))
+        templates.assert_called_once_with(
+            tokenizer.return_value, override=data.decode()
+        )
+        self.assertEqual(self.file_lines(status), [f"Chat template file · {path}"])
+        # Without one, the tokenizer's templates, and no line.
+        templates, tokenizer, _, status = self.start(main_args())
+        templates.assert_called_once_with(tokenizer.return_value, override=None)
+        self.assertEqual(self.file_lines(status), [])
+
+    def test_a_template_file_it_cannot_use_stops_startup_first(self):
+        # Before the tokenizer loads and the engine starts, and with no
+        # fallback to the model's own templates.
+        for name, path, refusal in (
+            (
+                "an absent file",
+                self.root / "absent.jinja",
+                "cannot read the chat template .*absent.jinja: No such file",
+            ),
+            (
+                "a directory",
+                self.root,
+                "cannot read the chat template .*: Is a directory",
+            ),
+            (
+                "a file that is not UTF-8",
+                self.template("bad.jinja", b"\xff"),
+                "bad.jinja is not UTF-8",
+            ),
+        ):
+            with self.subTest(name):
+                templates, tokenizer, runtime_type, status = self.start(
+                    main_args(chat_template_file=path)
+                )
+                self.assertRegex(
+                    status.call_args_list[-1].args[0], "^Error · .*" + refusal
+                )
+                tokenizer.assert_not_called()
+                templates.assert_not_called()
+                runtime_type.assert_not_called()
 
 
 if __name__ == "__main__":

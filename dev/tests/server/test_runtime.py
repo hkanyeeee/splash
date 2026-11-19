@@ -4,6 +4,7 @@ import os
 import select
 import struct
 import subprocess
+import sys
 import threading
 import time
 import typing
@@ -44,6 +45,9 @@ def f32_sampling(sampling):
 
 
 READY_STATUS = b'{"schema_version":%d,"ready":true}' % wire.STATUS_SCHEMA_VERSION
+# The source of the Ready an engine program of a test's own sends (w:
+# server.protocol).
+READY_SOURCE = "w.ReadyEvent(4, 131072, False, 248320, 9, (248046,))"
 
 
 def answer_status(process, message):
@@ -158,9 +162,12 @@ class RuntimeTests(unittest.TestCase):
             request(
                 300,
                 constraint=wire.ConstraintMode.TOKEN_MASK,
-                mask_provider=lambda event: array(
-                    "I", (1,) * (event.words_per_mask * event.mask_rows)
-                ).tobytes(),
+                mask_provider=lambda event: (
+                    array(
+                        "I", (1,) * (event.words_per_mask * event.mask_rows)
+                    ).tobytes(),
+                    (),
+                ),
             ),
             request(400, priority=wire.RequestPriority.BACKGROUND),
         )
@@ -626,7 +633,9 @@ class RuntimeTests(unittest.TestCase):
 
         def provider(event):
             mask_requests.append(event)
-            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+            return array(
+                "I", (1,) * (event.words_per_mask * event.mask_rows)
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -647,7 +656,9 @@ class RuntimeTests(unittest.TestCase):
         stop = process.stdin.wait_for(wire.StopFrame)[0]
         self.assertFalse(call.cancel())
         self.assertFalse(call.stop())
-        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6)))
+        process.send(
+            wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6), (wire.NO_PARENT, 0))
+        )
         process.send(
             wire.DoneEvent(call.request_id, wire.FinishReason.STOP, 2, 0, 0, 0, 10, ())
         )
@@ -744,7 +755,7 @@ class RuntimeTests(unittest.TestCase):
             provider_called.set()
             return array(
                 "I", range(1, event.words_per_mask * event.mask_rows + 1)
-            ).tobytes()
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -760,7 +771,11 @@ class RuntimeTests(unittest.TestCase):
             )
         )
 
-        process.send(wire.MaskRequestEvent(call.request_id, 987, 2, (5, 6, 7)))
+        process.send(
+            wire.MaskRequestEvent(
+                call.request_id, 987, 2, (5, 6, 7), (wire.NO_PARENT, 0, 1)
+            )
+        )
         response = process.stdin.wait_for(wire.MaskResponseFrame)[0]
         self.assertTrue(provider_called.is_set())
         self.assertTrue(provider_thread[0].startswith("splash-mask"))
@@ -786,13 +801,17 @@ class RuntimeTests(unittest.TestCase):
                     request(
                         30,
                         constraint=wire.ConstraintMode.TOKEN_MASK,
-                        mask_provider=lambda _event, mask=mask: mask,
+                        mask_provider=lambda _event, mask=mask: (mask, ()),
                     )
                 )
                 healthy = runtime.submit(request(40))
 
                 process.send(wire.StartEvent(bad.request_id, 0, 0))
-                process.send(wire.MaskRequestEvent(bad.request_id, 88, 2, (5, 6)))
+                process.send(
+                    wire.MaskRequestEvent(
+                        bad.request_id, 88, 2, (5, 6), (wire.NO_PARENT, 0)
+                    )
+                )
                 cancel = process.stdin.wait_for(wire.CancelFrame)[0]
                 self.assertEqual(cancel.request_id, bad.request_id)
                 process.send(
@@ -833,7 +852,7 @@ class RuntimeTests(unittest.TestCase):
         process = factory.processes[0]
         call = runtime.submit(request(10))
         process.send(wire.StartEvent(call.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
+        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, (), ()))
         with self.assertRaisesRegex(
             engine_runtime.ProtocolFatal, "token mask for an unconstrained request"
         ):
@@ -845,7 +864,7 @@ class RuntimeTests(unittest.TestCase):
 
         def provider(event):
             computed.append(event.mask_request_id)
-            return b""
+            return b"", ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -861,11 +880,11 @@ class RuntimeTests(unittest.TestCase):
             )
         )
         process.send(wire.StartEvent(call.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
+        process.send(wire.MaskRequestEvent(call.request_id, 88, 2, (), ()))
         process.stdin.wait_for(wire.CancelFrame)
         self.assertTrue(call.end_requested)
         self.assertFalse(call.cancel())
-        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, ()))
+        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, (), ()))
         process.send(
             wire.DoneEvent(
                 call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
@@ -914,7 +933,9 @@ class RuntimeTests(unittest.TestCase):
             provider_started.set()
             provider_release.wait(1.0)
             provider_finished.set()
-            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+            return array(
+                "I", (1,) * (event.words_per_mask * event.mask_rows)
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -930,7 +951,9 @@ class RuntimeTests(unittest.TestCase):
             )
         )
         process.send(wire.StartEvent(call.request_id, 0, 0))
-        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6)))
+        process.send(
+            wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6), (wire.NO_PARENT, 0))
+        )
         self.assertTrue(provider_started.wait(1.0))
         self.assertTrue(call.cancel())
         cancel = process.stdin.wait_for(wire.CancelFrame)[0]
@@ -955,7 +978,9 @@ class RuntimeTests(unittest.TestCase):
             calls_to_provider.append(event.request_id)
             started.set()
             release.wait(5.0)
-            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+            return array(
+                "I", (1,) * (event.words_per_mask * event.mask_rows)
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -975,7 +1000,10 @@ class RuntimeTests(unittest.TestCase):
             )
             call._record_start(wire.StartEvent(call.request_id, 0, 0))
             runtime._submit_mask(
-                call, wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6))
+                call,
+                wire.MaskRequestEvent(
+                    call.request_id, 89, 2, (5, 6), (wire.NO_PARENT, 0)
+                ),
             )
             return call
 
@@ -1018,7 +1046,9 @@ class RuntimeTests(unittest.TestCase):
         def provider(event):
             started.set()
             release.wait(5.0)
-            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+            return array(
+                "I", (1,) * (event.words_per_mask * event.mask_rows)
+            ).tobytes(), ()
 
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -1037,7 +1067,7 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
             process.send(wire.StartEvent(call.request_id, 0, 0))
-            process.send(wire.MaskRequestEvent(call.request_id, 1, 2, ()))
+            process.send(wire.MaskRequestEvent(call.request_id, 1, 2, (), ()))
             return call
 
         def cancelled(call):
@@ -1324,23 +1354,24 @@ class RuntimeTests(unittest.TestCase):
 
     def test_the_first_engines_warming_is_heard_before_its_ready(self):
         """The server's start learns that its engine holds its weights and
-        warms up; a relaunched engine's warm-up is a recovery and is not
-        reported."""
-        warming_then_ready = native_peer.serialize_event(
-            wire.WarmingEvent()
-        ) + native_peer.serialize_event(READY)
-        factory = FakeFactory(initial_output=warming_then_ready)
+        warms up, and each step of its warm-up that ends; a relaunched
+        engine's warm-up is a recovery and is not reported."""
+        warming = (wire.WarmingEvent(0, 9), wire.WarmingEvent(1, 9))
+        factory = FakeFactory(
+            initial_output=b"".join(map(native_peer.serialize_event, warming))
+            + native_peer.serialize_event(READY)
+        )
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
         heard = []
-        runtime.on_warming = lambda: heard.append(runtime.ready)
+        runtime.on_warming = lambda event: heard.append((event, runtime.ready))
         self.assertTrue(runtime.wait_ready(1))
-        self.assertEqual(heard, [False])
+        self.assertEqual(heard, [(event, False) for event in warming])
         with mock.patch.object(runtime._crash_trace, "dump"):
             factory.processes[0].kill()
             self.assertTrue(runtime.wait_ready(1))
         self.assertEqual(len(factory.processes), 2)
-        self.assertEqual(heard, [False])
+        self.assertEqual(heard, [(event, False) for event in warming])
 
     def test_engines_after_the_first_ready_run_the_relaunch_command(self):
         # Engines started before any was Ready run the command, and every one
@@ -1767,6 +1798,197 @@ class RuntimeTests(unittest.TestCase):
                 ):
                     runtime.wait_ready(1)
                 self.assertIs(type(caught.exception), kind)
+
+    def test_an_engine_starts_while_the_servers_stderr_stops_draining(self):
+        # The engine writes a line at each request's first token, on its loop.
+        # Here it writes 160 KB before its Ready: on a server stderr that
+        # nobody reads, a pipe of 64 KiB, they would block it before Ready.
+        engine = (
+            "import sys; from dev.tests import native_peer as n; "
+            "from server import protocol as w; "
+            "sys.stderr.write(('x' * 79 + '\\n') * 2000); sys.stderr.flush(); "
+            f"sys.stdout.buffer.write(n.serialize_event({READY_SOURCE})); "
+            "sys.stdout.buffer.flush(); sys.stdin.buffer.read()"
+        )
+        server = "\n".join(
+            (
+                "import sys",
+                "from server import runtime",
+                "native = runtime.MultiplexedRuntime(",
+                f"    (sys.executable, '-c', {engine!r}), pending_limit=1",
+                ")",
+                "try:",
+                "    print(native.wait_ready(5), flush=True)",
+                "except Exception as error:",
+                "    print(type(error).__name__, flush=True)",
+                "native.close()",
+            )
+        )
+        unread, stderr = os.pipe()
+        self.addCleanup(os.close, unread)
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-u", "-c", server],
+                cwd=Path(engine_runtime.__file__).resolve().parents[1],
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                text=True,
+            )
+        finally:
+            os.close(stderr)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.addCleanup(child.stdout.close)
+        self.assertTrue(select.select([child.stdout], [], [], 10)[0])
+        self.assertEqual(child.stdout.readline(), "True\n")
+
+    def test_an_engines_last_lines_come_before_its_failure(self):
+        # An engine says on stderr why it failed as it exits, and what it
+        # saved as it stops once the server fails it. A stop signal only ends
+        # its loop (main.mm): these take SIGTERM only where they wait for it.
+        # The first two end their stdout, which fails them, 0.3 s before their
+        # line: after Ready, which the failure listener reports, or before,
+        # which wait_ready raises. The third sends Ready, then bytes that start
+        # no frame, for which the server fails it.
+        cause = "error: native transport stopped after an engine failure (test)"
+        ready = (
+            f"sys.stdout.buffer.write(n.serialize_event({READY_SOURCE})); "
+            "sys.stdout.buffer.flush(); "
+        )
+        fails = (
+            "os.close(1); time.sleep(0.3); "
+            f"sys.stderr.write({cause!r} + '\\n'); sys.stderr.flush(); "
+            "os._exit(1)"
+        )
+        stops = (
+            "sys.stdout.buffer.write(b'\\xff' * 64); sys.stdout.buffer.flush(); "
+            "signal.sigwait({signal.SIGTERM}); "
+            "sys.stderr.write('Stopped\\n'); sys.stderr.flush(); "
+            "os._exit(0)"
+        )
+        for case, body, line in (
+            ("failed after Ready", ready + fails, cause),
+            ("failed before Ready", fails, cause),
+            ("failed by the server", ready + stops, "Stopped"),
+        ):
+            engine = (
+                "import os, signal, sys, time; "
+                "from dev.tests import native_peer as n; "
+                "from server import protocol as w; "
+                "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM}); " + body
+            )
+            server = "\n".join(
+                (
+                    "import sys, threading",
+                    "from server import diagnostics, runtime",
+                    "reported = threading.Event()",
+                    "def failed(*_failure):",
+                    "    diagnostics.print_status('Engine failed', error=True)",
+                    "    reported.set()",
+                    "native = runtime.MultiplexedRuntime(",
+                    f"    (sys.executable, '-c', {engine!r}), pending_limit=1",
+                    ")",
+                    "native.on_engine_failure = failed",
+                    "try:",
+                    "    native.wait_ready(10)",
+                    "    reported.wait(10)",
+                    "except runtime.EngineUnhealthy:",
+                    "    failed()",
+                    "native.close()",
+                )
+            )
+            with self.subTest(case=case):
+                result = subprocess.run(
+                    [sys.executable, "-c", server],
+                    cwd=Path(engine_runtime.__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                lines = result.stderr.splitlines()
+                self.assertEqual(len(lines), 2, result.stderr)
+                self.assertEqual(lines[0], line)
+                self.assertRegex(lines[1], r"^\d{2}:\d{2}:\d{2} Engine failed$")
+
+    def test_a_hung_engines_failure_waits_for_nothing_and_its_report_1_s(self):
+        # The server fails an engine whose loop hangs: it sends bytes that
+        # start no frame for its request, ignores SIGTERM, keeps its stderr
+        # open and says why 0.5 s later. The request's terminal and the
+        # failure listener, which schedules the restart (backend._failed),
+        # come at once; the report, printed then, is written after the
+        # engine's line, once the console's second has passed.
+        cause = "error: the loop stopped answering (test)"
+        engine = "\n".join(
+            (
+                "import os, signal, sys, time",
+                "from dev.tests import native_peer as n",
+                "from server import protocol as w",
+                "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})",
+                f"sys.stdout.buffer.write(n.serialize_event({READY_SOURCE}))",
+                "sys.stdout.buffer.flush()",
+                "frames = n.ClientFrameReader()",
+                "while data := os.read(0, 65536):",
+                "    if any(isinstance(m, w.RequestFrame) for m, _ in frames.feed(data)):",
+                "        break",
+                "sys.stdout.buffer.write(b'\\xff' * 64)",
+                "sys.stdout.buffer.flush()",
+                "time.sleep(0.5)",
+                f"sys.stderr.write({cause!r} + '\\n')",
+                "sys.stderr.flush()",
+                "time.sleep(30)",
+            )
+        )
+        server = "\n".join(
+            (
+                "import sys, time",
+                "from dev.tests import native_peer as n",
+                "from server import diagnostics, runtime",
+                "from server import protocol as w",
+                "heard = []",
+                "def failed(*_failure):",
+                "    heard.append(time.monotonic())",
+                "    diagnostics.print_status('Engine failed', error=True)",
+                "native = runtime.MultiplexedRuntime(",
+                f"    (sys.executable, '-c', {engine!r}), pending_limit=1",
+                ")",
+                "native.on_engine_failure = failed",
+                "native.wait_ready(10)",
+                "frame = n.request_frame(",
+                "    request_id=0, absolute_deadline_unix_micros=0,",
+                "    remaining_deadline_micros=0,",
+                ")",
+                "sent = time.monotonic()",
+                "call = native.submit(runtime.GenerationRequest(",
+                "    frame, sent + 30, None, w.request_fingerprint(frame)",
+                "))",
+                "try:",
+                "    call.result(10)",
+                "except runtime.EngineRuntimeError:",
+                "    ended = time.monotonic()",
+                "written = diagnostics.flush_console(5)",
+                "reported = time.monotonic()",
+                "native.kill()",
+                "native.close()",
+                "print(ended - sent, heard[0] - sent, reported - sent, written)",
+            )
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", server],
+            cwd=Path(engine_runtime.__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ended, heard, reported, written = result.stdout.split()
+        self.assertLess(float(ended), 0.8, result.stderr)
+        self.assertLess(float(heard), 0.8, result.stderr)
+        self.assertLess(float(reported), 3.0, result.stderr)
+        self.assertEqual(written, "True")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 2, result.stderr)
+        self.assertEqual(lines[0], cause)
+        self.assertRegex(lines[1], r"^\d{2}:\d{2}:\d{2} Engine failed$")
 
     def test_the_failure_listener_hears_which_requests_had_started(self):
         """The fingerprints of the started requests reach the listener with

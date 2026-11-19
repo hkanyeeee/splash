@@ -31,8 +31,9 @@ struct StepResult final {
 
 // Where a request's committed KV lives, chosen at admission and kept across
 // suspension: in memory (Resident), or, on a target that can spill, in the
-// SSD cache tier once its copies have landed, with memory keeping each
-// page's index (Spill).
+// SSD cache tier for the pages a claim released once their copies landed, or
+// under --kv-spill always as they land, memory keeping each page's index
+// (Spill).
 enum class KvMode : uint8_t { Resident, Spill };
 
 // Values are the Done event's reason byte.
@@ -166,11 +167,12 @@ inline constexpr std::string_view kDeadlineExceededMessage =
 // What held a request before its first token, in
 // milliseconds, each interval counted once by precedence: a command in
 // flight that carries its prompt's rows, its memory claim waiting, a decode
-// command, another request's prefill command, and the rest (the host,
-// admission, idle). The engine measures the first four between its ticks;
-// the rest is the time to the first token less them.
-enum class TtftPart : uint8_t { OwnPrefill, ClaimWait, Decode, OtherPrefill, Rest };
-inline constexpr size_t kTtftParts = 5;
+// command, another request's prefill command, the next prefill unit waiting
+// for a decoder whose memory lands (Scheduler::waitsUntil), and the rest
+// (the host, admission, idle). The engine measures the first five between
+// its ticks; the rest is the time to the first token less them.
+enum class TtftPart : uint8_t { OwnPrefill, ClaimWait, Decode, OtherPrefill, UnitWait, Rest };
+inline constexpr size_t kTtftParts = 6;
 using TtftParts = std::array<double, kTtftParts>;
 
 class EngineEventSink {
@@ -189,8 +191,7 @@ public:
   // counted (TtftPart::Rest is 0).
   virtual void firstTokenParts(uint64_t, const TtftParts &) {}
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
-  virtual void maskRequested(uint64_t requestId,
-                             std::span<const uint32_t> simulationTokens) = 0;
+  virtual void maskRequested(const ModelMaskRequest &request) = 0;
   // bounded: a Length end short of the request's maxNewTokens, at a bound
   // of the engine's own (the SSD cache's quota, or the memory a lone lane
   // could not grow past), which ends the response as its context would.
