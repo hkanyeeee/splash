@@ -3,7 +3,7 @@
 #include "metal/abi/VerifyTree.h"
 using namespace metal;
 
-struct Probe { uint width, routes, rows, bytes, masked, mapped, slot; };
+struct Probe { uint width, routes, rows, bytes, masked, mapped, slot, stride; };
 
 kernel void warmup_first_nonfinite(device const ushort *data [[buffer(0)]],
                                    device atomic_uint *first [[buffer(1)]],
@@ -17,7 +17,7 @@ kernel void warmup_first_nonfinite(device const ushort *data [[buffer(0)]],
   const uint mapped = p.mapped ? route_rows[group] : group;
   // Unverified routes carry a sentinel. Only the active lane's live routes are observed.
   if (mapped >= p.rows * routes) return;
-  const uint element = mapped * width + i % width;
+  const uint element = mapped * p.stride + i % width;
   const bool bad = p.bytes == 4
       ? (reinterpret_cast<device const uint *>(data)[element] & 0x7f800000u) == 0x7f800000u
       : (data[element] & 0x7f80u) == 0x7f80u;

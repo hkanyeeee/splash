@@ -731,7 +731,7 @@ protected:
   std::unique_ptr<WarmupTrace> warmupTrace_;
   void observe(metal::CommandGraph &graph, const char *stage, const metal::MetalBuffer &buffer,
                uint32_t rows, uint32_t width, uint32_t bytes = 2, uint32_t routes = 1,
-               const metal::MetalBuffer &routeRows = {}) const;
+               const metal::MetalBuffer &routeRows = {}, uint32_t stride = 0) const;
 
   const QwenTargetWeightsBase &weightsBase_;
   QwenTargetGeometry geometry_;

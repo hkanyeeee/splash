@@ -98,16 +98,18 @@ void QwenTarget::beginWarmupTrace(const char *phase) {
 
 void QwenTarget::observe(metal::CommandGraph &graph, const char *stage, const metal::MetalBuffer &buffer,
                          uint32_t rows, uint32_t width, uint32_t bytes, uint32_t routes,
-                         const metal::MetalBuffer &routeRows) const {
+                         const metal::MetalBuffer &routeRows, uint32_t stride) const {
   if (!warmupTrace_) return;
   auto &trace = *warmupTrace_;
+  if (!stride) stride = width;
   const uint64_t count = uint64_t{rows} * routes * width;
+  const uint64_t extent = (uint64_t{rows} * routes - 1) * stride + width;
   const auto slot = static_cast<uint32_t>(trace.points.size());
-  if (!count || count > UINT32_MAX || slot >= WarmupTrace::capacity || count * bytes > buffer.sizeBytes() ||
+  if (!count || count > UINT32_MAX || slot >= WarmupTrace::capacity || stride < width || extent * bytes > buffer.sizeBytes() ||
       (routeRows && uint64_t{rows} * routes * sizeof(uint32_t) > routeRows.sizeBytes()))
     throw std::logic_error("invalid B1 warmup trace extent");
   trace.points.push_back({stage, trace.layer, width, routes, graph.dispatches().size()});
-  ops::addWarmupTrace(graph, buffer, trace.results, trace.laneRows, routeRows, rows, width, routes, bytes, slot);
+  ops::addWarmupTrace(graph, buffer, trace.results, trace.laneRows, routeRows, rows, width, routes, bytes, slot, stride);
 }
 
 void QwenTarget::finishWarmupTrace() {
@@ -309,7 +311,10 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
              {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
               .prepared = std::move(normalized)},
              mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
-  observe(step.graph, "gdn_packed", b.gdnPacked, step.rows, geometry_.packedGdnWidth);
+  if (warmupTrace_) {
+    const uint32_t live = geometry_.convolutionDimension + geometry_.attentionWidth + 2 * geometry_.gdnValueHeads;
+    observe(step.graph, "gdn_packed", b.gdnPacked, step.rows, live, 2, 1, {}, geometry_.packedGdnWidth);
+  }
   const ops::LinearPlan outputPlan = linear.plan(
       mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   ops::PreparedInput hidden;
