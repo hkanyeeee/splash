@@ -1962,7 +1962,7 @@ struct MetalBackend::Impl {
                             }
                             if (step->kind == EventStep::Kind::Break) {
                                 leading.push_back(command);
-                                [command commit];
+                                commitEncoded(command);
                                 command = [queue commandBuffer];
                                 if (!command) failEncoding("unable to create Metal command buffer");
                                 continue;
