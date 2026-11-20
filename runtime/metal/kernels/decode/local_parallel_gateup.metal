@@ -374,5 +374,10 @@ M4_GATEUP_WIDTHS(q6pack_q80, FmtQ6Pack, FmtQ80)
 M4_GATEUP_WIDTHS(q5k_q6pack, FmtQ5K, FmtQ6Pack)
 M4_GATEUP_WIDTHS(q6pack_q5k, FmtQ6Pack, FmtQ5K)
 M4_GATEUP_WIDTHS(q6pack_q6pack, FmtQ6Pack, FmtQ6Pack)
+M4_GATEUP_WIDTHS(q5pack_q5pack, FmtQ5Pack, FmtQ5Pack)
+M4_GATEUP_WIDTHS(iq4nl_q5pack, FmtIQ4NL, FmtQ5Pack)
+M4_GATEUP_WIDTHS(iq4xs_q5pack, FmtIQ4XS, FmtQ5Pack)
+M4_GATEUP_WIDTHS(q5pack_q6pack, FmtQ5Pack, FmtQ6Pack)
+M4_GATEUP_WIDTHS(q6pack_q5pack, FmtQ6Pack, FmtQ5Pack)
 #undef M4_GATEUP_WIDTHS
 #undef M4_GATEUP

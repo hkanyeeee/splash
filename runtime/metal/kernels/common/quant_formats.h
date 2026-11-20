@@ -148,6 +148,27 @@ struct FmtQ5K {
   static uint4 codes(Chunk q) { return quant_nibble_pairs(q.x) | (((uint4(q.y) >> uint4(0, 2, 4, 6)) & 0x00010001u) << 4); }
   static QuantCoef coef(Meta hdr, ushort j) { return quant_k4_coef(hdr, j); }
 };
+// Q5_K with three complete five-bit codes per halfword; its top bit
+// and the matching nibble of plane 1 form the fourth code.
+struct FmtQ5Pack {
+  QUANT_FORMAT(GGUF_FMT_Q5PACK, QuantLinear, 0, 32, false);
+  using Payload = FmtQ5K::Payload;
+  using Chunk = FmtQ5K::Chunk;
+  using Meta = FmtQ5K::Meta;
+  static Payload load(device uchar *p0, device uchar *p1) { return FmtQ5K::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return FmtQ5K::loadMeta(m); }
+  static QuantCoef coef(Meta m, ushort j) { return FmtQ5K::coef(m, j); }
+  static Chunk assemble(uint word, uint byte) { return uint2(word, (byte & 15u) | ((byte & 240u) << 12)); }
+  static Chunk chunk(Payload w, ushort c) { return assemble(w.a[c], w.b >> (8 * c)); }
+  static Chunk loadChunk(device uchar *lo, device uchar *hi, ushort c) {
+    return assemble(((device uint *)lo)[c], hi[c]);
+  }
+  static uint4 codes(Chunk q) {
+    return uint4(q.x & 0x001f001fu, (q.x >> 5) & 0x001f001fu, (q.x >> 10) & 0x001f001fu,
+                 ((q.x >> 15) & 0x00010001u) | (q.y << 1));
+  }
+};
+
 // Q6_K: plane0 low 4 bits, plane1 the high 2 bits (halfword c = chunk c); meta 16 int8 scales, then half d.
 // value = d * sc * (q - 32) with one scale per 16-group.
 struct FmtQ6K {
@@ -593,7 +614,7 @@ QUANT_AFFINE_GROUPS(8)
 // Every format as X(format type, kernel name token), the token being its kQuantFormats name: the formats of the
 // Apple9 register tile (quant_register_format), then the others.
 #define QUANT_REGISTER_FORMATS(X)                                                                                   \
-  X(FmtQ4K, q4k) X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ5K, q5k) X(FmtQ6K, q6k) X(FmtQ6Pack, q6pack) X(FmtQ3K, q3k) X(FmtQ80, q80) \
+  X(FmtQ4K, q4k) X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ5K, q5k) X(FmtQ5Pack, q5pack) X(FmtQ6K, q6k) X(FmtQ6Pack, q6pack) X(FmtQ3K, q3k) X(FmtQ80, q80) \
   X(FmtIQ3S, iq3s) X(FmtQ2K, q2k) X(FmtIQ3XXS, iq3xxs) X(FmtIQ2XXS, iq2xxs) X(FmtIQ2XS, iq2xs) X(FmtIQ2S, iq2s)      \
   X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)            \
   X(FmtAF2G32, af2g32) X(FmtAF2G64, af2g64) X(FmtAF2G128, af2g128) X(FmtAF3G32, af3g32) X(FmtAF3G64, af3g64)      \

@@ -122,7 +122,8 @@
 #define GGUF_FMT_F16 42u
 #define GGUF_FMT_Q20 43u
 #define GGUF_FMT_Q6PACK 44u
-#define GGUF_FMT_COUNT 45u
+#define GGUF_FMT_Q5PACK 45u
+#define GGUF_FMT_COUNT 46u
 
 // The tensor type an image descriptor names for an MLX affine format: no GGUF
 // type is of this form.
@@ -133,6 +134,7 @@
 #define QUANT_FP8_TYPE 0x46503845u
 // Tagged image layout of native Q6_K rows, with three direct six-bit fields per lane.
 #define QUANT_Q6PACK_TYPE 0x5136504Bu
+#define QUANT_Q5PACK_TYPE 0x5135504Bu
 // Byte offsets in NVFP4's native block (its scales at 0) and FP8's (its g at 0).
 #define QUANT_NVFP4_G 16u
 #define QUANT_NVFP4_CODES 20u
@@ -199,6 +201,7 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {1, 256, 512, 64, 0, 4, 8, "f16"},
     {42, 64, 18, 8, 0, 2, 2, "q20"},      // GGUF's block_q2_0, one d per 64 elements; meta: d
     {QUANT_Q6PACK_TYPE, 256, 210, 16, 8, 20, 8, "q6pack"},
+    {QUANT_Q5PACK_TYPE, 256, 176, 16, 4, 16, 8, "q5pack"},
 };
 
 // The format that stores a GGUF tensor type (or a loader's);
@@ -226,7 +229,8 @@ inline constexpr bool quant_affine_format(uint32_t format) {
 inline constexpr uint32_t quant_affine_bits(uint32_t format) { return (kQuantFormats[format].ggml_type >> 8) & 0xFF; }
 // Image formats with loader-specific type tags, including the alternate Q6_K planes.
 inline constexpr bool quant_loader_format(uint32_t format) {
-  return quant_affine_format(format) || format == GGUF_FMT_NVFP4 || format == GGUF_FMT_FP8 || format == GGUF_FMT_Q6PACK;
+  return quant_affine_format(format) || format == GGUF_FMT_NVFP4 || format == GGUF_FMT_FP8 ||
+         format == GGUF_FMT_Q6PACK || format == GGUF_FMT_Q5PACK;
 }
 // Whether a format's values enter a bf16 matrix multiply exactly, as the
 // Apple9 register tile takes them (kernels/decode/linear_gguf_sgmatrix.metal):

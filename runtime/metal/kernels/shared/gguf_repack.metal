@@ -42,20 +42,35 @@ static inline uint gguf_nibble_pairs(uint x) {
 // Group j of a Q4_K (qs at byte 16) or Q5_K (qs at 48, with fifth bits) block from its words: a few shifts a word
 // instead of a byte load and a pack per element. Pair word c is qs words c and 4 + c; the fifth bits, bit j of
 // qh[4k..4k+3] gathered by the multiply, go to slots 8 (k % 4) + 4 (k / 4) on.
-static inline void gguf_repack_k_words(device const uchar *blk, uint qs_at, bool fifth, uint j, device uchar *out0,
+static inline void gguf_repack_k_words(device const uchar *blk, uint qs_at, bool fifth, bool compact, uint j, device uchar *out0,
                                        device uchar *out1, device uchar *meta) {
   device const uint *qs = (device const uint *)(blk + qs_at + (j / 2) * 32);
   uint4 pairs;
   for (uint c = 0; c < 4; ++c)
     pairs[c] = gguf_nibble_pairs((qs[c] >> (4 * (j % 2))) & 0x0F0F0F0Fu) |
                gguf_nibble_pairs((qs[4 + c] >> (4 * (j % 2))) & 0x0F0F0F0Fu) << 8;
-  *(device uint4 *)out0 = pairs;
+  if (!compact) *(device uint4 *)out0 = pairs;
   if (fifth) {
     device const uint *qh = (device const uint *)(blk + 16);
     uint bits = 0;
     for (uint k = 0; k < 8; ++k)
       bits |= ((((qh[k] >> j) & 0x01010101u) * 0x204081u) >> 21 & 0xFu) << (8 * (k % 4) + 4 * (k / 4));
-    *(device uint *)out1 = bits;
+    if (compact) {
+      for (uint c = 0; c < 4; ++c) {
+        uchar tail = 0;
+        for (uint e = 0; e < 2; ++e) {
+          uint4 q;
+          for (uint p = 0; p < 4; ++p)
+            q[p] = ((pairs[c] >> (16 * e + 4 * p)) & 15u) |
+                   (((bits >> (8 * c + 2 * p + e)) & 1u) << 4);
+          ((device ushort *)out0)[2 * c + e] = q.x | (q.y << 5) | (q.z << 10) | ((q.w & 1) << 15);
+          tail |= (q.w >> 1) << (4 * e);
+        }
+        out1[c] = tail;
+      }
+    } else {
+      *(device uint *)out1 = bits;
+    }
   }
   device const uint *head = (device const uint *)blk;
   if (j == 0) *(device uint4 *)meta = uint4(head[0], head[1], head[2], head[3]);
@@ -93,10 +108,11 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
   }
   switch (fmt) {
     case GGUF_FMT_Q4K:
-      gguf_repack_k_words(blk, 16, false, j, out0, out1, meta);
+      gguf_repack_k_words(blk, 16, false, false, j, out0, out1, meta);
       break;
     case GGUF_FMT_Q5K:
-      gguf_repack_k_words(blk, 48, true, j, out0, out1, meta);
+    case GGUF_FMT_Q5PACK:
+      gguf_repack_k_words(blk, 48, true, fmt == GGUF_FMT_Q5PACK, j, out0, out1, meta);
       break;
     case GGUF_FMT_IQ4XS: {
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[8 + 16 * j + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }

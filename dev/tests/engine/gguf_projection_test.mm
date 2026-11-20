@@ -393,15 +393,16 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   return out;
 }
 
-// All four plane layouts share a strided output. Each format also exercises
+// All five plane layouts share a strided output. Each format also exercises
 // a ragged final SME tile and the CPU/GPU handoff in the normal Linear path.
 void smePrefill(MetalBackend &backend) {
   if (!backend.capabilities().is40CoreM4Max()) return;
-  constexpr uint32_t k = 5120, rows = 1025, width = 512, stride = 4 * width + 64;
+  constexpr uint32_t k = 5120, rows = 1025, width = 512, stride = 5 * width + 64;
   const Linear linear(backend.capabilities(), Int8Activations::Off);
   const Tensor a = tensor(backend, Q6K, width, k), b = tensor(backend, Q5K, width, k), c = tensor(backend, Q80, width, k);
   const Tensor compact = tensor(backend, Q6Pack, width, k);
-  const Projection weights = projection({&a, &b, &c, &compact}, stride);
+  const Tensor five = tensor(backend, Q5Pack, width, k);
+  const Projection weights = projection({&a, &b, &c, &compact, &five}, stride);
   const auto plan = linear.plan(weights, rows);
   const auto storage = plan.storageRows();
   const Guarded input(backend, uint64_t{storage} * k * 2, 0);
@@ -424,7 +425,7 @@ void smePrefill(MetalBackend &backend) {
                                  weights, selected));
     static_cast<void>(linear.add(both, {.input = input.view, .output = output.view, .residual = addend,
                                        .prefillCpu = &scratch}, weights, selected));
-    if (both.command().events.size() != 4) fail("SME prefill did not split all four segments");
+    if (both.command().events.size() != 5) fail("SME prefill did not split all five segments");
     static_cast<void>(backend.submitCommandAsync(gpu.command()).wait());
     static_cast<void>(backend.submitCommandAsync(both.command()).wait());
     if (std::memcmp(reference.view.contents(), output.view.contents(), size_t(rows) * stride * 2))

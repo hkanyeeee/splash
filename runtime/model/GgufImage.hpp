@@ -183,7 +183,7 @@ struct Image {
 struct PlanOptions {
   bool streamExperts = false;
   bool streamTable = false;
-  bool compactQ6 = false;
+  bool compactKCoding = false;
 };
 
 // The routed experts each layer's image streams (Image::experts), in layer

@@ -32,7 +32,7 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
            IQ2XXS = GGUF_FMT_IQ2XXS, IQ2XS = GGUF_FMT_IQ2XS, IQ2S = GGUF_FMT_IQ2S, IQ1S = GGUF_FMT_IQ1S,
            IQ1M = GGUF_FMT_IQ1M, Q40 = GGUF_FMT_Q40, Q41 = GGUF_FMT_Q41, MXFP4 = GGUF_FMT_MXFP4,
            PQ20 = GGUF_FMT_PQ20, NVFP4 = GGUF_FMT_NVFP4, FP8 = GGUF_FMT_FP8, Q50 = GGUF_FMT_Q50, Q51 = GGUF_FMT_Q51,
-           BF16 = GGUF_FMT_BF16, F16 = GGUF_FMT_F16, Q20 = GGUF_FMT_Q20, Q6Pack = GGUF_FMT_Q6PACK, FMT_COUNT = GGUF_FMT_COUNT };
+           BF16 = GGUF_FMT_BF16, F16 = GGUF_FMT_F16, Q20 = GGUF_FMT_Q20, Q6Pack = GGUF_FMT_Q6PACK, Q5Pack = GGUF_FMT_Q5PACK, FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
 // The format of kQuantFormats name `name`, FMT_COUNT for none.
 inline Fmt fmtNamed(const std::string &name) {
@@ -210,7 +210,7 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
     } else {
       memcpy(blk + off, &d, 2);
     }
-    if (f == Q4K || f == Q5K || f == Q2K || f == Q41 || f == Q51) {
+    if (f == Q4K || (f == Q5K || f == Q5Pack) || f == Q2K || f == Q41 || f == Q51) {
       const uint16_t m = scale();
       memcpy(blk + off + 2, &m, 2);
     }
@@ -298,7 +298,7 @@ inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
     return std::uniform_real_distribution<float>(top / 4, top);
   }
   switch (f) {
-    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case Q50: case Q51: case MXFP4:
+    case Q4K: case Q5Pack: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case Q50: case Q51: case MXFP4:
       return std::uniform_real_distribution<float>(0.0005f, 0.004f);
     case IQ4XS: return std::uniform_real_distribution<float>(0.00002f, 0.00015f);
     case Q6Pack: case Q6K: return std::uniform_real_distribution<float>(0.00002f, 0.0001f);
@@ -402,7 +402,7 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       }
       packBits(lo, 4, p0); return;
     }
-    case Q5K: {
+    case Q5Pack: case Q5K: {
       const uint8_t *qh = blk + 16, *ql = blk + 48 + (j / 2) * 32;
       const int sh = (j % 2) * 4;
       uint16_t d16, m16; memcpy(&d16, blk, 2); memcpy(&m16, blk + 2, 2);
@@ -413,7 +413,19 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
         hi[quant_slot(k)] = h1;
         vals[k] = h2f(d16) * sc * (l4 + 16 * h1) - h2f(m16) * mn;
       }
-      packPairs(lo, p0); packBits(hi, 1, p1); return;
+      if (f == Q5Pack) {
+        memset(p1, 0, 4);
+        for (uint32_t i = 0; i < 8; ++i) {
+          const uint32_t first = 8 * (i / 2) + i % 2;
+          auto q = [&](uint32_t p) { return lo[first + 2*p] | hi[first + 2*p] << 4; };
+          const uint16_t w = uint16_t(q(0) | q(1) << 5 | q(2) << 10 | (q(3) & 1) << 15);
+          memcpy(p0 + 2*i, &w, 2);
+          p1[i / 2] |= (q(3) >> 1) << (4 * (i % 2));
+        }
+      } else {
+        packPairs(lo, p0); packBits(hi, 1, p1);
+      }
+      return;
     }
     case Q6Pack: case Q6K: {
       const uint32_t n = j / 4, r = j % 4;
@@ -637,7 +649,7 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
   if (affine(f)) { memcpy(dst, blk, fi.meta_bytes); return; }   // s, z
   switch (f) {
     // The block's leading fields.
-    case Q4K: case Q5K: case IQ4XS: case IQ4NL: case Q80: case IQ3S: case IQ3XXS: case IQ2XXS: case IQ2XS: case IQ2S:
+    case Q4K: case Q5Pack: case Q5K: case IQ4XS: case IQ4NL: case Q80: case IQ3S: case IQ3XXS: case IQ2XXS: case IQ2XS: case IQ2S:
     case IQ1S: case Q40: case Q41: case Q50: case Q51: case MXFP4: case PQ20: case Q20:
       memcpy(dst, blk, fi.meta_bytes); return;
     case Q6Pack: case Q6K: memcpy(dst, blk + kQ6KScales, 16); memcpy(dst + 16, blk + kQ6KD, 2); dst[18] = dst[19] = 0; return;

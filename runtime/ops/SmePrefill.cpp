@@ -83,7 +83,15 @@ void packWeights(const QuantizedSegment &s, uint32_t columns, float *dest) {
                   const int code = int(value) - 32;
                   packed[(i + e) * kTile] = float(_Float16(scale[side] * float(code)));
                 } else {
-                  const int code = int(lo | (((h >> e) & 1) << 4));
+                  uint32_t code;
+                  if constexpr (Format == GGUF_FMT_Q5PACK) {
+                    const uint32_t word = lowBits >> (16 * e), nibble = (highBits >> (4 * e)) & 15;
+                    const uint32_t codes[4] = {word & 31, (word >> 5) & 31, (word >> 10) & 31,
+                                               ((word >> 15) & 1) | (nibble << 1)};
+                    code = codes[pair];
+                  } else {
+                    code = lo | (((h >> e) & 1) << 4);
+                  }
                   packed[(i + e) * kTile] = float(_Float16(std::fma(scale[side], float(code), bias)));
                 }
               }
@@ -133,6 +141,7 @@ void project(const PrefillCpuScratch &scratch, const metal::MetalBuffer &input, 
   switch (segment.formatId) {
   case GGUF_FMT_Q6PACK: packWeights<GGUF_FMT_Q6PACK>(segment, columns, weights); break;
   case GGUF_FMT_Q6K: packWeights<GGUF_FMT_Q6K>(segment, columns, weights); break;
+  case GGUF_FMT_Q5PACK: packWeights<GGUF_FMT_Q5PACK>(segment, columns, weights); break;
   case GGUF_FMT_Q5K: packWeights<GGUF_FMT_Q5K>(segment, columns, weights); break;
   case GGUF_FMT_Q80: packWeights<GGUF_FMT_Q80>(segment, columns, weights); break;
   default: throw std::logic_error("unsupported SME prefill format");
@@ -168,7 +177,8 @@ uint32_t smePrefillColumns(const PrefillCpuScratch &scratch, const metal::MetalB
                            const QuantizedSegment &s, uint32_t rows, uint32_t columns) {
   const uint32_t k = s.inputSize;
   if (rows < 1024 || (k != 5120 && k != 6144) ||
-      (s.formatId != GGUF_FMT_Q6PACK && s.formatId != GGUF_FMT_Q6K && s.formatId != GGUF_FMT_Q5K && s.formatId != GGUF_FMT_Q80))
+      (s.formatId != GGUF_FMT_Q6PACK && s.formatId != GGUF_FMT_Q6K && s.formatId != GGUF_FMT_Q5PACK &&
+       s.formatId != GGUF_FMT_Q5K && s.formatId != GGUF_FMT_Q80))
     return 0;
   static const bool supported = tileWidth() == kTile;
   // On the 40-core M4 Max this share includes the cost of packing both operands.
