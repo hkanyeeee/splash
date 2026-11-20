@@ -393,18 +393,12 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   return out;
 }
 
-// All five plane layouts share a strided output. Each format also exercises
-// a ragged final SME tile and the CPU/GPU handoff in the normal Linear path.
-void smePrefill(MetalBackend &backend) {
-  if (!backend.capabilities().is40CoreM4Max()) return;
-  constexpr uint32_t k = 5120, rows = 1025, width = 512, stride = 5 * width + 64;
-  const Linear linear(backend.capabilities(), Int8Activations::Off);
-  const Tensor a = tensor(backend, Q6K, width, k), b = tensor(backend, Q5K, width, k), c = tensor(backend, Q80, width, k);
-  const Tensor compact = tensor(backend, Q6Pack, width, k);
-  const Tensor five = tensor(backend, Q5Pack, width, k);
-  const Projection weights = projection({&a, &b, &c, &compact, &five}, stride);
-  const auto plan = linear.plan(weights, rows);
-  const auto storage = plan.storageRows();
+// A ragged final SME tile, guard bands and the CPU/GPU handoff in the normal Linear path.
+void checkSmeProjection(MetalBackend &backend, const Linear &linear, const Projection &weights,
+                        std::initializer_list<LinearEpilogue> epilogues) {
+  constexpr uint32_t rows = 1025;
+  const uint32_t k = weights.inputSize, stride = weights.outputSize;
+  const uint32_t storage = linear.plan(weights, rows, *epilogues.begin()).storageRows();
   const Guarded input(backend, uint64_t{storage} * k * 2, 0);
   const Guarded reference(backend, uint64_t{storage} * stride * 2, 0x55), output(backend, reference.bytes, 0x55);
   auto *x = static_cast<uint16_t *>(input.view.contents());
@@ -417,7 +411,7 @@ void smePrefill(MetalBackend &backend) {
   auto *skip = static_cast<uint16_t *>(residual.view.contents());
   for (uint32_t i = 0; i < rows * stride; ++i)
     skip[i] = floatToBf16(std::ldexp(float(int(i % 4093) - 181), int(i % 25) - 15));
-  for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
+  for (const auto epilogue : epilogues) {
     const auto selected = linear.plan(weights, rows, epilogue);
     const MetalBuffer addend = epilogue == LinearEpilogue::Residual ? residual.view : MetalBuffer{};
     CommandGraph gpu, both;
@@ -425,7 +419,7 @@ void smePrefill(MetalBackend &backend) {
                                  weights, selected));
     static_cast<void>(linear.add(both, {.input = input.view, .output = output.view, .residual = addend,
                                        .prefillCpu = &scratch}, weights, selected));
-    if (both.command().events.size() != 5) fail("SME prefill did not split all five segments");
+    if (both.command().events.size() != weights.blocks().segments.size()) fail("SME prefill did not split every segment");
     static_cast<void>(backend.submitCommandAsync(gpu.command()).wait());
     static_cast<void>(backend.submitCommandAsync(both.command()).wait());
     if (std::memcmp(reference.view.contents(), output.view.contents(), size_t(rows) * stride * 2))
@@ -433,6 +427,22 @@ void smePrefill(MetalBackend &backend) {
   }
   for (const Guarded *guard : {&input, &reference, &output, &activations, &packed, &part, &residual})
     if (!guard->intact()) fail("SME prefill wrote past a buffer");
+}
+
+void smePrefill(MetalBackend &backend) {
+  if (!backend.capabilities().is40CoreM4Max()) return;
+  constexpr uint32_t k = 5120, width = 512, stride = 5 * width + 64;
+  const Linear linear(backend.capabilities(), Int8Activations::Off);
+  const Tensor a = tensor(backend, Q6K, width, k), b = tensor(backend, Q5K, width, k), c = tensor(backend, Q80, width, k);
+  const Tensor compact = tensor(backend, Q6Pack, width, k);
+  const Tensor five = tensor(backend, Q5Pack, width, k);
+  const Projection weights = projection({&a, &b, &c, &compact, &five}, stride);
+  checkSmeProjection(backend, linear, weights, {LinearEpilogue::None, LinearEpilogue::Residual});
+  // The split FFN's down projection reads the first 7,680 inputs of each 17,408-input row.
+  for (Fmt format : {Q6K, Q5K, Q80, Q6Pack, Q5Pack}) {
+    const Tensor down = tensor(backend, format, width, 17408);
+    checkSmeProjection(backend, linear, projection({&down}, width).leadingInputs(7680), {LinearEpilogue::Residual});
+  }
 }
 
 // Every output of rows [0, rows) and the covered columns within its interval: the projection's (`want`), plus the

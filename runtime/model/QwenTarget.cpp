@@ -198,12 +198,12 @@ void QwenTarget::addReadRows(const PrefillStep &step, const metal::MetalBuffer &
     ops::RowCopy::add(step.graph, compact, {row, width, 0}, output, {step.readRows[row], width, 0}, 1, width);
 }
 
-std::optional<ops::PrefillCpuScratch> QwenTarget::mixerCpuScratch(const PrefillStep &step,
-                                                                  const metal::MetalBuffer &weights) const {
+std::optional<ops::PrefillCpuScratch> QwenTarget::prefillCpuScratch(
+    const PrefillStep &step, const metal::MetalBuffer &activations, const metal::MetalBuffer &weights) const {
   if (step.decode || step.rows < 1024 || !geometry_.isDense27B() ||
       !backend_.capabilities().is40CoreM4Max())
     return std::nullopt;
-  return ops::PrefillCpuScratch{step.buffers.denseIntermediate, weights, step.buffers.gdnValues};
+  return ops::PrefillCpuScratch{activations, weights, step.buffers.gdnValues};
 }
 
 // The mixer reads the normalized rows as its input projection's plan takes
@@ -217,7 +217,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
-  const auto cpuScratch = mixerCpuScratch(step, b.fullPacked);
+  const auto cpuScratch = prefillCpuScratch(step, b.denseIntermediate, b.fullPacked);
   linear.add(step.graph,
              {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
               .prepared = std::move(normalized), .prefillCpu = cpuScratch ? &*cpuScratch : nullptr},
@@ -286,7 +286,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
   const ops::AttentionRows rows{b.laneRows, step.rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
   const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
-  const auto cpuScratch = mixerCpuScratch(step, b.gdnPacked);
+  const auto cpuScratch = prefillCpuScratch(step, b.denseIntermediate, b.gdnPacked);
   linear.add(step.graph,
              {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
               .prepared = std::move(normalized), .prefillCpu = cpuScratch ? &*cpuScratch : nullptr},
@@ -366,9 +366,11 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t rows = step.outputRows();
-  const ops::PrefillFfnBuffers buffers = b.ffn();
-  // The split takes whole chunks; read rows alone run on the GPU.
+  ops::PrefillFfnBuffers buffers = b.ffn();
+  // The split takes one whole chunk. Multi-chunk prefill can share the mixer buffers across chunks.
   if (step.aneFfn && step.readRows.empty()) {
+    const auto cpu = prefillCpuScratch(step, b.gdnPacked, b.fullPacked);
+    buffers.prefillCpu = cpu ? &*cpu : nullptr;
     ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows);
     step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), rows);
     return;

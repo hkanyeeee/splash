@@ -29,20 +29,22 @@ template <class T> T load(const uint8_t *bytes) {
 // operand, [output tile][input][output lane]. Round weights to half exactly
 // where the Metal prefill tile stages them, then widen them for the FP32 MMA.
 template <uint32_t Format>
-void packWeights(const QuantizedSegment &s, uint32_t columns, float *dest) {
+void packWeights(const QuantizedSegment &s, uint32_t columns, float *dest, uint32_t planeInputs) {
   constexpr bool q6 = Format == GGUF_FMT_Q6K || Format == GGUF_FMT_Q6PACK;
   constexpr auto format = kQuantFormats[Format];
   const auto *low = static_cast<const uint8_t *>(s.plane0.contents());
   const auto *high = static_cast<const uint8_t *>(s.plane1.contents());
   const auto *meta = static_cast<const uint8_t *>(s.meta.contents());
   const uint32_t first = s.outputSize - columns, k = s.inputSize, groups = k / 32;
+  // The ANE split gives the GPU the leading inputs of each full down-projection row.
+  const uint32_t planeGroups = planeInputs ? planeInputs / 32 : groups;
   dispatch_apply(columns / kTile, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t tile) {
     for (uint32_t group = 0; group < groups; ++group) {
       for (uint32_t lane = 0; lane < kTile; ++lane) {
         const uint32_t row = first + tile * kTile + lane;
-        const size_t wi = quant_tile_index(row, group, groups);
+        const size_t wi = quant_tile_index(row, group, planeGroups);
         const uint32_t unit = group / format.meta_groups, j = group % format.meta_groups;
-        const uint8_t *header = meta + quant_tile_index(row, unit, groups / format.meta_groups) * format.meta_bytes;
+        const uint8_t *header = meta + quant_tile_index(row, unit, planeGroups / format.meta_groups) * format.meta_bytes;
         float *packed = dest + (tile * k + group * 32) * kTile + lane;
         if constexpr (Format == GGUF_FMT_Q80) {
           const float scale = load<_Float16>(header);
@@ -130,7 +132,7 @@ static void multiply(const float *a, const float *b, uint32_t k, float *tile) {
 }
 
 void project(const PrefillCpuScratch &scratch, const metal::MetalBuffer &input, const QuantizedSegment &segment,
-             uint32_t rows, uint32_t columns, const metal::MetalBuffer &residual, uint32_t stride) {
+             uint32_t rows, uint32_t columns, const metal::MetalBuffer &residual, uint32_t stride, uint32_t planeInputs) {
   auto *activations = static_cast<float *>(scratch.activations.contents());
   auto *weights = static_cast<float *>(scratch.weights.contents());
   auto *output = static_cast<__bf16 *>(scratch.result.contents());
@@ -139,11 +141,11 @@ void project(const PrefillCpuScratch &scratch, const metal::MetalBuffer &input, 
   const auto *skip = static_cast<const __bf16 *>(residual.contents());
   const uint32_t offset = segment.columnOffset + segment.outputSize - columns;
   switch (segment.formatId) {
-  case GGUF_FMT_Q6PACK: packWeights<GGUF_FMT_Q6PACK>(segment, columns, weights); break;
-  case GGUF_FMT_Q6K: packWeights<GGUF_FMT_Q6K>(segment, columns, weights); break;
-  case GGUF_FMT_Q5PACK: packWeights<GGUF_FMT_Q5PACK>(segment, columns, weights); break;
-  case GGUF_FMT_Q5K: packWeights<GGUF_FMT_Q5K>(segment, columns, weights); break;
-  case GGUF_FMT_Q80: packWeights<GGUF_FMT_Q80>(segment, columns, weights); break;
+  case GGUF_FMT_Q6PACK: packWeights<GGUF_FMT_Q6PACK>(segment, columns, weights, planeInputs); break;
+  case GGUF_FMT_Q6K: packWeights<GGUF_FMT_Q6K>(segment, columns, weights, planeInputs); break;
+  case GGUF_FMT_Q5PACK: packWeights<GGUF_FMT_Q5PACK>(segment, columns, weights, planeInputs); break;
+  case GGUF_FMT_Q5K: packWeights<GGUF_FMT_Q5K>(segment, columns, weights, planeInputs); break;
+  case GGUF_FMT_Q80: packWeights<GGUF_FMT_Q80>(segment, columns, weights, planeInputs); break;
   default: throw std::logic_error("unsupported SME prefill format");
   }
   dispatch_apply((rows + kTile - 1) / kTile, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t block) {
@@ -176,7 +178,7 @@ void project(const PrefillCpuScratch &scratch, const metal::MetalBuffer &input, 
 uint32_t smePrefillColumns(const PrefillCpuScratch &scratch, const metal::MetalBuffer &input,
                            const QuantizedSegment &s, uint32_t rows, uint32_t columns) {
   const uint32_t k = s.inputSize;
-  if (rows < 1024 || (k != 5120 && k != 6144) ||
+  if (rows < 1024 || (k != 5120 && k != 6144 && k != 7680) ||
       (s.formatId != GGUF_FMT_Q6PACK && s.formatId != GGUF_FMT_Q6K && s.formatId != GGUF_FMT_Q5PACK &&
        s.formatId != GGUF_FMT_Q5K && s.formatId != GGUF_FMT_Q80))
     return 0;
@@ -195,8 +197,8 @@ uint32_t smePrefillColumns(const PrefillCpuScratch &scratch, const metal::MetalB
 
 void addSmePrefill(metal::CommandGraph &graph, const PrefillCpuScratch &scratch, metal::MetalBuffer input,
                    metal::MetalBuffer output, const QuantizedSegment &segment, uint32_t rows,
-                   uint32_t stride, uint32_t columns, const std::function<void()> &gpu, metal::MetalBuffer residual) {
-  graph.host([=] { project(scratch, input, segment, rows, columns, residual, stride); }, {},
+                   uint32_t stride, uint32_t columns, const std::function<void()> &gpu, metal::MetalBuffer residual, uint32_t planeInputs) {
+  graph.host([=] { project(scratch, input, segment, rows, columns, residual, stride, planeInputs); }, {},
              metal::HostStepGpu::Idle, {}, gpu, {scratch.activations, scratch.weights, scratch.result});
   RowCopy::add(graph, scratch.result, {0, columns, 0}, output,
                {0, stride, segment.columnOffset + segment.outputSize - columns}, rows, columns);

@@ -1791,19 +1791,20 @@ void malformedEventStepsRefused(const std::string &metallibPath) {
     rejects([&] { (void)submit({{3, event, 1, Signal}}); },
             "more dispatches than its command has",
             "an event step past the command's dispatches was submitted");
+    const uint64_t capacity = backend.capabilities().is40CoreM4Max() ? 1024 : 512;
     std::vector<EventStep> signals;
-    for (uint64_t signal = 1; signal <= 512; ++signal)
+    for (uint64_t signal = 1; signal <= capacity; ++signal)
         signals.push_back({2, event, signal, Signal});
     rejects([&] { (void)submit(signals); }, "more command buffers than its queue holds",
-            "a command of 512 signals was submitted");
+            "a command of too many signals was submitted");
     // A host step takes a command buffer, and one more when it keeps the GPU
     // awake.
-    const std::vector<EventStep> hostSteps(512, EventStep{2, {}, 0, Host, [] {}});
+    const std::vector<EventStep> hostSteps(capacity, EventStep{2, {}, 0, Host, [] {}});
     rejects([&] { (void)submit(hostSteps); }, "more command buffers than its queue holds",
-            "a command of 512 host steps was submitted");
-    const std::vector<EventStep> awakeSteps(256, EventStep{2, {}, 0, Host, [] {}, {}, HostStepGpu::Awake});
+            "a command of too many host steps was submitted");
+    const std::vector<EventStep> awakeSteps(capacity / 2, EventStep{2, {}, 0, Host, [] {}, {}, HostStepGpu::Awake});
     rejects([&] { (void)submit(awakeSteps); }, "more command buffers than its queue holds",
-            "a command of 256 awake host steps was submitted");
+            "a command of too many awake host steps was submitted");
     // Beside dispatches and the buffers the work writes: a host step's alone,
     // within the command, no event step among them and no empty buffer; their
     // buffer counts.
@@ -1826,22 +1827,22 @@ void malformedEventStepsRefused(const std::string &metallibPath) {
     beside.beside = 1;
     rejects([&] { (void)submit({beside, {1, event, 1, Signal}}); }, "among a host step's beside dispatches",
             "an event step among beside dispatches was submitted");
-    // 511 host steps take 512 command buffers; beside dispatches one more.
-    std::vector<EventStep> besideSteps(511, EventStep{2, {}, 0, Host, [] {}});
+    // The largest batch of plain host steps takes every buffer; a beside dispatch needs one more.
+    std::vector<EventStep> besideSteps(capacity - 1, EventStep{2, {}, 0, Host, [] {}});
     besideSteps.front() = beside;
     rejects([&] { (void)submit(besideSteps); }, "more command buffers than its queue holds",
-            "a command of 511 host steps, one with beside dispatches, was submitted");
+            "beside dispatches beyond the command buffer capacity were submitted");
     require(backend.healthy() && BackendInstrumentation::submittedCommands(backend) == 0,
             "a refused event step marked the backend unhealthy or submitted work");
-    // 511 signals take 512 command buffers, as many as the queue holds.
+    // One fewer signal than the capacity leaves a buffer for the last dispatch.
     signals.pop_back();
     auto submitted = std::async(std::launch::async, [&] { return submit(signals); });
     require(submitted.wait_for(std::chrono::seconds(30)) == std::future_status::ready,
             "a command of as many command buffers as its queue holds did not finish");
     (void)submitted.get();
     id<MTLSharedEvent> native = (__bridge id<MTLSharedEvent>)event.nativeHandle();
-    require(*value == 2 && native.signaledValue == 511,
-            "a command of 511 signals did not run");
+    require(*value == 2 && native.signaledValue == capacity - 1,
+            "the largest batch of signals did not run");
     std::cout << "PASS malformed event steps are refused\n";
 }
 

@@ -441,22 +441,22 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
-    const metal::DispatchSize groups{rowTiles, s.outputSize / GGUF_TILE_COLUMNS, 1};
-    if (b.prefillCpu && smePrefill_ && !p.rotation && !p.planeInputs() && w.epilogue == LinearEpilogue::Residual && b.residual.contents()) {
-      const uint32_t cpu = smePrefillColumns(*b.prefillCpu, b.input, s, w.rows, s.outputSize);
-      if (cpu) {
-        addSmePrefill(graph, *b.prefillCpu, b.input, b.output, s, w.rows, n, cpu, [&] {
-          graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params,
-                    {rowTiles, (s.outputSize - cpu) / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
-        }, b.residual);
-        continue;
-      }
-    }
-    if (p.planeInputs())
-      graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
-                GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
+    const auto gpu = [&](uint32_t columns) {
+      const metal::DispatchSize groups{rowTiles, columns / GGUF_TILE_COLUMNS, 1};
+      if (p.planeInputs())
+        graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
+                  GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
+      else
+        graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+    };
+    uint32_t cpu = 0;
+    if (b.prefillCpu && smePrefill_ && !p.rotation && w.epilogue == LinearEpilogue::Residual && b.residual.contents())
+      cpu = smePrefillColumns(*b.prefillCpu, b.input, s, w.rows, s.outputSize);
+    if (cpu)
+      addSmePrefill(graph, *b.prefillCpu, b.input, b.output, s, w.rows, n, cpu,
+                    [&] { gpu(s.outputSize - cpu); }, b.residual, p.planeInputs());
     else
-      graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+      gpu(s.outputSize);
   }
 }
 

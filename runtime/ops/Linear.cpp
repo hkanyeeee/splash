@@ -299,14 +299,17 @@ void Linear::addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
         *ffn.up, plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows), ffn.gate);
   } else {
     normalized = add(graph,
-                     {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch, .prepared = normalized},
+                     {.input = b.normalized, .output = b.gateScratch, .scratch = b.scratch, .prepared = normalized,
+                      .prefillCpu = b.prefillCpu},
                      *ffn.gate, plan(*ffn.gate, rows, LinearEpilogue::None, nullptr, chunkRows));
     add(graph,
         {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
          .prepared = normalized},
         *ffn.up, plan(*ffn.up, rows, LinearEpilogue::UpWithGate, nullptr, chunkRows));
   }
-  addResidualProjection(graph, b.intermediate, *ffn.down, residual, output, rows, b.scratch, chunkRows);
+  add(graph, {.input = b.intermediate, .output = output, .residual = residual, .scratch = b.scratch,
+              .prefillCpu = b.prefillCpu},
+      *ffn.down, plan(*ffn.down, rows, LinearEpilogue::Residual, nullptr, chunkRows));
 }
 
 } // namespace splash::ops

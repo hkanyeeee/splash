@@ -186,11 +186,17 @@ struct SwiGluProjections final {
   const Projection *up = nullptr;
   const Projection *down = nullptr;
 };
+// Shared prefill arena views lent to one CPU projection until the GPU needs them again.
+struct PrefillCpuScratch final {
+  metal::MetalBuffer activations, weights, result;
+};
+
 // A prefill chunk's buffers of its dense FFN: the normalized rows, gate's
 // output, the intermediate rows and the linear scratch.
 struct PrefillFfnBuffers final {
   metal::MetalBuffer normalized, gateScratch, intermediate;
   LinearScratch scratch;
+  const PrefillCpuScratch *prefillCpu = nullptr;
 };
 struct LinearScratchSize final {
   uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
@@ -262,12 +268,6 @@ private:
 };
 
 enum class FfnPass { General, TargetVerify, DraftDecode };
-
-// Shared prefill arena views that the mixer can lend to a CPU projection
-// until the following GDN, attention or FFN pass uses them.
-struct PrefillCpuScratch final {
-  metal::MetalBuffer activations, weights, result;
-};
 
 // The plan defines which fields are used and how much scratch they require.
 struct LinearBuffers final {

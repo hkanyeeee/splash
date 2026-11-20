@@ -660,10 +660,10 @@ protected:
   void requireLayers(size_t layers, size_t attentionLayers) const;
   void requireLayerPartition(uint32_t gdnLayers, uint32_t attentionLayers) const;
 
-  // The opposite mixer's packed buffer and two arena views unused until after
-  // each mixer projection completes. Both host and GPU work finish before reuse.
-  [[nodiscard]] std::optional<ops::PrefillCpuScratch> mixerCpuScratch(const PrefillStep &step,
-                                                                      const metal::MetalBuffer &weights) const;
+  // These prefill arena views are available until the next mixer or FFN reads them.
+  [[nodiscard]] std::optional<ops::PrefillCpuScratch> prefillCpuScratch(const PrefillStep &step,
+                                                                       const metal::MetalBuffer &activations,
+                                                                       const metal::MetalBuffer &weights) const;
 
   // The mixers, of a step's normalized rows (buffers.normalized) into their
   // output projection's `output`: a GDN, and an attention whose rows attend

@@ -14,6 +14,6 @@ namespace splash::ops {
 void addSmePrefill(metal::CommandGraph &graph, const PrefillCpuScratch &scratch, metal::MetalBuffer input,
                    metal::MetalBuffer output, const QuantizedSegment &segment, uint32_t rows,
                    uint32_t stride, uint32_t columns, const std::function<void()> &gpu,
-                   metal::MetalBuffer residual = {});
+                   metal::MetalBuffer residual = {}, uint32_t planeInputs = 0);
 
 } // namespace splash::ops

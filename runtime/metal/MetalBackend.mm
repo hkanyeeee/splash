@@ -159,7 +159,11 @@ constexpr uint64_t kBytesArgumentLimit = 4096;
 constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 // The queue's outstanding command buffers; a command takes one, and one more
 // per buffer its event steps add (addedBuffers).
-constexpr NSUInteger kMaximumCommandBuffers = 512;
+NSUInteger commandBufferCapacity(const DeviceCapabilities &device) noexcept {
+    // A 64-layer prefill can split the mixer and FFN projections between the GPU and SME
+    // as well as handing every FFN to the Neural Engine.
+    return device.is40CoreM4Max() ? 1024 : 512;
+}
 // The most loads host_step_wait spins for through an awake step: 60-190 ms on
 // the M5 Max (0.23-0.71 us a load), longer than nearly every step's work.
 // The spin check bounds its spins by their release (hostStepCheckLoads).
@@ -207,7 +211,7 @@ NSUInteger addedBuffers(const EventStep &step) noexcept {
 // steps takes: one, and those its steps add, after the `earlier` buffers of
 // its first part (MetalBackend::submitCommandPartsAsync). Refuses the steps when
 // its submission cannot encode them.
-NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches, NSUInteger earlier = 0) {
+NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches, NSUInteger capacity, NSUInteger earlier = 0) {
     size_t before = 0, joined = 0;
     NSUInteger buffers = earlier + 1;
     for (const EventStep &step : events) {
@@ -232,7 +236,7 @@ NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches, NSU
         joined = step.before + step.beside;
         buffers += addedBuffers(step);
     }
-    if (buffers > kMaximumCommandBuffers)
+    if (buffers > capacity)
         throw MetalBackendError("Metal command's event steps take more command "
                                 "buffers than its queue holds");
     return buffers;
@@ -2050,7 +2054,7 @@ struct MetalBackend::Impl {
                     try {
                         second = rest();
                         [[maybe_unused]] const NSUInteger buffers =
-                            checkEvents(second.events, second.dispatches.size(), ahead ? 1 : 0);
+                            checkEvents(second.events, second.dispatches.size(), commandBufferCapacity(capabilities), ahead ? 1 : 0);
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
                         lastCommandBuffers = buffers;
 #endif
@@ -2333,7 +2337,7 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
         // 64-layer prefill with a Neural Engine step each would wait on
         // itself.
         impl_->queue = [impl_->device
-            newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
+            newCommandQueueWithMaxCommandBufferCount:commandBufferCapacity(impl_->capabilities)];
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
         }
@@ -2568,7 +2572,8 @@ CommandTicket MetalBackend::submitCommandAsync(
 CommandTicket MetalBackend::submitCommandAsync(const Command &command,
                                                CommandCompletion completion) {
     checkOperation();
-    [[maybe_unused]] const NSUInteger buffers = checkEvents(command.events, command.dispatches.size());
+    [[maybe_unused]] const NSUInteger buffers = checkEvents(command.events, command.dispatches.size(),
+                                                           commandBufferCapacity(impl_->capabilities));
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
     impl_->lastCommandBuffers = buffers;
     if (impl_->dispatchProfiling)
