@@ -47,9 +47,8 @@ struct Surface final {
 inline constexpr uint64_t kConstantOffset = 64;
 [[nodiscard]] std::vector<uint8_t> constantBlob(std::span<const _Float16> values);
 
-// splash-ane in the per-user cache directory, where programs keep their
-// sources and recall() keeps what remember() wrote. Throws if macOS names no
-// per-user cache directory.
+// Comparison programs and remembered calibration share the current arm's
+// explicit private directory. Throws if the directory fails validation.
 [[nodiscard]] std::filesystem::path cacheDirectory();
 
 // Why no Program can run in this process, as constructing one would throw

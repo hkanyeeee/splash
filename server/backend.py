@@ -111,6 +111,7 @@ class NativeResult:
     # The engine ended the response at a bound of its own, short of
     # max_new_tokens: what the SSD cache or memory holds of its context.
     bounded: bool = False
+    strict_mask_replies: int = 0
 
     @functools.cached_property
     def metrics(self):
@@ -145,6 +146,7 @@ class Job:
     response_validator: object | None = None
     response_format: dict | None = None
     constraint: TokenConstraint | None = None
+    strict_mask_replies: int = 0
     cache: CacheInfo = field(default_factory=CacheInfo)
     # The engine's id of the request once the engine has taken it, by which
     # the console's lines name it.
@@ -801,7 +803,10 @@ class NativeBackend:
             # tree, the pending anchor its root. TokenConstraint returns the
             # mask before the first simulated token and after each token's
             # path, and the tokens the grammar forces after each.
-            return job.constraint.masks(event.simulation_tokens, event.parents)
+            masks = job.constraint.masks(event.simulation_tokens, event.parents)
+            if job.tool_policy is not None and job.tool_policy.strict:
+                job.strict_mask_replies += 1
+            return masks
 
         return provide
 
@@ -1088,6 +1093,7 @@ class NativeBackend:
             )
             stop_sequence = state.streamer.stop_sequence
             result = NativeResult(
+                strict_mask_replies=job.strict_mask_replies,
                 reason=(
                     "stop"
                     if stop_sequence is not None

@@ -16,7 +16,6 @@
 
 #import <Foundation/Foundation.h>
 
-#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -742,9 +741,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
   const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
       device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
-  if (config.maximumMemoryBytes > hardBudgetBytes)
-    logLine("--max-memory ignored: its ", gibibytes(config.maximumMemoryBytes), " exceed this Mac's Metal budget of ",
-            gibibytes(hardBudgetBytes), ", which it can only lower.");
+  if (config.maximumMemoryBytes != (42ull << 30) || hardBudgetBytes != config.maximumMemoryBytes ||
+      requestedContextTokens != 262144 || config.model.capabilities.maximumContextTokens != requestedContextTokens)
+    throw RuntimeResourcesError(RuntimeResourceStage::Configuration, "comparison budget or context mismatch");
   model::StreamableWeights streamable;
   // The arenas of the model by what streams of it, and those of a runtime
   // whose K/V spills, which only a block-sparse target with a spillable
@@ -832,14 +831,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     diskOff(reason);
     return without;
   };
-  // One plan owner is used both before allocation and during encoding. The
-  // engine lends it to model execution without inspecting its plans.
-  const char *option = std::getenv("SPLASH_231_DECODE");
-  const bool exact = config.model.decodeTrialAssembly && config.verifyRows == model::VerifyRows::All &&
-                     config.kvFormat == kv::Format::BFloat16 && config.stateFormat == ops::GdnStateFormat::Float32 &&
-                     config.exactCachedStates && config.maximumMemoryBytes == (42ull << 30);
-  const auto trial = ops::decodeTrial(device, exact, option ? option : "");
-  ops::ExecutionPlans operators(device, config.int8Activations, trial);
+  ops::ExecutionPlans operators(device, config.int8Activations, model::windowDecodeTrial(device, config.model,
+      config.verifyRows, config.kvFormat, config.stateFormat, config.exactCachedStates,
+      config.maximumMemoryBytes, hardBudgetBytes, requestedContextTokens));
   // The arenas by what streams of the model, from the geometry its target's
   // files give: whatever streams, its projections are those of its formats.
   const auto planArenas = [&](const model::QwenTargetGeometry &target) {

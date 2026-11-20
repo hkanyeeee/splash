@@ -1,3 +1,4 @@
+#include "metal/WindowCounts.hpp"
 #import "MetalBackend.hpp"
 #include "AwakeClock.hpp"
 #include "CommandWatchdog.hpp"
@@ -1852,6 +1853,8 @@ struct MetalBackend::Impl {
     // (MetalBackend::submitCommandPartsAsync): committed as its encoding ends, and
     // the part `rest` then gives is prepared and encoded after it, into the
     // same ticket.
+    WindowCounts windowCounts;
+
     CommandTicket commit(std::span<const PreparedDispatch> dispatches,
                          std::span<const PreparedTable> tables,
                          std::span<const EventStep> events,
@@ -2021,6 +2024,7 @@ struct MetalBackend::Impl {
                             [encoder dispatchThreadgroups:item.groups
                                      threadsPerThreadgroup:item.threads];
                         }
+                        windowCounts.encoded(dispatch.pipelineName);
                     }
                     encodeSteps(dispatches.size());
                     if (encoder) [encoder endEncoding];

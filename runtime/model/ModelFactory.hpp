@@ -12,6 +12,7 @@
 
 #include <array>
 #include <filesystem>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -116,6 +117,16 @@ enum class VerifyRows : uint8_t {
   // repeats its output.
   All,
 };
+
+inline ops::DecodeTrial windowDecodeTrial(const DeviceCapabilities &device, const ModelDescriptor &model,
+    VerifyRows rows, kv::Format kv, ops::GdnStateFormat state, bool exact, uint64_t requestedBytes,
+    uint64_t effectiveBytes, uint32_t context) noexcept {
+  const char *option = std::getenv("SPLASH_231_DECODE");
+  const bool eligible = model.decodeTrialAssembly && rows == VerifyRows::All && kv == kv::Format::BFloat16 &&
+      state == ops::GdnStateFormat::Float32 && exact && requestedBytes == (42ull << 30) &&
+      effectiveBytes == requestedBytes && context == 262144 && model.capabilities.maximumContextTokens == context;
+  return ops::decodeTrial(device, eligible, option ? option : "");
+}
 
 // Model execution resources, which the engine assembles. What a request's
 // start allocates is admitted through the state storage.

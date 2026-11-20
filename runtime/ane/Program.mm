@@ -20,6 +20,8 @@
 #include <climits>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <sys/stat.h>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -373,10 +375,17 @@ std::filesystem::path rememberedFile(std::string_view key) {
 } // namespace
 
 std::filesystem::path cacheDirectory() {
-  char path[PATH_MAX];
-  const size_t size = confstr(_CS_DARWIN_USER_CACHE_DIR, path, sizeof path);
-  if (!size || size > sizeof path) throw std::runtime_error("macOS names no per-user cache directory");
-  return std::filesystem::path(path) / "splash-ane";
+  const char *value = std::getenv("SPLASH_231_CALIBRATION_ROOT");
+  const std::filesystem::path root = value ? value : "";
+  const char *temporary = std::getenv("TMPDIR");
+  const std::filesystem::path tmp = temporary ? temporary : "";
+  struct stat st{};
+  if (root.filename() != "calibration" || root.parent_path().filename() != "active-cache" ||
+      tmp != root.parent_path() / "tmp" || !std::filesystem::is_regular_file(root.parent_path() / "owner") ||
+      !root.is_absolute() || std::filesystem::canonical(root) != root || lstat(root.c_str(), &st) ||
+      !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0777) != 0700)
+    throw std::runtime_error("comparison requires a private absolute calibration directory");
+  return root;
 }
 
 std::optional<std::string> unavailable() {

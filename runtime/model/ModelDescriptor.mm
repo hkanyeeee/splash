@@ -12,6 +12,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cstdint>
 #include <fnmatch.h>
 #include <initializer_list>
@@ -74,12 +78,8 @@ NSDictionary *readObject(const std::filesystem::path &path,
   return static_cast<NSDictionary *>(value);
 }
 
-// Compare the content IDs in the verified assembly record. Private roots
-// have different file paths, timestamps and model.json hashes.
-bool decodeTrialAssembly(NSDictionary *record) {
-  NSDictionary *files = record[@"files"];
-  if (![files isKindOfClass:NSDictionary.class]) return false;
-  NSDictionary *expected = @{
+NSDictionary *windowComponentPins() {
+  return @{
     @"config.json": @"806669083aa894f1e68654ffb354cf5e43ef33d89fa4e6327cdecb526a3592f1",
     @"draft/config.json": @"79279cc5665bced6f3cdaa2095a2ffe819497b2e",
     @"draft/model.safetensors": @"67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c",
@@ -90,12 +90,50 @@ bool decodeTrialAssembly(NSDictionary *record) {
     @"tokenizer/tokenizer_config.json": @"c0435ea80b819a4fb16914a820960ff7c38f9d48cb94e7e8a28780fe01e8dea0",
     @"vision/mmproj.gguf": @"cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e",
   };
-  if (files.count != expected.count) return false;
+}
+
+// The offline verifier hashes the private snapshot before emitting its receipt.
+void requireWindowReceipt(const std::filesystem::path &root, const std::string &recordHash, NSDictionary *record,
+                          NSDictionary *expected) {
+  namespace fs = std::filesystem;
+  const char *pin = std::getenv("SPLASH_231_RECEIPT_SHA256");
+  if (!pin || std::strlen(pin) != 64 || !root.is_absolute() || fs::canonical(root) != root ||
+      root.filename() != recordHash || root.parent_path().filename() != ".resolved")
+    throw std::invalid_argument("unverified comparison assembly");
+  const auto package = root.parent_path().parent_path().parent_path();
+  std::string digest;
+  NSDictionary *receipt = readObject(package / "verified.json", "offline content receipt", &digest);
+  if (digest != pin || ![receipt[@"model_json_sha256"] isEqual:@(recordHash.c_str())] ||
+      ![receipt[@"root"] isEqual:@(root.c_str())])
+    throw std::invalid_argument("content receipt does not bind this assembly");
+  NSDictionary *files = receipt[@"files"], *entries = record[@"files"];
+  if (![files isKindOfClass:NSDictionary.class] || ![entries isKindOfClass:NSDictionary.class] ||
+      files.count != expected.count || entries.count != expected.count)
+    throw std::invalid_argument("unexpected assembly inventory");
   for (NSString *name in expected) {
-    NSDictionary *entry = files[name];
-    if (![entry isKindOfClass:NSDictionary.class] || ![expected[name] isEqual:entry[@"digest"]]) return false;
+    NSDictionary *f = files[name], *entry = entries[name];
+    const auto blob = package / "blobs" / name.UTF8String;
+    const auto link = root / name.UTF8String;
+    struct stat st{};
+    if (![f isKindOfClass:NSDictionary.class] || ![entry isKindOfClass:NSDictionary.class] ||
+        ![expected[name] isEqual:f[@"digest"]] || ![expected[name] isEqual:entry[@"digest"]] ||
+        ![entry[@"path"] isEqual:@(blob.c_str())] || fs::read_symlink(link) != blob ||
+        fs::canonical(link) != blob || lstat(blob.c_str(), &st) || !S_ISREG(st.st_mode) ||
+        st.st_uid != geteuid() || st.st_nlink != 1 || (st.st_mode & 0777) != 0400 ||
+        ![f[@"dev"] isEqual:@(static_cast<uint64_t>(st.st_dev))] || ![f[@"ino"] isEqual:@(st.st_ino)] ||
+        ![f[@"size"] isEqual:@(st.st_size)] || ![f[@"ctime_ns"] isEqual:@(1000000000LL*st.st_ctimespec.tv_sec+st.st_ctimespec.tv_nsec)] ||
+        ![f[@"mtime_ns"] isEqual:@(1000000000LL*st.st_mtimespec.tv_sec+st.st_mtimespec.tv_nsec)])
+      throw std::invalid_argument("changed offline-verified model component");
   }
-  return true;
+  size_t leaves = 0;
+  for (const auto &item : fs::recursive_directory_iterator(root)) {
+    const auto rel = item.path().lexically_relative(root).string();
+    if (!item.is_symlink() && item.is_directory()) continue;
+    if (rel != "model.json" && !expected[@(rel.c_str())])
+      throw std::invalid_argument("unexpected model component");
+    ++leaves;
+  }
+  if (leaves != expected.count+1) throw std::invalid_argument("incomplete assembly");
 }
 
 NSDictionary *requireObject(NSDictionary *object, NSString *key,
@@ -945,6 +983,7 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
   @autoreleasepool {
     std::string sourceIdentity;
     NSDictionary *record = readObject(root / "model.json", "resolved model", &sourceIdentity);
+    requireWindowReceipt(root, sourceIdentity, record, windowComponentPins());
     requireNumbers(record, "assembly", "model record", {{"version", 1}});
     std::string name = requireString(record, @"model", "model name");
     const std::string targetFormat = requireString(record, @"target_format", "target format");
@@ -956,7 +995,7 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
     result.decodeTrialAssembly = result.family() == "Qwen3.8-27B" && result.targetSource == TargetSource::Gguf &&
-                                 result.visionSource == VisionSource::Gguf && decodeTrialAssembly(record);
+                                 result.visionSource == VisionSource::Gguf;
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;

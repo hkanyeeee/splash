@@ -360,6 +360,7 @@ def metrics_dict(result):
         # Native DoneEvent intervals are request lifecycle timing, not summed
         # executor command/GPU time. Native batch throughput lives in /status.
         "request_latency": latency,
+        "strict_mask_replies": result.strict_mask_replies,
         "cache": cache,
     }
     if result.drafted_tokens:
