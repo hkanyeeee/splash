@@ -200,8 +200,7 @@ void QwenTarget::addReadRows(const PrefillStep &step, const metal::MetalBuffer &
 
 std::optional<ops::PrefillCpuScratch> QwenTarget::mixerCpuScratch(const PrefillStep &step,
                                                                   const metal::MetalBuffer &weights) const {
-  if (step.decode || step.rows < 1024 || geometry_.ffnKind != QwenFfnKind::Dense || geometry_.layers != 64 ||
-      geometry_.hiddenSize != 5120 || geometry_.gdnValueHeads != 48 || geometry_.attentionQueryHeads != 24 ||
+  if (step.decode || step.rows < 1024 || !geometry_.isDense27B() ||
       !backend_.capabilities().is40CoreM4Max())
     return std::nullopt;
   return ops::PrefillCpuScratch{step.buffers.denseIntermediate, weights, step.buffers.gdnValues};

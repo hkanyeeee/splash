@@ -539,9 +539,10 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     const auto &g = gate->blocks().segments.front();
     const auto &u = segments.front();
     const std::string pair = std::string(g.name()) + "_" + u.name();
-    constexpr std::array<std::string_view, 10> supported{
+    constexpr std::array<std::string_view, 15> supported{
         "iq4xs_q6k", "q5k_q5k", "q6k_q80", "q5k_q6k", "q6k_q5k", "iq4nl_q5k",
-        "iq4xs_q5k", "q6k_q6k", "q80_q80", "af4g64_af4g64"};
+        "iq4xs_q5k", "q6k_q6k", "q80_q80", "af4g64_af4g64", "iq4xs_q6pack", "q6pack_q80", "q5k_q6pack",
+        "q6pack_q5k", "q6pack_q6pack"};
     const auto need = localPairScratch(w, config);
     if (!g.isFloat() && !u.isFloat() && !g.columnOffset && !u.columnOffset && g.outputSize == n && u.outputSize == n &&
         std::ranges::find(supported, pair) != supported.end() &&

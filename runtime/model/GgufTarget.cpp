@@ -54,7 +54,8 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)) {
   planned_->images =
       gguf::planImages(planned_->source.file(), architecture, geometry,
-                       {.streamExperts = experts.memoryBytes != 0, .streamTable = table.cacheBytes != 0});
+                       {.streamExperts = experts.memoryBytes != 0, .streamTable = table.cacheBytes != 0,
+                        .compactQ6 = backend.capabilities().is40CoreM4Max() && geometry.isDense27B()});
   planned_->layers = geometry.layers;
   planned_->firstMoeLayer = geometry.leadingDenseLayers;
   planned_->table = table;

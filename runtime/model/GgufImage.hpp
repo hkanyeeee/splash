@@ -53,7 +53,7 @@ struct SafetensorsSource {
 // Whether a quantized safetensors tensor may be in a format: MLX affine,
 // mxfp4, nvfp4 or fp8.
 [[nodiscard]] constexpr bool safetensorsFormat(uint32_t format) {
-  return quant_loader_format(format) || format == GGUF_FMT_MXFP4;
+  return quant_affine_format(format) || format == GGUF_FMT_NVFP4 || format == GGUF_FMT_FP8 || format == GGUF_FMT_MXFP4;
 }
 
 // The tensor scale g of an nvfp4 or fp8 tensor's rows: the F32 or BF16 values
@@ -183,6 +183,7 @@ struct Image {
 struct PlanOptions {
   bool streamExperts = false;
   bool streamTable = false;
+  bool compactQ6 = false;
 };
 
 // The routed experts each layer's image streams (Image::experts), in layer

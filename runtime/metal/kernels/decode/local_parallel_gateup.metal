@@ -325,212 +325,54 @@ inline void pair(device const bfloat *table,device const float *sums,device ucha
 }
 } // namespace m4_parallel
 
-kernel void m4_borrow_pair_iq4xs_q6k_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4XS::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4XS> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4XS>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4XS,FmtQ6K,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
+#define M4_GATEUP(NAME, Gate, Up, L) \
+ kernel void m4_borrow_pair_##NAME##_l##L##_g1( \
+    device const bfloat *table [[buffer(0)]], \
+    device const float *sums [[buffer(1)]], \
+    device uchar *u0 [[buffer(2)]], \
+    device uchar *u1 [[buffer(3)]], \
+    device uchar *um [[buffer(4)]], \
+    device uchar *g0 [[buffer(5)]], \
+    device uchar *g1 [[buffer(6)]], \
+    device uchar *gm [[buffer(7)]], \
+    device bfloat *out [[buffer(8)]], \
+    device bfloat *gate_output [[buffer(9)]], \
+    device coherent(device) float *up_partials [[buffer(10)]], \
+    device atomic_uint *counters [[buffer(11)]], \
+    device coherent(device) float *gate_partials [[buffer(12)]], \
+    constant GgufDecodeParams &p [[buffer(13)]], \
+    uint2 tg [[threadgroup_position_in_grid]], \
+    uint tid [[thread_index_in_threadgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]], \
+    uint lane [[thread_index_in_simdgroup]]) { \
+  threadgroup bfloat2 glut[Gate::Kind == QuantCodebook ? kQuantPairTableEntries : 1]; \
+  threadgroup bfloat2 ulut[Up::Kind == QuantCodebook ? kQuantPairTableEntries : 1]; \
+  threadgroup m4_parallel::Coef<Gate> gcoefs[L * GGUF_REGISTER_COLUMNS * m4_parallel::Shape<Gate>::J]; \
+  threadgroup m4_parallel::Coef<Up> ucoefs[L * GGUF_REGISTER_COLUMNS * m4_parallel::Shape<Up>::J]; \
+  threadgroup uint arrival; \
+  m4_parallel::pair<Gate, Up, L, 1>(table, sums, u0, u1, um, g0, g1, gm, out, gate_output, up_partials, \
+                                    counters, gate_partials + ulong(L) * 8 * p.splits * p.out_stride, p, tg, \
+                                    tid, sg, lane, glut, ulut, gcoefs, ucoefs, &arrival); \
 }
 
-kernel void m4_borrow_pair_iq4xs_q6k_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4XS::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4XS> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4XS>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4XS,FmtQ6K,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_iq4xs_q6k_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4XS::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4XS> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4XS>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4XS,FmtQ6K,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q5k_q5k_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ5K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ5K,FmtQ5K,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q5k_q5k_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ5K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ5K,FmtQ5K,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q5k_q5k_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ5K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ5K,FmtQ5K,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q80_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ80> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ80,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q80_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ80> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ80,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q80_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ80> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ80,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q5k_q6k_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ5K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ5K,FmtQ6K,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q5k_q6k_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ5K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ5K,FmtQ6K,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q5k_q6k_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ5K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ5K,FmtQ6K,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q5k_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ5K,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q5k_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ5K,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q5k_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ5K,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_iq4nl_q5k_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4NL::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4NL> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4NL>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4NL,FmtQ5K,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_iq4nl_q5k_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4NL::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4NL> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4NL>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4NL,FmtQ5K,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_iq4nl_q5k_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4NL::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4NL> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4NL>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4NL,FmtQ5K,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_iq4xs_q5k_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4XS::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4XS> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4XS>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4XS,FmtQ5K,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_iq4xs_q5k_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4XS::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4XS> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4XS>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4XS,FmtQ5K,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_iq4xs_q5k_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtIQ4XS::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ5K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtIQ4XS> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtIQ4XS>::J];
- threadgroup m4_parallel::Coef<FmtQ5K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ5K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtIQ4XS,FmtQ5K,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q6k_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ6K,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q6k_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ6K,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q6k_q6k_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ6K::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ6K> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];
- threadgroup m4_parallel::Coef<FmtQ6K> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ6K>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ6K,FmtQ6K,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q80_q80_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ80> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];
- threadgroup m4_parallel::Coef<FmtQ80> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ80,FmtQ80,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q80_q80_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ80> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];
- threadgroup m4_parallel::Coef<FmtQ80> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ80,FmtQ80,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_q80_q80_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtQ80::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtQ80> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];
- threadgroup m4_parallel::Coef<FmtQ80> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtQ80>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtQ80,FmtQ80,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_af4g64_af4g64_l1_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtAF4G64::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtAF4G64::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtAF4G64> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtAF4G64>::J];
- threadgroup m4_parallel::Coef<FmtAF4G64> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtAF4G64>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtAF4G64,FmtAF4G64,1,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(1)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_af4g64_af4g64_l2_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtAF4G64::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtAF4G64::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtAF4G64> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtAF4G64>::J];
- threadgroup m4_parallel::Coef<FmtAF4G64> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtAF4G64>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtAF4G64,FmtAF4G64,2,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(2)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
-
-kernel void m4_borrow_pair_af4g64_af4g64_l4_g1(device const bfloat *table [[buffer(0)]],device const float *sums [[buffer(1)]],device uchar *u0 [[buffer(2)]],device uchar *u1 [[buffer(3)]],device uchar *um [[buffer(4)]],device uchar *g0 [[buffer(5)]],device uchar *g1 [[buffer(6)]],device uchar *gm [[buffer(7)]],device bfloat *out [[buffer(8)]],device bfloat *gate_output [[buffer(9)]],device coherent(device) float *up_partials [[buffer(10)]],device atomic_uint *counters [[buffer(11)]],device coherent(device) float *gate_partials [[buffer(12)]],constant GgufDecodeParams &p [[buffer(13)]],uint2 tg [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]){
- threadgroup bfloat2 glut[FmtAF4G64::Kind==QuantCodebook?kQuantPairTableEntries:1],ulut[FmtAF4G64::Kind==QuantCodebook?kQuantPairTableEntries:1];
- threadgroup m4_parallel::Coef<FmtAF4G64> gcoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtAF4G64>::J];
- threadgroup m4_parallel::Coef<FmtAF4G64> ucoefs[1*GGUF_REGISTER_COLUMNS*m4_parallel::Shape<FmtAF4G64>::J];threadgroup uint arrival;
- m4_parallel::pair<FmtAF4G64,FmtAF4G64,4,1>(table,sums,u0,u1,um,g0,g1,gm,out,gate_output,up_partials,counters,gate_partials+ulong(4)*8*p.splits*p.out_stride,p,tg,tid,sg,lane,glut,ulut,gcoefs,ucoefs,&arrival);
-}
+#define M4_GATEUP_WIDTHS(NAME, Gate, Up) \
+ M4_GATEUP(NAME, Gate, Up, 1) \
+M4_GATEUP(NAME, Gate, Up, 2) \
+M4_GATEUP(NAME, Gate, Up, 4)
+M4_GATEUP_WIDTHS(iq4xs_q6k, FmtIQ4XS, FmtQ6K)
+M4_GATEUP_WIDTHS(q5k_q5k, FmtQ5K, FmtQ5K)
+M4_GATEUP_WIDTHS(q6k_q80, FmtQ6K, FmtQ80)
+M4_GATEUP_WIDTHS(q5k_q6k, FmtQ5K, FmtQ6K)
+M4_GATEUP_WIDTHS(q6k_q5k, FmtQ6K, FmtQ5K)
+M4_GATEUP_WIDTHS(iq4nl_q5k, FmtIQ4NL, FmtQ5K)
+M4_GATEUP_WIDTHS(iq4xs_q5k, FmtIQ4XS, FmtQ5K)
+M4_GATEUP_WIDTHS(q6k_q6k, FmtQ6K, FmtQ6K)
+M4_GATEUP_WIDTHS(q80_q80, FmtQ80, FmtQ80)
+M4_GATEUP_WIDTHS(af4g64_af4g64, FmtAF4G64, FmtAF4G64)
+M4_GATEUP_WIDTHS(iq4xs_q6pack, FmtIQ4XS, FmtQ6Pack)
+M4_GATEUP_WIDTHS(q6pack_q80, FmtQ6Pack, FmtQ80)
+M4_GATEUP_WIDTHS(q5k_q6pack, FmtQ5K, FmtQ6Pack)
+M4_GATEUP_WIDTHS(q6pack_q5k, FmtQ6Pack, FmtQ5K)
+M4_GATEUP_WIDTHS(q6pack_q6pack, FmtQ6Pack, FmtQ6Pack)
+#undef M4_GATEUP_WIDTHS
+#undef M4_GATEUP

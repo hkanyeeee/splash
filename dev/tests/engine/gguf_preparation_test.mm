@@ -620,7 +620,8 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     step.plane1 = layout.plane1_bytes ? plane1 : 0;
     step.meta = meta;
     for (uint32_t window = 0; window < windows; ++window) {
-      model::gguf::TensorRows sources{"fixture", layout.ggml_type, 0, shape.rows, stride, shape.order, &source};
+      const uint32_t sourceType = f == Q6Pack ? kQuantFormats[Q6K].ggml_type : layout.ggml_type;
+      model::gguf::TensorRows sources{"fixture", sourceType, 0, shape.rows, stride, shape.order, &source};
       sources.windows = windows;
       sources.window = window;
       if (blockNvfp4) sources.ggufNvfp4RowBytes = uint64_t{windows} * K / 64 * kBlockNvfp4Bytes;

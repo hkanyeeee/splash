@@ -156,7 +156,7 @@ public:
   Builder(const GgufFile &file, const QwenTargetDimensions &geometry, Problems &problems, std::string name,
           uint32_t layer, uint32_t type, PlanOptions options = {})
       : file_(file), geometry_(geometry), problems_(problems),
-        image_(std::move(name), layer, type, options.streamExperts) {}
+        image_(std::move(name), layer, type, options.streamExperts), compactQ6_(options.compactQ6) {}
 
   // A vector the kernels read as F32 unrounded, as the reference GGUF
   // implementation does: a norm (ops::NormWeights) or Qwen3.8-Flash-Next's PLE
@@ -179,7 +179,8 @@ public:
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != windows * columns)
       throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    const uint32_t sourceFormat = imageFormat(tensor->type);
+    const uint32_t format = compactQ6_ && sourceFormat == GGUF_FMT_Q6K ? GGUF_FMT_Q6PACK : sourceFormat;
     Repack repack = image_.planes(format, windows * rows, columns, name);
     for (uint32_t window = 0; window < windows; ++window) {
       TensorRows source = tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], windows * columns), order);
@@ -469,6 +470,7 @@ private:
   const QwenTargetDimensions &geometry_;
   Problems &problems_;
   ImageBuilder image_;
+  bool compactQ6_;
 };
 
 std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."; }
@@ -702,7 +704,7 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
     Family::layer(layer, g, index);
     images.push_back(layer.finish());
   }
-  Builder head(file, g, problems, "head.bin", g.layers, 2);
+  Builder head(file, g, problems, "head.bin", g.layers, 2, options);
   Family::head(head, g);
   head.quantized("output.weight", g.vocabularySize, g.hiddenSize);
   images.push_back(head.finish());

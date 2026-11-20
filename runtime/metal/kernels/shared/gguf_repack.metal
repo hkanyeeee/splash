@@ -104,14 +104,29 @@ static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, 
       if (j == 0) for (uint i = 0; i < 8; ++i) meta[i] = blk[i];
       break;
     }
-    case GGUF_FMT_Q6K: {
+    case GGUF_FMT_Q6K:
+    case GGUF_FMT_Q6PACK: {
       const uint hb = j / 4, quarter = j % 4;
       for (uint e = 0; e < 32; ++e) {
         lo[quant_slot(e)] = (blk[64 * hb + 32 * (quarter & 1) + e] >> (4 * (quarter >> 1))) & 15;
         hi[quant_slot(e)] = (blk[128 + 32 * hb + e] >> (2 * quarter)) & 3;
       }
-      gguf_store_pairs(lo, out0);
-      gguf_store_bits(hi, 2, out1);
+      if (fmt == GGUF_FMT_Q6PACK) {
+        for (uint c = 0; c < 4; ++c) {
+          for (uint e = 0; e < 2; ++e) {
+            uint4 q;
+            for (uint p = 0; p < 4; ++p) {
+              uint slot = 8 * c + 2 * p + e;
+              q[p] = lo[slot] | (uint(hi[slot]) << 4);
+            }
+            ((device ushort *)out0)[2 * c + e] = q.x | (q.y << 6) | ((q.w & 15) << 12);
+            out1[2 * c + e] = q.z | ((q.w >> 4) << 6);
+          }
+        }
+      } else {
+        gguf_store_pairs(lo, out0);
+        gguf_store_bits(hi, 2, out1);
+      }
       if (j == 0) { for (uint i = 0; i < 16; ++i) meta[i] = blk[192 + i]; meta[16] = blk[208]; meta[17] = blk[209]; meta[18] = 0; meta[19] = 0; }
       break;
     }

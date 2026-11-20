@@ -30,6 +30,7 @@ template <class T> T load(const uint8_t *bytes) {
 // where the Metal prefill tile stages them, then widen them for the FP32 MMA.
 template <uint32_t Format>
 void packWeights(const QuantizedSegment &s, uint32_t columns, float *dest) {
+  constexpr bool q6 = Format == GGUF_FMT_Q6K || Format == GGUF_FMT_Q6PACK;
   constexpr auto format = kQuantFormats[Format];
   const auto *low = static_cast<const uint8_t *>(s.plane0.contents());
   const auto *high = static_cast<const uint8_t *>(s.plane1.contents());
@@ -49,7 +50,7 @@ void packWeights(const QuantizedSegment &s, uint32_t columns, float *dest) {
             packed[i * kTile] = float(_Float16(scale * load<int8_t>(low + wi * 32 + quant_slot(i))));
         } else {
           float scale[2], bias = 0;
-          if constexpr (Format == GGUF_FMT_Q6K) {
+          if constexpr (q6) {
             const float d = load<_Float16>(header + 16);
             for (uint32_t side = 0; side < 2; ++side)
               scale[side] = d * load<int8_t>(header + 2 * j + side);
@@ -62,15 +63,24 @@ void packWeights(const QuantizedSegment &s, uint32_t columns, float *dest) {
           }
           for (uint32_t c = 0; c < 4; ++c) {
             const uint32_t lowBits = load<uint32_t>(low + wi * 16 + c * 4);
-            const uint32_t highBits = Format == GGUF_FMT_Q6K ? load<uint16_t>(high + wi * 8 + c * 2) : high[wi * 4 + c];
+            const uint32_t highBits = q6 ? load<uint16_t>(high + wi * 8 + c * 2) : high[wi * 4 + c];
             for (uint32_t pair = 0; pair < 4; ++pair) {
               const uint32_t side = pair / 2, i = side * 16 + 4 * c + 2 * (pair % 2);
               const uint32_t l = lowBits >> (4 * pair);
-              const uint32_t h = highBits >> ((Format == GGUF_FMT_Q6K ? 4 : 2) * pair);
+              const uint32_t h = highBits >> ((q6 ? 4 : 2) * pair);
               for (uint32_t e = 0; e < 2; ++e) {
                 const uint32_t lo = (l >> (16 * e)) & 15;
-                if constexpr (Format == GGUF_FMT_Q6K) {
-                  const int code = int(lo | (((h >> (2 * e)) & 3) << 4)) - 32;
+                if constexpr (q6) {
+                  uint32_t value;
+                  if constexpr (Format == GGUF_FMT_Q6PACK) {
+                    const uint32_t word = lowBits >> (16 * e), byte = highBits >> (8 * e);
+                    const uint32_t codes[4] = {word & 63, (word >> 6) & 63, byte & 63,
+                                               ((word >> 12) & 15) | ((byte >> 2) & 48)};
+                    value = codes[pair];
+                  } else {
+                    value = lo | (((h >> (2 * e)) & 3) << 4);
+                  }
+                  const int code = int(value) - 32;
                   packed[(i + e) * kTile] = float(_Float16(scale[side] * float(code)));
                 } else {
                   const int code = int(lo | (((h >> e) & 1) << 4));
@@ -121,6 +131,7 @@ void project(const PrefillCpuScratch &scratch, const metal::MetalBuffer &input, 
   const auto *skip = static_cast<const __bf16 *>(residual.contents());
   const uint32_t offset = segment.columnOffset + segment.outputSize - columns;
   switch (segment.formatId) {
+  case GGUF_FMT_Q6PACK: packWeights<GGUF_FMT_Q6PACK>(segment, columns, weights); break;
   case GGUF_FMT_Q6K: packWeights<GGUF_FMT_Q6K>(segment, columns, weights); break;
   case GGUF_FMT_Q5K: packWeights<GGUF_FMT_Q5K>(segment, columns, weights); break;
   case GGUF_FMT_Q80: packWeights<GGUF_FMT_Q80>(segment, columns, weights); break;
@@ -157,7 +168,7 @@ uint32_t smePrefillColumns(const PrefillCpuScratch &scratch, const metal::MetalB
                            const QuantizedSegment &s, uint32_t rows, uint32_t columns) {
   const uint32_t k = s.inputSize;
   if (rows < 1024 || (k != 5120 && k != 6144) ||
-      (s.formatId != GGUF_FMT_Q6K && s.formatId != GGUF_FMT_Q5K && s.formatId != GGUF_FMT_Q80))
+      (s.formatId != GGUF_FMT_Q6PACK && s.formatId != GGUF_FMT_Q6K && s.formatId != GGUF_FMT_Q5K && s.formatId != GGUF_FMT_Q80))
     return 0;
   static const bool supported = tileWidth() == kTile;
   // On the 40-core M4 Max this share includes the cost of packing both operands.

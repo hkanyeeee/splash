@@ -129,6 +129,11 @@ struct QwenTargetDimensions {
   uint32_t pleHeadDimension = 0;
   uint32_t pleConvolutionTaps = 0;
 
+  [[nodiscard]] constexpr bool isDense27B() const noexcept {
+    return ffnKind == QwenFfnKind::Dense && layers == 64 && hiddenSize == 5120 &&
+           gdnValueHeads == 48 && attentionQueryHeads == 24;
+  }
+
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
     return fullAttentionPeriod && (layer + 1) % fullAttentionPeriod == 0;

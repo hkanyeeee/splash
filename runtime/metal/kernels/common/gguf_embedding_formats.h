@@ -369,7 +369,7 @@ GGUF_EMBED_AFFINE(8)
 // Every format's stored-block struct as X(kernel name token, struct), the token its kQuantFormats name: the quantized
 // formats (GGUF_QUANTIZED_EMBEDDING_FORMATS), whose blocks each hold whole runs of 8 values, then the 16-bit floats.
 #define GGUF_QUANTIZED_EMBEDDING_FORMATS(X)                                                                        \
-  X(q4k, GgufEmbedQ4K) X(q6k, GgufEmbedQ6K) X(q80, GgufEmbedQ80) X(q5k, GgufEmbedQ5K) X(q3k, GgufEmbedQ3K)        \
+  X(q4k, GgufEmbedQ4K) X(q6k, GgufEmbedQ6K) X(q6pack, GgufEmbedQ6K) X(q80, GgufEmbedQ80) X(q5k, GgufEmbedQ5K) X(q3k, GgufEmbedQ3K)        \
   X(q2k, GgufEmbedQ2K) X(q40, GgufEmbedQ40) X(q41, GgufEmbedQ41) X(q50, GgufEmbedQ50) X(q51, GgufEmbedQ51)        \
   X(pq20, GgufEmbedPQ20) X(q20, GgufEmbedQ20) X(iq4nl, GgufEmbedIQ4NL) X(iq4xs, GgufEmbedIQ4XS)                    \
   X(iq3s, GgufEmbedIQ3S) X(iq3xxs, GgufEmbedIQ3XXS) X(iq2xxs, GgufEmbedIQ2XXS) X(iq2xs, GgufEmbedIQ2XS)            \
