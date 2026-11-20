@@ -180,6 +180,16 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
     graph.add("ane_ffn_pack", {rotated, packed.back()}, AneFfnPackParams{kHidden, segment * kSegment, kStride},
               {kRows / ANE_FFN_TILE, kSegment / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
   }
+  const uint32_t tokenRows = kRows - 1, padded = kSegment + ANE_FFN_TILE;
+  std::array<MetalBuffer, 2> tokenMajor, transposed;
+  for (uint32_t i = 0; i < 2; ++i) {
+    tokenMajor[i] = filled(backend, uint64_t{kRows} * kSegment, kUntouched);
+    transposed[i] = filled(backend, uint64_t{kRows} * padded, kUntouched);
+    graph.add("ane_ffn_transpose_weights", {packed[i], transposed[i]}, std::array<uint32_t, 2>{kStride, padded},
+              {kRows / ANE_FFN_TILE, kSegment / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+  }
+  graph.add("ane_ffn_pack_token_rows", {rotated, tokenMajor[0], tokenMajor[1]}, kSegment,
+            {kHidden / (256 * 4), tokenRows, 1}, {256, 1, 1});
   run(backend, graph);
 
   for (uint32_t row = 0; row < kRows; ++row) {
@@ -197,6 +207,18 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
       if (!near(got, expected))
         fail("row " + std::to_string(row) + " channel " + std::to_string(channel) + ": " + std::to_string(got) +
              ", not " + std::to_string(expected));
+    }
+  }
+  for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t row = 0; row < kRows; ++row) {
+      for (uint32_t channel = 0; channel < padded; ++channel) {
+        const uint8_t expected = channel < kSegment ? contents<uint8_t>(packed[i])[channel * kStride + row] : kUntouched;
+        if (contents<uint8_t>(transposed[i])[row * padded + channel] != expected)
+          fail("weight transpose changed a code or overwrote padding");
+        if (channel < kSegment &&
+            contents<uint8_t>(tokenMajor[i])[row * kSegment + channel] != (row < tokenRows ? expected : kUntouched))
+          fail("token-major input pack changed a code or overwrote a row");
+      }
     }
   }
   for (const MetalBuffer &segment : packed)

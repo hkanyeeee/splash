@@ -239,13 +239,19 @@ AneFfn::Memory AneFfn::allocate(const Shape &shape, MakeBuffer &&buffer, MakeSur
                             "ane ffn row scales");
   memory.rotated = buffer(uint64_t{kMaximumRows} * shape.hidden * sizeof(_Float16), "ane ffn rotated input");
   memory.status = buffer(sizeof(uint32_t), "ane ffn status");
-  for (const uint32_t width : shape.inputSegments) memory.inputs.push_back(surface(width, kMaximumRows, Element::Int8));
+  // For the M4 gate and up matmuls, tokens are contiguous rows of x and
+  // output channels are contiguous within each input channel's weight row.
+  const auto inputMatrix = [&](uint32_t rows, uint32_t width) {
+    // Both dimensions of the M4 split are aligned IOSurface row widths.
+    return shape.m4DenseSplit ? surface(width, rows, Element::Int8) : surface(rows, width, Element::Int8);
+  };
+  for (const uint32_t width : shape.inputSegments) memory.inputs.push_back(inputMatrix(width, kMaximumRows));
   memory.tokenScale = surface(1, kMaximumRows, Element::Float16);
   memory.partial = surface(shape.hidden + 1, kMaximumRows, Element::Float16);
   for (Weights &set : memory.sets) {
     for (const uint32_t width : shape.inputSegments) {
-      set.gate.push_back(surface(shape.ane, width, Element::Int8));
-      set.up.push_back(surface(shape.ane, width, Element::Int8));
+      set.gate.push_back(inputMatrix(shape.ane, width));
+      set.up.push_back(inputMatrix(shape.ane, width));
     }
     for (const uint32_t width : shape.downSegments) set.down.push_back(surface(shape.hidden, width, Element::Int8));
     set.gateScale = surface(shape.ane, 1, Element::Float16);
@@ -270,7 +276,7 @@ uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, uint32_
   return bytes;
 }
 
-// x<k>: the rotated input rows of segment k, channel-major in int8, and tx
+// x<k>: the rotated int8 input rows of segment k, and tx
 // their per-token scales; wg<k> and wu<k>: gate's and up's rotated int8 rows
 // over segment k, and sg and su their per-row scales; wd<i>: down's rotated
 // int8 rows over segment i of its ANE inputs, and sd their per-row scales.
@@ -280,12 +286,15 @@ std::vector<AneFfn::Input> AneFfn::programInputs(const Shape &shape, const Memor
   };
   std::vector<Input> inputs;
   for (uint32_t k = 0; k < memory.inputs.size(); ++k)
-    inputs.push_back({"x" + std::to_string(k), {&memory.inputs[k], &memory.inputs[k]}, shape.inputSegments[k], 0});
+    inputs.push_back(
+        {"x" + std::to_string(k), {&memory.inputs[k], &memory.inputs[k]}, shape.inputSegments[k], 0, true});
   inputs.push_back({"tx", {&memory.tokenScale, &memory.tokenScale}, 1, 0});
   for (uint32_t k = 0; k < memory.inputs.size(); ++k) {
     const uint32_t width = shape.inputSegments[k];
-    inputs.push_back({"wg" + std::to_string(k), {&memory.sets[0].gate[k], &memory.sets[1].gate[k]}, shape.ane, width});
-    inputs.push_back({"wu" + std::to_string(k), {&memory.sets[0].up[k], &memory.sets[1].up[k]}, shape.ane, width});
+    inputs.push_back(
+        {"wg" + std::to_string(k), {&memory.sets[0].gate[k], &memory.sets[1].gate[k]}, shape.ane, width, true});
+    inputs.push_back(
+        {"wu" + std::to_string(k), {&memory.sets[0].up[k], &memory.sets[1].up[k]}, shape.ane, width, true});
   }
   inputs.push_back({"sg", both(&Weights::gateScale), shape.ane, 1});
   inputs.push_back({"su", both(&Weights::upScale), shape.ane, 1});
@@ -303,7 +312,7 @@ std::vector<AneFfn::Input> AneFfn::programInputs(const Shape &shape, const Memor
 // in a last row each token's intermediate scale, which the join multiplies
 // with the input's in fp32 (ane_ffn_join): the output at full scale could
 // overflow fp16. The function reads and writes the leading `rows` of each row
-// of the chunk's surfaces.
+// of the chunk's surfaces, or the leading token rows of the M4 gate and up inputs.
 std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, const ane::Surface &output,
                              uint32_t rows) {
   const auto segmentCount = static_cast<uint32_t>(shape.inputSegments.size());
@@ -315,14 +324,22 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
     line(tensor("fp16", height, width) + " " + name + " = " + expression);
   };
   for (const Input &input : inputs) {
-    const uint32_t width = input.width ? input.width : rows;
+    uint32_t height = input.rows, width = input.width ? input.width : rows;
+    if (shape.m4DenseSplit && input.transposed) std::swap(height, width);
     parameters +=
-        (parameters.empty() ? "" : ", ") + input.surfaces[0]->bufferType(input.rows, width) + " " + input.name;
-    line(tensor(ane::Surface::milType(input.surfaces[0]->element), input.rows, width) + " " + input.name +
+        (parameters.empty() ? "" : ", ") + input.surfaces[0]->bufferType(height, width) + " " + input.name;
+    line(tensor(ane::Surface::milType(input.surfaces[0]->element), height, width) + " " + input.name +
          "_t = tensor_buffer_to_tensor<ios17>(input = " + input.name + ")");
   }
   const auto matmul = [&](const std::string &name, const std::string &weights, const std::string &values,
-                          uint64_t height, uint64_t width) {
+                          uint64_t height, uint64_t width, bool transposed) {
+    if (transposed) {
+      f16(weights + "_d", width, height, "dequantize(input = " + weights + "_t, scale = " + unit + ")");
+      f16(name + "_rows", rows, height, "matmul(transpose_x = bool(false), transpose_y = bool(false), x = " +
+          values + ", y = " + weights + "_d)");
+      f16(name, height, rows, "transpose(x = " + name + "_rows, perm = tensor<int32, [4]>([0, 1, 3, 2]))");
+      return;
+    }
     f16(weights + "_d", height, width, "dequantize(input = " + weights + "_t, scale = " + unit + ")");
     line(tensor("fp16", height, rows) + " " + name +
          " = matmul(transpose_x = bool(false), transpose_y = bool(false), x = " + weights + "_d, y = " + values + ")");
@@ -339,13 +356,14 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
 
   for (uint32_t k = 0; k < segmentCount; ++k) {
     const std::string x = "x" + std::to_string(k);
-    f16(x + "_d", shape.inputSegments[k], rows, "dequantize(input = " + x + "_t, scale = " + unit + ")");
+    f16(x + "_d", shape.m4DenseSplit ? rows : shape.inputSegments[k], shape.m4DenseSplit ? shape.inputSegments[k] : rows,
+        "dequantize(input = " + x + "_t, scale = " + unit + ")");
   }
   for (const char *projection : {"g", "u"}) {
     const std::string p = projection;
     for (uint32_t k = 0; k < segmentCount; ++k)
       matmul(p + "m" + std::to_string(k), "w" + p + std::to_string(k), "x" + std::to_string(k) + "_d", channels,
-             shape.inputSegments[k]);
+             shape.inputSegments[k], shape.m4DenseSplit);
     f16(p + "s", channels, rows, "mul(x = " + sum(p + "m", segmentCount, channels) + ", y = s" + p + "_t)");
   }
   const std::string c = std::to_string(channels), r = std::to_string(rows),
@@ -359,7 +377,7 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   f16("tp", channels, rows, "add(x = th, y = " + fp16(1.0) + ")");
   f16("silu", channels, rows, "mul(x = gh, y = tp)");
   f16("h", channels, rows, "mul(x = silu, y = us)");
-  if (shape.sharedRotation) {
+  if (shape.m4DenseSplit) {
     // Treat each 512-channel block as a batch that reads the same weight operand.
     const std::string dims =
         "[1, " + std::to_string(channels / ANE_FFN_INTERMEDIATE_BLOCK) + ", " + block + ", " + r + "]";
@@ -399,7 +417,7 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
     f16(slice, width, rows,
         "slice_by_size(x = hd, begin = tensor<int32, [4]>([0, 0, " + std::to_string(begin) +
             ", 0]), size = tensor<int32, [4]>(" + dimensions(width, rows) + "))");
-    matmul("dm" + index, "wd" + index, slice, shape.hidden, width);
+    matmul("dm" + index, "wd" + index, slice, shape.hidden, width, false);
     begin += width;
   }
   f16("ds", shape.hidden, rows, "mul(x = " + sum("dm", shape.downSegments.size(), shape.hidden) + ", y = sd_t)");
@@ -425,6 +443,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
                uint32_t aneUnits, std::function<bool()> interrupted, std::span<const uint32_t> functionRows)
     : backend_(backend), linear_(linear), shape_(shapeOf(layers, aneUnits)),
       handoff_(backend, kHandoffBound) {
+  shape_.m4DenseSplit = backend_.capabilities().is40CoreM4Max() && shape_.hidden == 5120 &&
+                          shape_.intermediate == 17408 && shape_.ane == 19 * ANE_FFN_INTERMEDIATE_BLOCK;
   // What Metal allocates, which the memory audit compares with the plan.
   memory_ = allocate(
       shape_,
@@ -448,10 +468,8 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
                        source.up->rows(backend_, {{0, shape_.gpu}}),
                        source.down->leadingInputs(shape_.gpu)});
 
-  shape_.sharedRotation = backend_.capabilities().is40CoreM4Max() && shape_.hidden == 5120 &&
-                          shape_.intermediate == 17408 && shape_.ane == 19 * ANE_FFN_INTERMEDIATE_BLOCK;
   const std::vector<Input> inputs = programInputs(shape_, memory_);
-  const uint32_t rotationRows = shape_.sharedRotation ? ANE_FFN_INTERMEDIATE_BLOCK : shape_.ane;
+  const uint32_t rotationRows = shape_.m4DenseSplit ? ANE_FFN_INTERMEDIATE_BLOCK : shape_.ane;
   program_ = std::make_unique<ane::Program>(program(shape_, inputs, memory_.partial, functionRows),
                                             rotationBlob(rotationRows, signs),
                                             ane::Program::Limits{kProgramLimit, std::move(interrupted)});
@@ -514,13 +532,34 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
                        uint32_t input, uint32_t width, uint32_t rows, Rotation rotation) {
     const Planes &planes = source.planes[static_cast<size_t>(matrix)];
     const uint32_t scaleStride = scale.strideBytes / uint32_t{sizeof(_Float16)};
-    requireBytes(output.buffer, rowBytes(rows, output.strideBytes, width, 1), "ANE FFN weight surface");
+    const bool transpose = shape_.m4DenseSplit && rotation == Rotation::Inputs;
+    const uint32_t stride = transpose ? width : output.strideBytes;
+    requireBytes(output.buffer, rowBytes(transpose ? width : rows, output.strideBytes, transpose ? rows : width, 1),
+                 "ANE FFN weight surface");
     requireBytes(scale.buffer, rowBytes(rows, scaleStride, 1, sizeof(_Float16)), "ANE FFN weight scale surface");
-    graph.add(kernel("ane_ffn_weights_gguf", rotation),
-              {planes.buffers[0], planes.buffers[1], planes.buffers[2], rowScales(layer, matrix), output.buffer,
-               scale.buffer, memory_.signs},
-              AneFfnWeightParams{planes.groups, row, input, width, output.strideBytes, scaleStride, planes.format},
-              {rows / ANE_FFN_WEIGHT_ROWS, width / blockOf(rotation), 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
+    const auto scales = rowScales(layer, matrix);
+    // Reuse the rotation scratch between input packs. Each stripe holds whole
+    // transpose tiles. The original kernel rounds every weight into int8.
+    const uint32_t stripe =
+        transpose ? uint32_t(memory_.rotated.sizeBytes() / width / ANE_FFN_TILE) * ANE_FFN_TILE : rows;
+    if (!stripe) throw std::logic_error("ANE FFN weight scratch does not hold one tile");
+    for (uint32_t first = 0; first < rows; first += stripe) {
+      const uint32_t count = std::min(stripe, rows - first);
+      const auto from = backend_.view(scales, first * sizeof(_Float16), count * sizeof(_Float16));
+      const auto to = backend_.view(scale.buffer, uint64_t{first} * scale.strideBytes,
+                                    rowBytes(count, scaleStride, 1, sizeof(_Float16)));
+      graph.add(kernel("ane_ffn_weights_gguf", rotation),
+                {planes.buffers[0], planes.buffers[1], planes.buffers[2], from,
+                 transpose ? memory_.rotated : output.buffer, to, memory_.signs},
+                AneFfnWeightParams{planes.groups, row + first, input, width, stride, scaleStride, planes.format},
+                {count / ANE_FFN_WEIGHT_ROWS, width / blockOf(rotation), 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
+      if (transpose) {
+        const auto target = backend_.view(output.buffer, first, rowBytes(width, output.strideBytes, count, 1));
+        graph.add("ane_ffn_transpose_weights", {memory_.rotated, target},
+                  std::array<uint32_t, 2>{width, output.strideBytes}, {width / ANE_FFN_TILE, count / ANE_FFN_TILE, 1},
+                  {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+      }
+    }
   };
   uint32_t input = 0;
   for (size_t k = 0; k < shape_.inputSegments.size(); ++k) {
@@ -575,13 +614,18 @@ void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfn
   if (!layer) addWeights(graph, 0, 0);
   graph.add("ane_ffn_rotate", {ffn.normalized, memory_.signs, memory_.rotated, memory_.tokenScale.buffer},
             AneFfnRotateParams{shape_.hidden}, {rows, 1, 1}, {ANE_FFN_ROTATE_THREADS, 1, 1});
-  uint32_t channel = 0;
-  for (size_t k = 0; k < shape_.inputSegments.size(); ++k) {
-    const uint32_t width = shape_.inputSegments[k];
-    graph.add("ane_ffn_pack", {memory_.rotated, memory_.inputs[k].buffer},
-              AneFfnPackParams{shape_.hidden, channel, memory_.inputs[k].strideBytes},
-              {tiles, width / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
-    channel += width;
+  if (shape_.m4DenseSplit) {
+    graph.add("ane_ffn_pack_token_rows", {memory_.rotated, memory_.inputs[0].buffer, memory_.inputs[1].buffer},
+              kSegment, {shape_.hidden / (256 * 4), rows, 1}, {256, 1, 1});
+  } else {
+    uint32_t channel = 0;
+    for (size_t k = 0; k < shape_.inputSegments.size(); ++k) {
+      const uint32_t width = shape_.inputSegments[k];
+      graph.add("ane_ffn_pack", {memory_.rotated, memory_.inputs[k].buffer},
+                AneFfnPackParams{shape_.hidden, channel, memory_.inputs[k].strideBytes},
+                {tiles, width / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+      channel += width;
+    }
   }
   const uint64_t ready = ane ? handoff_.next() : 0;
   if (ane) graph.signal(handoff_.event(), ready);

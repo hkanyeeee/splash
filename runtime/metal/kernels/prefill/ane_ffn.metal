@@ -268,3 +268,26 @@ kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
     output[index] = bfloat(float(output[index]) + staged[position.x][j] * scale[j]);
   }
 }
+
+// The two segments of the 5120-channel M4 gate and up input, in token order.
+kernel void ane_ffn_pack_token_rows(device const half4 *rotated [[buffer(0)]],
+                                    device char4 *first [[buffer(1)]], device char4 *second [[buffer(2)]],
+                                    constant uint &width [[buffer(3)]], uint2 id [[thread_position_in_grid]]) {
+  const uint segment = width / 4;
+  const half4 value = rotated[id.y * 2 * segment + id.x];
+  (id.x < segment ? first : second)[id.y * segment + id.x % segment] =
+      char4(clamp(rint(float4(value)), -ANE_FFN_INT8_PEAK, ANE_FFN_INT8_PEAK));
+}
+
+// Each tile transposes int8 weights after the rotation kernel has rounded them.
+kernel void ane_ffn_transpose_weights(device const char *input [[buffer(0)]], device char *output [[buffer(1)]],
+                                      constant uint2 &strides [[buffer(2)]], uint2 tile [[threadgroup_position_in_grid]],
+                                      uint2 lane [[thread_position_in_threadgroup]]) {
+  threadgroup char values[ANE_FFN_TILE][ANE_FFN_TILE + 1];
+  const uint x = tile.x * ANE_FFN_TILE, y = tile.y * ANE_FFN_TILE;
+  for (uint i = lane.y; i < ANE_FFN_TILE; i += ANE_FFN_TILE_ROWS)
+    values[i][lane.x] = input[ulong(y + i) * strides.x + x + lane.x];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = lane.y; i < ANE_FFN_TILE; i += ANE_FFN_TILE_ROWS)
+    output[ulong(x + i) * strides.y + y + lane.x] = values[lane.x][i];
+}

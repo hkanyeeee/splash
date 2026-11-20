@@ -163,7 +163,9 @@ private:
   struct Shape final {
     uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0;
     std::vector<uint32_t> inputSegments, downSegments;
-    bool sharedRotation = false;
+    // The M4 gate and up use token-major inputs, and the intermediate
+    // rotation reuses one block matrix across all its channel blocks.
+    bool m4DenseSplit = false;
   };
   // A staging set of the ANE's int8 weights: gate's and up's rows over each
   // segment of the hidden inputs, down's rows over each segment of its ANE
@@ -211,6 +213,7 @@ private:
     std::string name;
     std::array<const ane::Surface *, 2> surfaces;
     uint32_t rows = 0, width = 0;
+    bool transposed = false; // This input takes the transposed layout on the M4 dense split.
   };
   // What encode() adds of a split layer: the GPU's work alone (its channels,
   // the staging of the next layer's int8 weights, and the packing and join
