@@ -291,6 +291,8 @@ struct LinearBuffers final {
 // about a quarter off Qwen3.8-27B MLX 4-bit prefill.
 enum class Int8Activations : uint8_t { Off, On };
 
+enum class PrefillGeometry { General, Short128, Short256, PairedColumns };
+
 // Owns projection pipeline selection and dispatch. Plans follow the device's
 // KernelCalibration and the runtime's Int8Activations (KernelSelection.cpp),
 // which ExecutionPlans also gives its attention plans.
@@ -300,8 +302,8 @@ public:
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
-  // SIMD groups per narrow column tile for an eligible packed projection, or zero for the general tile.
-  [[nodiscard]] uint32_t shortPrefillGroups(uint32_t rows) const noexcept;
+  // Geometry of eligible packed projections at this row count, used by dispatch and startup warmup.
+  [[nodiscard]] PrefillGeometry prefillGeometry(uint32_t rows) const noexcept;
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection,

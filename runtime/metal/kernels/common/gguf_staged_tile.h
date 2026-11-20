@@ -88,22 +88,23 @@ __attribute__((always_inline)) inline void gguf_staged_tile_walk(uint step_begin
 // payload while the step's matmul runs, and so its meta unit when the next step enters a new one (a unit spans
 // F::MetaGroups groups): both DRAM round trips overlap a matmul. Both go to the registers the step has just
 // dequantized from, so the prefetch holds no second meta unit.
-template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc>
+// A simdgroup multiplies FragmentColumns adjacent columns starting at first_column within the shared stage.
+template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, ushort FragmentColumns = Cols, class Acc>
 inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
                               uint output_origin, threadgroup half *stage, threadgroup half2 *tl, uint thread_index,
-                              uint step_begin, uint step_end, uint step_first, bool matmuls, thread Acc &acc) {
+                              uint step_begin, uint step_end, uint step_first, bool matmuls, thread Acc &acc, uint first_column = 0) {
   constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + Threads - 1) / Threads;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
-  constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto descriptor = matmul2d_descriptor(Rows, FragmentColumns, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
   device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
   device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
   device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
-  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
-  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * Cols, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
-  auto b0 = bt0.slice<KS, Cols>(0, 0), b1 = bt1.slice<KS, Cols>(0, 0);
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage + first_column * KS, dextents<int, 2>{KS, FragmentColumns}, array<int, 2>{1, KS});
+  tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + (Cols + first_column) * KS, dextents<int, 2>{KS, FragmentColumns}, array<int, 2>{1, KS});
+  auto b0 = bt0.slice<KS, FragmentColumns>(0, 0), b1 = bt1.slice<KS, FragmentColumns>(0, 0);
   // Per item: the payload of the step it stages next and that step's meta unit.
   typename F::Payload packed[IPT]; typename F::Meta hdr[IPT];
 #pragma unroll

@@ -36,6 +36,7 @@
 // Narrow output tiles used by the 40-core M4 Max on short prefills.
 #define GGUF_PREFILL_SHORT_COLUMNS 32u
 #define GGUF_PREFILL_SHORT_GROUPS 2u
+#define GGUF_PREFILL_COLUMN_GROUPS 2u
 // Apple9 register tile: four simdgroups of GGUF_REGISTER_COLUMNS columns.
 #define GGUF_REGISTER_COLUMNS 16u
 #define GGUF_REGISTER_THREADS (GGUF_TILE_COLUMNS / GGUF_REGISTER_COLUMNS * 32u)

@@ -70,30 +70,28 @@ inline void gguf_store_gate_up(thread Acc &gate, thread Acc &up, uint splits, ui
   split_release(counter, lane);
 }
 
-// ---------------- prefill tiles: a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG
-// rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is
-// not a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather
-// than to the tile (a 33-row chunk: 1.7x faster than a 128-row tile). Full tiles run this loop too; a branch-free copy
-// for them is no faster.
-template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
+// Prefill stages TileN columns once per threadgroup. Each row group owns RowsPerSG rows, split across
+// ColumnGroups simdgroups. Groups past the last active row skip matmuls and stores but still stage the weights.
+template <class F, ushort RowsPerSG, ushort RowGroups, ushort TileN, ushort KS, ushort ColumnGroups, GgufEpilogue Ep = EpNone>
 inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
                     uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
-  const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
-  device bfloat *rows_input = input + ulong(simd_group) * RowsPerSG * input_size;
-  auto acc = staged_accumulator<RowsPerSG, TileN, KS>(rows_input, input_size, stage);
+  constexpr ushort FragmentColumns = TileN / ColumnGroups;
+  static_assert(TileN % ColumnGroups == 0);
+  const uint row = (simd_group / ColumnGroups) * RowsPerSG;
+  const uint column = (simd_group % ColumnGroups) * FragmentColumns;
+  const bool owns_rows = row < rows;
+  device bfloat *rows_input = input + ulong(row) * input_size;
+  auto acc = staged_accumulator<RowsPerSG, FragmentColumns, KS>(rows_input, input_size, stage);
   gguf_zero(acc);
-  gguf_staged_steps<F, RowsPerSG, TileN, KS, Simdgroups * 32>(rows_input, w0, w1, meta, input_size, output_origin, stage, tl,
-                                                              simd_group * 32 + simd_lane, 0, input_size / KS, 0, owns_rows,
-                                                              acc);
+  gguf_staged_steps<F, RowsPerSG, TileN, KS, RowGroups * ColumnGroups * 32, FragmentColumns>(
+      rows_input, w0, w1, meta, input_size, output_origin, stage, tl, simd_group * 32 + simd_lane,
+      0, input_size / KS, 0, owns_rows, acc, column);
   if (!owns_rows) return;
-#pragma unroll
-  for (ushort i = 0; i < acc.get_capacity(); ++i) {
-    if (!acc.is_valid_element(i)) continue;
-    auto index = acc.get_multidimensional_index(i);
-    const ulong o = (ulong(simd_group) * RowsPerSG + index[1]) * out_stride + out_offset + output_origin + index[0];
-    output[o] = gguf_epilogue<Ep>(acc[i], aux, o);
-  }
+  gguf_elements(acc, [&](uint r, uint c, float value) {
+    const ulong o = ulong(row + r) * out_stride + out_offset + output_origin + column + c;
+    output[o] = gguf_epilogue<Ep>(value, aux, o);
+  });
 }
 
 // ---------------- decode dispatches over (64-column tiles, K partitions): two simdgroups of 32 columns per
@@ -272,25 +270,25 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
   threadgroup half stage[2 * Cols * Step]
 // The plain kernel takes up to three segments of its format (GgufPrefillSegmentsParams), so the segments of a fused
 // projection that share a format run as one dispatch, grid.y over their column tiles in segment order.
-#define GGUF_PREFILL(F, f, Step, Groups, Cols)                                                                     \
+#define GGUF_PREFILL(F, f, Step, Groups, Cols, ColumnGroups)                                                       \
   kernel void gguf_prefill_##f##_a(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                              \
                                    device bfloat *output [[buffer(10)]],                                           \
                                    constant GgufPrefillSegmentsParams &p [[buffer(11)]], GGUF_PREFILL_THREAD) {    \
-    GGUF_PREFILL_TABLES(F, Step, Groups, Cols);                                                                    \
+    GGUF_PREFILL_TABLES(F, Step, (Groups) * (ColumnGroups), Cols);                                                 \
     GGUF_SEGMENT_OF(group.y, p.cols, Cols);                                                                        \
     const uint first = group.x * GGUF_PREFILL_SIMDGROUP_ROWS * Groups;                                             \
     const uint rows = p.rows > first ? p.rows - first : 0;                                                         \
-    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, Groups, Cols, Step>(                                         \
+    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, Groups, Cols, Step, ColumnGroups>(                           \
         input + ulong(first) * p.input_size, w0, w1, meta, output + ulong(first) * p.out_stride, p.input_size,     \
         local * Cols, rows, stage, tl, simd_lane, simd_group, p.out_stride, p.offset[s]);                          \
   }
-#define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep, Step, Groups, Cols)                                                    \
+#define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep, Step, Groups, Cols, ColumnGroups)                                      \
   kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                      \
                                       constant GgufPrefillParams &p [[buffer(6)]], GGUF_PREFILL_THREAD) {          \
-    GGUF_PREFILL_TABLES(F, Step, Groups, Cols);                                                                    \
+    GGUF_PREFILL_TABLES(F, Step, (Groups) * (ColumnGroups), Cols);                                                 \
     const uint first = group.x * GGUF_PREFILL_SIMDGROUP_ROWS * Groups;                                             \
     const uint rows = p.rows > first ? p.rows - first : 0;                                                         \
-    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, Groups, Cols, Step, Ep>(                                     \
+    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, Groups, Cols, Step, ColumnGroups, Ep>(                       \
         input + ulong(first) * p.input_size, w0, w1, meta, output + ulong(first) * p.out_stride, p.input_size,     \
         group.y * Cols, rows, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset,                        \
         aux + ulong(first) * p.out_stride);                                                                        \
@@ -299,11 +297,11 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
 // projection, one per format. Each runs the tile of its residual kernel on the planes advanced past the groups and
 // meta units the view leaves unread in the rows of the plane tiles before its column tile, which the tile then
 // addresses as rows of input_size inputs.
-#define GGUF_PREFILL_LEADING_INPUTS(F, f, Step)                                                                    \
+#define GGUF_PREFILL_LEADING_INPUTS(F, f, Step, ColumnGroups)                                                      \
   kernel void gguf_prefill_##f##_r_leading_inputs(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],          \
                                                   constant GgufPrefillLeadingParams &leading [[buffer(6)]],        \
                                                   GGUF_PREFILL_THREAD) {                                           \
-    GGUF_PREFILL_TABLES(F, Step, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS);                                      \
+    GGUF_PREFILL_TABLES(F, Step, GGUF_PREFILL_SIMDGROUPS * (ColumnGroups), GGUF_TILE_COLUMNS);                     \
     constant GgufPrefillParams &p = leading.prefill;                                                               \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
     const ulong before = ulong(group.y * GGUF_TILE_COLUMNS / QUANT_TILE_ROWS) * QUANT_TILE_ROWS;                   \
@@ -311,28 +309,32 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
     const ulong unread = before * (plane_groups - groups),                                                         \
                 unread_units = before * (plane_groups / F::MetaGroups - groups / F::MetaGroups);                   \
     gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, Step,            \
-                      EpResidual>(input + ulong(first) * p.input_size, w0 + unread * F::P0, w1 + unread * F::P1,   \
+                      ColumnGroups, EpResidual>(input + ulong(first) * p.input_size, w0 + unread * F::P0, w1 + unread * F::P1,\
                                   meta + unread_units * F::MetaBytes, output + ulong(first) * p.out_stride,        \
                                   p.input_size, group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane,           \
                                   simd_group, p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);      \
   }
-#define GGUF_PREFILL_TILED(F, f, Step, Groups, Cols) \
-  GGUF_PREFILL(F, f, Step, Groups, Cols) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual, Step, Groups, Cols) \
-  GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate, Step, Groups, Cols)
-#define GGUF_PREFILL_KERNELS(F, f, Step) \
-  GGUF_PREFILL_TILED(F, f, Step, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS) GGUF_PREFILL_LEADING_INPUTS(F, f, Step)
-#define GGUF_PREFILL_FORMAT(F, f) GGUF_PREFILL_KERNELS(F, f, GGUF_PREFILL_STEP)
+#define GGUF_PREFILL_TILED(F, f, Step, Groups, Cols, ColumnGroups) \
+  GGUF_PREFILL(F, f, Step, Groups, Cols, ColumnGroups) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual, Step, Groups, Cols, ColumnGroups)\
+  GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate, Step, Groups, Cols, ColumnGroups)
+#define GGUF_PREFILL_KERNELS(F, f, Step, ColumnGroups) \
+  GGUF_PREFILL_TILED(F, f, Step, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, ColumnGroups) GGUF_PREFILL_LEADING_INPUTS(F, f, Step, ColumnGroups)
+#define GGUF_PREFILL_FORMAT(F, f) GGUF_PREFILL_KERNELS(F, f, GGUF_PREFILL_STEP, 1)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
 // The 40-core M4 Max split prefill stages one 32-input quantization group at a time.
-GGUF_PREFILL_KERNELS(FmtQ5Pack, q5pack_k32, 32)
-GGUF_PREFILL_KERNELS(FmtQ6Pack, q6pack_k32, 32)
-GGUF_PREFILL_KERNELS(FmtQ80, q80_k32, 32)
+GGUF_PREFILL_KERNELS(FmtQ5Pack, q5pack_k32, 32, 1)
+GGUF_PREFILL_KERNELS(FmtQ6Pack, q6pack_k32, 32, 1)
+GGUF_PREFILL_KERNELS(FmtQ80, q80_k32, 32, 1)
 #define GGUF_PREFILL_SHORT(F, f) \
-  GGUF_PREFILL_TILED(F, f##_short128, 32, GGUF_PREFILL_SIMDGROUPS, GGUF_PREFILL_SHORT_COLUMNS) \
-  GGUF_PREFILL_TILED(F, f##_short256, 64, GGUF_PREFILL_SHORT_GROUPS, GGUF_PREFILL_SHORT_COLUMNS)
+  GGUF_PREFILL_TILED(F, f##_short128, 32, GGUF_PREFILL_SIMDGROUPS, GGUF_PREFILL_SHORT_COLUMNS, 1) \
+  GGUF_PREFILL_TILED(F, f##_short256, 64, GGUF_PREFILL_SHORT_GROUPS, GGUF_PREFILL_SHORT_COLUMNS, 1)
 GGUF_PREFILL_SHORT(FmtQ5Pack, q5pack)
 GGUF_PREFILL_SHORT(FmtQ6Pack, q6pack)
 GGUF_PREFILL_SHORT(FmtQ80, q80)
+// Two simdgroups multiply adjacent 32-column fragments of each long prefill row group.
+GGUF_PREFILL_KERNELS(FmtQ5Pack, q5pack_col2, 64, GGUF_PREFILL_COLUMN_GROUPS)
+GGUF_PREFILL_KERNELS(FmtQ6Pack, q6pack_col2, 64, GGUF_PREFILL_COLUMN_GROUPS)
+GGUF_PREFILL_KERNELS(FmtQ80, q80_col2, 64, GGUF_PREFILL_COLUMN_GROUPS)
 #undef GGUF_PREFILL_SHORT
 #undef GGUF_PREFILL_TILED
 #undef GGUF_PREFILL_FORMAT

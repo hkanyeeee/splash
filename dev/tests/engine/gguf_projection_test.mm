@@ -393,9 +393,9 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   return out;
 }
 
-// Compare short M4 prefill tiles against the general prefill kernel on the same device, including repeated
+// Compare M4 prefill tiles against the general prefill kernel on the same device, including repeated
 // segments of one format, auxiliary reads at nonzero offsets, and the last partially active simdgroup.
-void shortPrefill(MetalBackend &backend, const Linear &linear) {
+void m4PrefillGeometry(MetalBackend &backend, const Linear &linear) {
   if (!backend.capabilities().is40CoreM4Max()) return;
   DeviceCapabilities general = backend.capabilities();
   general.gpuCoreCount = 32;
@@ -404,22 +404,24 @@ void shortPrefill(MetalBackend &backend, const Linear &linear) {
   const Tensor a = tensor(backend, Q6Pack, width, k), b = tensor(backend, Q5Pack, width, k),
                c = tensor(backend, Q80, width, k), d = tensor(backend, Q6Pack, width, k);
   const Projection p = projection({&a, &b, &c, &d}, stride);
-  const auto input = activations(Inputs::Dense, 384, k), auxiliary = residuals(384, stride);
-  for (const uint32_t rows : {64u, 65u, 92u, 128u, 129u, 192u, 256u, 257u}) {
+  const auto input = activations(Inputs::Dense, 640, k), auxiliary = residuals(640, stride);
+  for (const uint32_t rows : {64u, 65u, 92u, 128u, 129u, 192u, 256u, 257u, 511u, 512u, 513u}) {
     for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
       const auto plan = Linear::plan({{stride, k}, rows, e}, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
       const auto x = storageRows(input, k, rows, plan.storageRows());
       const auto aux = storageRows(auxiliary, stride, rows, plan.storageRows());
-      const std::string label = "short prefill " + std::to_string(rows) + " " + epilogueName(e);
+      const std::string label = "M4 prefill " + std::to_string(rows) + " " + epilogueName(e);
       const auto original = run(backend, reference, plan, p, nullptr, x, aux, kPoisonNaN, 4 * width, label);
       const auto actual = run(backend, linear, plan, p, nullptr, x, aux, kPoisonNaN, 4 * width, label);
       if (actual.output != original.output) fail(label + ": differs from general tile");
       const bool narrow = rows > kMaximumDecodeTileRows && rows <= 256;
       for (const auto &name : actual.pipelines)
-        if ((name.find("_short") != std::string::npos) != narrow) fail(label + ": unexpected pipeline " + name);
+        if ((name.find("_short") != std::string::npos) != narrow ||
+            (name.find("_col2") != std::string::npos) != (rows >= 512))
+          fail(label + ": unexpected pipeline " + name);
     }
   }
-  section("short prefill: 64 through 257 rows, three packed formats, three epilogues and repeated segment offsets");
+  section("M4 prefill: 64 through 513 rows, three packed formats, three epilogues and repeated segment offsets");
 }
 
 // A ragged final SME tile, guard bands and the CPU/GPU handoff in the normal Linear path.
@@ -1921,7 +1923,7 @@ int main(int argc, char **argv) {
     try {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities(), Int8Activations::On);
-      shortPrefill(backend, linear);
+      m4PrefillGeometry(backend, linear);
       smePrefill(backend);
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));

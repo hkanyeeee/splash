@@ -35,23 +35,31 @@ std::string decodeKernel(bool int8, const char *format, uint32_t rows, std::stri
 // A narrower column tile supplies more independent threadgroups when the chunk has few row tiles.
 struct PrefillTile {
   const char *suffix;
-  uint32_t groups;
+  uint32_t rowGroups;
   uint32_t columns;
+  uint32_t columnGroups = 1;
 
   metal::DispatchSize grid(uint32_t rows, uint32_t outputs) const noexcept {
-    const uint32_t height = groups * GGUF_PREFILL_SIMDGROUP_ROWS;
+    const uint32_t height = rowGroups * GGUF_PREFILL_SIMDGROUP_ROWS;
     return {(rows + height - 1) / height, outputs / columns, 1};
   }
-  metal::DispatchSize threads() const noexcept { return {groups * 32, 1, 1}; }
+  metal::DispatchSize threads() const noexcept { return {rowGroups * columnGroups * 32, 1, 1}; }
   std::string kernel(const QuantizedSegment &segment, char epilogue) const {
     return std::string("gguf_prefill_") + segment.name() + suffix + epilogue;
   }
 };
-PrefillTile prefillTile(uint32_t format, uint32_t k, uint32_t shortGroups, bool split) noexcept {
+PrefillTile prefillTile(uint32_t format, uint32_t k, PrefillGeometry geometry, bool leading, bool split) noexcept {
   const bool packed = format == GGUF_FMT_Q5PACK || format == GGUF_FMT_Q6PACK || format == GGUF_FMT_Q80;
-  if (packed && shortGroups && (k == 5120 || k == 6144 || k == 17408))
-    return {shortGroups == GGUF_PREFILL_SIMDGROUPS ? "_short128_" : "_short256_", shortGroups,
-            GGUF_PREFILL_SHORT_COLUMNS};
+  if (packed && (k == 5120 || k == 6144 || k == 7680 || k == 17408)) {
+    if (geometry == PrefillGeometry::PairedColumns)
+      return {"_col2_", GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_COLUMN_GROUPS};
+    if (!leading && k != 7680) {
+      if (geometry == PrefillGeometry::Short128)
+        return {"_short128_", GGUF_PREFILL_SIMDGROUPS, GGUF_PREFILL_SHORT_COLUMNS};
+      if (geometry == PrefillGeometry::Short256)
+        return {"_short256_", GGUF_PREFILL_SHORT_GROUPS, GGUF_PREFILL_SHORT_COLUMNS};
+    }
+  }
   return {packed && split ? "_k32_" : "_", GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS};
 }
 
@@ -143,9 +151,12 @@ std::pair<const QuantizedSegment &, const QuantizedSegment &> onePassTensors(con
 
 } // namespace
 
-uint32_t Linear::shortPrefillGroups(uint32_t rows) const noexcept {
-  if (!smePrefill_ || rows <= kMaximumDecodeTileRows || rows > 256) return 0;
-  return rows <= 128 ? GGUF_PREFILL_SIMDGROUPS : GGUF_PREFILL_SHORT_GROUPS;
+PrefillGeometry Linear::prefillGeometry(uint32_t rows) const noexcept {
+  if (!smePrefill_ || rows <= kMaximumDecodeTileRows) return PrefillGeometry::General;
+  if (rows <= 128) return PrefillGeometry::Short128;
+  if (rows <= 256) return PrefillGeometry::Short256;
+  if (rows >= 512) return PrefillGeometry::PairedColumns;
+  return PrefillGeometry::General;
 }
 
 void LinearPlan::requireConfiguration() const {
@@ -415,7 +426,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
   const auto tileFor = [&](uint32_t format) {
-    return prefillTile(format, k, p.planeInputs() ? 0 : shortPrefillGroups(w.rows), smePrefill_ && b.prefillCpu);
+    return prefillTile(format, k, prefillGeometry(w.rows), p.planeInputs() != 0, smePrefill_ && b.prefillCpu);
   };
   if (w.epilogue == LinearEpilogue::None && !p.planeInputs()) {
     const std::vector<QuantizedSegment> &segments = p.blocks().segments;

@@ -752,7 +752,7 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
                        " rows after " + std::to_string(chunk->second) + " tokens");
   };
   const Linear &linear = plans.linear();
-  check("short prefill groups", noHistory, [&](uint32_t rows, uint32_t) { return linear.shortPrefillGroups(rows); });
+  check("prefill geometry", noHistory, [&](uint32_t rows, uint32_t) { return linear.prefillGeometry(rows); });
   // A projection plan's tile, and a staged tile's height, which names its kernels.
   const auto tile = [](const LinearPlan &plan) {
     const LinearTile t = plan.configuration().tile;
