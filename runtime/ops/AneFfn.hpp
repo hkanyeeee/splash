@@ -163,6 +163,7 @@ private:
   struct Shape final {
     uint32_t hidden = 0, intermediate = 0, layers = 0, gpu = 0, ane = 0;
     std::vector<uint32_t> inputSegments, downSegments;
+    bool sharedRotation = false;
   };
   // A staging set of the ANE's int8 weights: gate's and up's rows over each
   // segment of the hidden inputs, down's rows over each segment of its ANE

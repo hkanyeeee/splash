@@ -140,9 +140,8 @@ std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> rotationSigns() {
   return signs;
 }
 
-// The program's constant: the rotation of each of the ANE's intermediate
-// channels as the [channels, ANE_FFN_INTERMEDIATE_BLOCK, 1, 1] weight of a
-// grouped 1x1 convolution.
+// The rotation matrix in each block is identical. The batched matmul needs one
+// copy, while the grouped convolution takes one copy per group.
 std::vector<uint8_t> rotationBlob(uint32_t channels, const std::array<float, ANE_FFN_INTERMEDIATE_BLOCK> &signs) {
   constexpr uint32_t block = ANE_FFN_INTERMEDIATE_BLOCK;
   std::vector<_Float16> values(uint64_t{channels} * block);
@@ -360,17 +359,31 @@ std::string AneFfn::function(const Shape &shape, std::span<const Input> inputs, 
   f16("tp", channels, rows, "add(x = th, y = " + fp16(1.0) + ")");
   f16("silu", channels, rows, "mul(x = gh, y = tp)");
   f16("h", channels, rows, "mul(x = silu, y = us)");
-  line("tensor<fp16, [1, " + c + ", 1, " + r + "]> h4 = reshape(x = h, shape = tensor<int32, [4]>([1, " + c + ", 1, " +
-       r + "]))");
-  line("tensor<fp16, [" + c + ", " + block +
-       ", 1, 1]> rotation = const()[name = string(\"rotation\"), val = tensor<fp16, [" + c + ", " + block +
-       ", 1, 1]>(BLOBFILE(path = string(\"@model_path/weights.bin\"), offset = uint64(" +
-       std::to_string(ane::kConstantOffset) + ")))]");
-  line("tensor<fp16, [1, " + c + ", 1, " + r + "]> hr4 = conv(dilations = tensor<int32, [2]>([1, 1]), groups = int32(" +
-       std::to_string(channels / ANE_FFN_INTERMEDIATE_BLOCK) +
-       "), pad = tensor<int32, [4]>([0, 0, 0, 0]), pad_type = string(\"valid\"), strides = tensor<int32, [2]>([1, "
-       "1]), weight = rotation, x = h4)");
-  f16("hr", channels, rows, "reshape(x = hr4, shape = tensor<int32, [4]>(" + dimensions(channels, rows) + "))");
+  if (shape.sharedRotation) {
+    // Treat each 512-channel block as a batch that reads the same weight operand.
+    const std::string dims =
+        "[1, " + std::to_string(channels / ANE_FFN_INTERMEDIATE_BLOCK) + ", " + block + ", " + r + "]";
+    const std::string batch = "tensor<fp16, " + dims + ">";
+    const std::string matrix = tensor("fp16", ANE_FFN_INTERMEDIATE_BLOCK, ANE_FFN_INTERMEDIATE_BLOCK);
+    line(batch + " hslices = reshape(x = h, shape = tensor<int32, [4]>(" + dims + "))");
+    line(matrix + " rotbase = const()[name = string(\"rotbase\"), val = " + matrix +
+         "(BLOBFILE(path = string(\"@model_path/weights.bin\"), offset = uint64(" +
+         std::to_string(ane::kConstantOffset) + ")))]");
+    line(batch + " hrslices = matmul(transpose_x = bool(false), transpose_y = bool(false), x = rotbase, y = hslices)");
+    f16("hr", channels, rows, "reshape(x = hrslices, shape = tensor<int32, [4]>(" + dimensions(channels, rows) + "))");
+  } else {
+    line("tensor<fp16, [1, " + c + ", 1, " + r + "]> h4 = reshape(x = h, shape = tensor<int32, [4]>([1, " + c + ", 1, " +
+         r + "]))");
+    line("tensor<fp16, [" + c + ", " + block +
+         ", 1, 1]> rotation = const()[name = string(\"rotation\"), val = tensor<fp16, [" + c + ", " + block +
+         ", 1, 1]>(BLOBFILE(path = string(\"@model_path/weights.bin\"), offset = uint64(" +
+         std::to_string(ane::kConstantOffset) + ")))]");
+    line("tensor<fp16, [1, " + c + ", 1, " + r + "]> hr4 = conv(dilations = tensor<int32, [2]>([1, 1]), groups = int32(" +
+         std::to_string(channels / ANE_FFN_INTERMEDIATE_BLOCK) +
+         "), pad = tensor<int32, [4]>([0, 0, 0, 0]), pad_type = string(\"valid\"), strides = tensor<int32, [2]>([1, "
+         "1]), weight = rotation, x = h4)");
+    f16("hr", channels, rows, "reshape(x = hr4, shape = tensor<int32, [4]>(" + dimensions(channels, rows) + "))");
+  }
   f16("habs", channels, rows, "abs(x = hr)");
   f16("peak", 1, rows, "reduce_max(x = habs, axes = tensor<int32, [1]>([2]), keep_dims = bool(true))");
   f16("floor", 1, rows, "maximum(x = peak, y = " + fp16(kIntermediateFloor) + ")");
@@ -435,9 +448,12 @@ AneFfn::AneFfn(metal::MetalBackend &backend, const Linear &linear, std::span<con
                        source.up->rows(backend_, {{0, shape_.gpu}}),
                        source.down->leadingInputs(shape_.gpu)});
 
+  shape_.sharedRotation = backend_.capabilities().is40CoreM4Max() && shape_.hidden == 5120 &&
+                          shape_.intermediate == 17408 && shape_.ane == 19 * ANE_FFN_INTERMEDIATE_BLOCK;
   const std::vector<Input> inputs = programInputs(shape_, memory_);
+  const uint32_t rotationRows = shape_.sharedRotation ? ANE_FFN_INTERMEDIATE_BLOCK : shape_.ane;
   program_ = std::make_unique<ane::Program>(program(shape_, inputs, memory_.partial, functionRows),
-                                            rotationBlob(shape_.ane, signs),
+                                            rotationBlob(rotationRows, signs),
                                             ane::Program::Limits{kProgramLimit, std::move(interrupted)});
   for (const uint32_t rows : functionRows) {
     Evaluation &evaluation = evaluations_.emplace_back();
