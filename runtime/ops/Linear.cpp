@@ -154,7 +154,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
 
 Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, bool pairedGateUp) noexcept
     : calibration_(KernelCalibration::of(device)), localParallelGateUp_(pairedGateUp),
-      int8Activations_(int8Activations) {}
+      smePrefill_(device.is40CoreM4Max()), int8Activations_(int8Activations) {}
 
 uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format

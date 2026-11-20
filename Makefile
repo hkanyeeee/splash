@@ -263,6 +263,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
+	runtime/ops/SmePrefill.cpp \
 	runtime/ops/KernelSelection.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \

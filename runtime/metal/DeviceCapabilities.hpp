@@ -30,6 +30,9 @@ struct DeviceCapabilities {
     // substitutes kAssumedGpuCores for kernel policy. Keep the missing value
     // here (status reports it).
     uint32_t gpuCoreCount = 0;
+    [[nodiscard]] bool is40CoreM4Max() const noexcept {
+        return appleGpuFamily == 9 && gpuCoreCount == 40 && deviceName == "Apple M4 Max";
+    }
     // Missing core metadata uses one intermediate estimate for all families.
     // This is a fallback, not a calibrated optimum. Reported counts always win.
     static constexpr uint32_t kAssumedGpuCores = 32;

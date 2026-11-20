@@ -393,6 +393,46 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   return out;
 }
 
+// All three plane formats share a strided output. Each format also exercises
+// a ragged final SME tile and the CPU/GPU handoff in the normal Linear path.
+void smePrefill(MetalBackend &backend) {
+  if (!backend.capabilities().is40CoreM4Max()) return;
+  constexpr uint32_t k = 5120, rows = 1025, width = 512, stride = 3 * width + 64;
+  const Linear linear(backend.capabilities(), Int8Activations::Off);
+  const Tensor a = tensor(backend, Q6K, width, k), b = tensor(backend, Q5K, width, k), c = tensor(backend, Q80, width, k);
+  const Projection weights = projection({&a, &b, &c}, stride);
+  const auto plan = linear.plan(weights, rows);
+  const auto storage = plan.storageRows();
+  const Guarded input(backend, uint64_t{storage} * k * 2, 0);
+  const Guarded reference(backend, uint64_t{storage} * stride * 2, 0x55), output(backend, reference.bytes, 0x55);
+  auto *x = static_cast<uint16_t *>(input.view.contents());
+  for (uint32_t i = 0; i < rows * k; ++i)
+    x[i] = floatToBf16(std::ldexp(float(int((i * 23773u) % 4093u) - 2046), int(i % 29) - 16));
+  const Guarded activations(backend, uint64_t{1056} * k * 4, 0), packed(backend, 64 * k * 4, 0);
+  const Guarded part(backend, rows * 64 * 2, 0);
+  const PrefillCpuScratch scratch{activations.view, packed.view, part.view};
+  const Guarded residual(backend, reference.bytes, 0);
+  auto *skip = static_cast<uint16_t *>(residual.view.contents());
+  for (uint32_t i = 0; i < rows * stride; ++i)
+    skip[i] = floatToBf16(std::ldexp(float(int(i % 4093) - 181), int(i % 25) - 15));
+  for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
+    const auto selected = linear.plan(weights, rows, epilogue);
+    const MetalBuffer addend = epilogue == LinearEpilogue::Residual ? residual.view : MetalBuffer{};
+    CommandGraph gpu, both;
+    static_cast<void>(linear.add(gpu, {.input = input.view, .output = reference.view, .residual = addend},
+                                 weights, selected));
+    static_cast<void>(linear.add(both, {.input = input.view, .output = output.view, .residual = addend,
+                                       .prefillCpu = &scratch}, weights, selected));
+    if (both.command().events.size() != 3) fail("SME prefill did not split each of the three segments");
+    static_cast<void>(backend.submitCommandAsync(gpu.command()).wait());
+    static_cast<void>(backend.submitCommandAsync(both.command()).wait());
+    if (std::memcmp(reference.view.contents(), output.view.contents(), size_t(rows) * stride * 2))
+      fail("SME prefill live rows differ from the GPU");
+  }
+  for (const Guarded *guard : {&input, &reference, &output, &activations, &packed, &part, &residual})
+    if (!guard->intact()) fail("SME prefill wrote past a buffer");
+}
+
 // Every output of rows [0, rows) and the covered columns within its interval: the projection's (`want`), plus the
 // residual, or times silu of the gate the up pass read (a gate/up plan's gate scratch, itself a projection: `gate`).
 void checkValues(const Outcome &out, const Want &want, const Want &gate, const std::vector<uint16_t> &aux,
@@ -1840,6 +1880,7 @@ int main(int argc, char **argv) {
     try {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities(), Int8Activations::On);
+      smePrefill(backend);
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
         fusedDecode(backend, linear, tile, false);

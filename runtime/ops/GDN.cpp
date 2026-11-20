@@ -174,8 +174,10 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
   const bool endCapture = !captures.empty() && captures.back().tokens == tokens;
   const size_t runs = captures.size() - (endCapture ? 1 : 0) + 1;
   const std::string prepare = std::string("prefill_gdn_prepare") + std::string(kernel.suffix);
-  const std::string scan =
-      stateKernel(std::string("prefill_gdn_scan") + std::string(kernel.scanSuffix), state);
+  const bool streamed = state == GdnStateFormat::Float32 && kernel.scanSuffix.empty() &&
+                        backend.capabilities().is40CoreM4Max();
+  const std::string scan = streamed ? "prefill_gdn_scan_streamed"
+                                    : stateKernel(std::string("prefill_gdn_scan") + std::string(kernel.scanSuffix), state);
   metal::MetalBuffer convolution = buffers.convolutionIn;
   metal::MetalBuffer recurrent = buffers.recurrentIn;
   const metal::MetalBuffer recurrentOut = buffers.recurrentOut;

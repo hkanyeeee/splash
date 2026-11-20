@@ -161,6 +161,50 @@ inline void gdn_scan_prefill_phase(
   }
 }
 
+// The 48-value-head fp32 scan streams each token's operands into registers.
+// Eight lanes share a state row and reduce its dots in the same order as the staged scan.
+kernel void prefill_gdn_scan_streamed(
+    device const bfloat *q [[buffer(0)]], device const bfloat *k [[buffer(1)]], device const bfloat *v [[buffer(2)]],
+    device const float *decay [[buffer(3)]], device const bfloat *beta [[buffer(4)]],
+    device const float *state_in [[buffer(5)]], device float *state_out [[buffer(6)]], device bfloat *output [[buffer(7)]],
+    constant GDNPrefillParams &params [[buffer(8)]], uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint HeadDim = 128, KeyHeads = 16, ValueHeads = 48;
+  constexpr uint Rows = SPLASH_GDN_SCAN_STATE_ROWS, LanesPerRow = 8, GroupsPerHead = HeadDim / Rows;
+  static_assert(Rows * LanesPerRow == SPLASH_GDN_SCAN_THREADS);
+  const uint head = group / GroupsPerHead, row = (group % GroupsPerHead) * Rows + thread_index / LanesPerRow;
+  const uint col = (lane % LanesPerRow) * 16;
+  const uint state_offset = (head * HeadDim + row) * HeadDim + col;
+  float4 state[4];
+  for (uint c = 0; c < 4; ++c)
+    state[c] = reinterpret_cast<device const float4 *>(state_in + state_offset)[c];
+  for (uint t = 0; t < params.tokens; ++t) {
+    const uint key_offset = (t * KeyHeads + head / (ValueHeads / KeyHeads)) * HeadDim + col;
+    const uint gate = t * ValueHeads + head;
+    const uint value_offset = gate * HeadDim + row;
+    const float d = decay[gate], b = float(beta[gate]);
+    float4 key[4], query[4], partial = 0;
+    for (uint c = 0; c < 4; ++c) {
+      key[c] = float4(reinterpret_cast<device const bfloat4 *>(k + key_offset)[c]);
+      query[c] = float4(reinterpret_cast<device const bfloat4 *>(q + key_offset)[c]);
+      state[c] *= d;
+      partial = fma(state[c], key[c], partial);
+    }
+    float memory = (partial.x + partial.y) + (partial.z + partial.w);
+    for (uint s = 1; s < LanesPerRow; s <<= 1) memory += simd_shuffle_xor(memory, s);
+    const float delta = (float(v[value_offset]) - memory) * b;
+    partial = 0;
+    for (uint c = 0; c < 4; ++c) {
+      state[c] = fma(key[c], delta, state[c]);
+      partial = fma(state[c], query[c], partial);
+    }
+    float result = (partial.x + partial.y) + (partial.z + partial.w);
+    for (uint s = 1; s < LanesPerRow; s <<= 1) result += simd_shuffle_xor(result, s);
+    if (lane % LanesPerRow == 0) output[value_offset] = bfloat(result);
+  }
+  for (uint c = 0; c < 4; ++c)
+    reinterpret_cast<device float4 *>(state_out + state_offset)[c] = state[c];
+}
 #define GDN_SCAN_PREFILL_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, State)    \
   kernel void Name(                                                           \
       device const bfloat *q [[buffer(0)]],                                   \

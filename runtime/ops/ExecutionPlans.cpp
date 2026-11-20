@@ -10,7 +10,7 @@
 namespace splash::ops {
 
 DecodeTrial decodeTrial(const DeviceCapabilities &device, bool exactAssembly, std::string_view option) noexcept {
-  if (!exactAssembly || device.appleGpuFamily != 9 || device.gpuCoreCount != 40 || device.deviceName != "Apple M4 Max")
+  if (!exactAssembly || !device.is40CoreM4Max())
     return DecodeTrial::Off;
   if (option == "pair") return DecodeTrial::PairedGateUp;
   if (option == "flags") return DecodeTrial::RescaleFlags;

@@ -263,6 +263,12 @@ private:
 
 enum class FfnPass { General, TargetVerify, DraftDecode };
 
+// Shared prefill arena views that the mixer can lend to a CPU projection
+// until the following GDN, attention or FFN pass uses them.
+struct PrefillCpuScratch final {
+  metal::MetalBuffer activations, weights, result;
+};
+
 // The plan defines which fields are used and how much scratch they require.
 struct LinearBuffers final {
   metal::MetalBuffer input;
@@ -274,6 +280,7 @@ struct LinearBuffers final {
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
   FfnPass pass = FfnPass::General;
+  const PrefillCpuScratch *prefillCpu = nullptr;
 };
 
 // Whether plans may round activations to int8 where an int8-activation path
@@ -377,6 +384,7 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;
   bool localParallelGateUp_ = false;
+  bool smePrefill_ = false;
   Int8Activations int8Activations_;
 };
 

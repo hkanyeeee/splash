@@ -198,6 +198,15 @@ void QwenTarget::addReadRows(const PrefillStep &step, const metal::MetalBuffer &
     ops::RowCopy::add(step.graph, compact, {row, width, 0}, output, {step.readRows[row], width, 0}, 1, width);
 }
 
+std::optional<ops::PrefillCpuScratch> QwenTarget::mixerCpuScratch(const PrefillStep &step,
+                                                                  const metal::MetalBuffer &weights) const {
+  if (step.decode || step.rows < 1024 || geometry_.ffnKind != QwenFfnKind::Dense || geometry_.layers != 64 ||
+      geometry_.hiddenSize != 5120 || geometry_.gdnValueHeads != 48 || geometry_.attentionQueryHeads != 24 ||
+      !backend_.capabilities().is40CoreM4Max())
+    return std::nullopt;
+  return ops::PrefillCpuScratch{step.buffers.denseIntermediate, weights, step.buffers.gdnValues};
+}
+
 // The mixer reads the normalized rows as its input projection's plan takes
 // them (`normalized`, which the norm wrote), and its output projection reads
 // the hidden rows as the decode GDN or the attention gate wrote them for its
@@ -209,9 +218,10 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
   const QwenTargetPrefillBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.gdnLayer++;
+  const auto cpuScratch = mixerCpuScratch(step, b.fullPacked);
   linear.add(step.graph,
              {.input = b.normalized, .output = b.gdnPacked, .scratch = b.linearScratch,
-              .prepared = std::move(normalized)},
+              .prepared = std::move(normalized), .prefillCpu = cpuScratch ? &*cpuScratch : nullptr},
              mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
   const ops::LinearPlan outputPlan = linear.plan(
       mixer.outputProjection, step.rows, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
@@ -251,7 +261,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
   }
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = std::move(output.rows), .residual = std::move(output.residual),
-              .scratch = b.linearScratch, .prepared = std::move(hidden)},
+              .scratch = b.linearScratch, .prepared = std::move(hidden),
+              .prefillCpu = cpuScratch ? &*cpuScratch : nullptr},
              mixer.outputProjection, outputPlan);
 }
 
@@ -276,9 +287,10 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   const std::span<const kv::ChunkedPrefillParams> sequences = step.attentionSequences();
   const ops::AttentionRows rows{b.laneRows, step.rows, step.decode ? step.decode->tree : metal::MetalBuffer{}};
   const std::span<const metal::MetalBuffer> pageTables = std::span(step.pageTables).first(sequences.size());
+  const auto cpuScratch = mixerCpuScratch(step, b.gdnPacked);
   linear.add(step.graph,
              {.input = b.normalized, .output = b.fullPacked, .scratch = b.linearScratch,
-              .prepared = std::move(normalized)},
+              .prepared = std::move(normalized), .prefillCpu = cpuScratch ? &*cpuScratch : nullptr},
              mixer.inputProjection, linear.plan(mixer.inputProjection, step.rows));
   // The q/k projection stores each row's key and value in its page slot.
   ops::PagedAttention::addProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos, b.ropeSin,
@@ -343,7 +355,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   }
   linear.add(step.graph,
              {.input = b.attentionHidden, .output = std::move(output.rows), .residual = std::move(residual),
-              .scratch = b.linearScratch, .prepared = hidden},
+              .scratch = b.linearScratch, .prepared = hidden, .prefillCpu = cpuScratch ? &*cpuScratch : nullptr},
              mixer.outputProjection, outputPlan);
 }
 
