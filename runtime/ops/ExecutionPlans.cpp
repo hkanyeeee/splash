@@ -14,12 +14,14 @@ DecodeTrial decodeTrial(const DeviceCapabilities &device, bool exactAssembly, st
     return DecodeTrial::Off;
   if (option == "pair") return DecodeTrial::PairedGateUp;
   if (option == "flags") return DecodeTrial::RescaleFlags;
+  if (option == "both") return DecodeTrial::Both;
   return DecodeTrial::Off;
 }
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations, DecodeTrial trial)
-    : linear_(device, int8Activations, trial == DecodeTrial::PairedGateUp),
-      draftLinear_(device, Int8Activations::Off, trial == DecodeTrial::PairedGateUp), trial_(trial) {}
+    : linear_(device, int8Activations, trial == DecodeTrial::PairedGateUp || trial == DecodeTrial::Both),
+      draftLinear_(device, Int8Activations::Off, trial == DecodeTrial::PairedGateUp || trial == DecodeTrial::Both),
+      trial_(trial) {}
 
 // A chunk's rows pick its projections' tile, and a tile's height names its
 // kernels (gguf_decode_<format>_m<rows>_*, the register tile's _l<tiles>), so
@@ -76,7 +78,7 @@ AttentionPlan ExecutionPlans::attention(AttentionPass pass, std::span<const kv::
                                         kv::Layout layout, AttentionWorkspace capacity,
                                         AttentionVariant variant) const {
   return PagedAttention::plan(pass, sequences, queryHeads, layout, calibration().attention, linear_.int8Activations(),
-                              capacity, variant, trial_ == DecodeTrial::RescaleFlags);
+                              capacity, variant, trial_ == DecodeTrial::RescaleFlags || trial_ == DecodeTrial::Both);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

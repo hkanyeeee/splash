@@ -15,9 +15,9 @@
 
 namespace splash::ops {
 
-enum class DecodeTrial { Off, PairedGateUp, RescaleFlags };
+enum class DecodeTrial { Off, PairedGateUp, RescaleFlags, Both };
 
-// Select one mechanism for the qualified assembly. Missing hardware metadata
+// Select the requested mechanisms for the qualified assembly. Missing hardware metadata
 // keeps the ordinary pipelines and arena sizes.
 [[nodiscard]] DecodeTrial decodeTrial(const DeviceCapabilities &device, bool exactAssembly,
                                       std::string_view option) noexcept;
