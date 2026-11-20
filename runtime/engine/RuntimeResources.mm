@@ -16,6 +16,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -833,7 +834,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device, config.int8Activations);
+  const char *option = std::getenv("SPLASH_231_DECODE");
+  const bool exact = config.model.decodeTrialAssembly && config.verifyRows == model::VerifyRows::All &&
+                     config.kvFormat == kv::Format::BFloat16 && config.stateFormat == ops::GdnStateFormat::Float32 &&
+                     config.exactCachedStates && config.maximumMemoryBytes == (42ull << 30);
+  const auto trial = ops::decodeTrial(device, exact, option ? option : "");
+  ops::ExecutionPlans operators(device, config.int8Activations, trial);
   // The arenas by what streams of the model, from the geometry its target's
   // files give: whatever streams, its projections are those of its formats.
   const auto planArenas = [&](const model::QwenTargetGeometry &target) {

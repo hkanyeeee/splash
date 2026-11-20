@@ -60,6 +60,7 @@ struct ModelDescriptor final {
   // (inspectModelRoot): what every image is written from
   // (WeightFileRecord).
   std::string sourceIdentity;
+  bool decodeTrialAssembly = false;
   // The target's RoPE scaling (servedFor), which stretches the window
   // capabilities states beyond the layout's native one.
   RopeScaling ropeScaling;

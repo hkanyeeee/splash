@@ -78,6 +78,61 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
             "workspace does not cover an installed plan");
 }
 
+void isolatedDecodeTrials() {
+  DeviceCapabilities m4 = device(9);
+  m4.deviceName = "Apple M4 Max";
+  m4.gpuCoreCount = 40;
+  for (const auto option : {"pair", "flags"}) {
+    require(decodeTrial(m4, false, option) == DecodeTrial::Off, "an unqualified assembly selected a trial");
+    for (const auto &[family, cores] : {std::pair{8u, 40u}, {9u, 0u}, {9u, 32u}, {10u, 40u}}) {
+      DeviceCapabilities other = m4;
+      other.appleGpuFamily = family;
+      other.gpuCoreCount = cores;
+      require(decodeTrial(other, true, option) == DecodeTrial::Off, "other device selected a trial");
+    }
+    auto m3 = m4;
+    m3.deviceName = "Apple M3 Max";
+    require(decodeTrial(m3, true, option) == DecodeTrial::Off, "M3 Max selected a trial");
+  }
+  require(decodeTrial(m4, true, "") == DecodeTrial::Off && decodeTrial(m4, true, "pair+flags") == DecodeTrial::Off,
+          "missing or mixed option selected a trial");
+  const ExecutionPlans pair(m4, Int8Activations::On, decodeTrial(m4, true, "pair"));
+  const ExecutionPlans flags(m4, Int8Activations::On, decodeTrial(m4, true, "flags"));
+  const ExecutionPlans stock(m4, Int8Activations::On);
+  for (const uint32_t rows : {8u, 16u}) {
+    const ProjectionShape shape{17408, 5120};
+    const auto plain = stock.linear().scratchSize(shape, rows);
+    for (const auto pass : {FfnPass::TargetVerify, FfnPass::DraftDecode}) {
+      const auto trial = pair.linear().scratchSize(shape, rows, pass);
+      require(trial.partials >= 2ull * rows * 4 * 17408 * 4 && trial.counters >= 4352,
+              "decode arena omits one half of the pair or its counters");
+      require(flags.linear().scratchSize(shape, rows, pass).partials == plain.partials &&
+                  pair.linear().scratchSize(shape, rows).counters == plain.counters,
+              "ordinary projection scratch grew");
+    }
+  }
+  for (auto format : {kv::Format::Int8, kv::Format::BFloat16}) {
+    const kv::Layout layout{16, 4, 256, format};
+    for (uint32_t lanes : {1u, 2u, 3u, 4u})
+      for (uint32_t rows : {1u, 8u, 9u, 16u, 17u, 33u, 64u, 65u})
+        for (uint32_t history : {32767u, 32768u, 65536u}) {
+          const std::vector seq(lanes, sequenceOf(history, rows));
+          for (auto pass : {AttentionPass::Prompt, AttentionPass::Verify}) {
+            const auto ws = PagedAttention::workspace(512, 24, layout);
+            const auto base = stock.attention(pass, seq, 24, layout, ws);
+            const auto selected = flags.attention(pass, seq, 24, layout, ws);
+            const bool hit = pass == AttentionPass::Verify && format == kv::Format::BFloat16 &&
+                             lanes == 1 && rows <= 8 && history >= 32768;
+            require(selected.splitPipeline() == (hit ? "attention_bf16_split_flags" : base.splitPipeline()) &&
+                        pair.attention(pass, seq, 24, layout, ws).splitPipeline() == base.splitPipeline() &&
+                        selected.reducePipeline() == base.reducePipeline() &&
+                        selected.sequences()[0].splits == base.sequences()[0].splits,
+                    "decode trial changed a fallback or the partition");
+          }
+        }
+  }
+}
+
 void baselinePlans() {
   for (uint32_t family : {9U, 10U, 11U}) {
     const ExecutionPlans plans(device(family), Int8Activations::On);
@@ -409,6 +464,7 @@ void invalidLookupsAndContextEdges() {
 
 int main() {
   try {
+    isolatedDecodeTrials();
     baselinePlans();
     int8ActivationsSetting();
     draftPlans();

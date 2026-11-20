@@ -9,10 +9,18 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace splash::ops {
+
+enum class DecodeTrial { Off, PairedGateUp, RescaleFlags };
+
+// Select one mechanism for the qualified assembly. Missing hardware metadata
+// keeps the ordinary pipelines and arena sizes.
+[[nodiscard]] DecodeTrial decodeTrial(const DeviceCapabilities &device, bool exactAssembly,
+                                      std::string_view option) noexcept;
 
 // The device's plans of every operator a model runs, at the runtime's
 // Int8Activations, which its Linear holds and its attention plans read too.
@@ -20,7 +28,8 @@ namespace splash::ops {
 // changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations);
+  explicit ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations,
+                          DecodeTrial trial = DecodeTrial::Off);
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
   // A DFlash2 draft's plans: linear()'s in bf16 activations
   // (Int8Activations::Off), so no prefill chunk runs the int8 prefill tile.
@@ -81,6 +90,7 @@ public:
 private:
   Linear linear_;
   Linear draftLinear_;
+  DecodeTrial trial_;
 };
 
 } // namespace splash::ops

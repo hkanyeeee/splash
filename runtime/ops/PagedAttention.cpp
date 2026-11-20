@@ -351,7 +351,7 @@ metal::DispatchSize AttentionPlan::reduceGroups(const Dispatch &dispatch) const 
 AttentionPlan PagedAttention::plan(AttentionPass pass, std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                    kv::Layout layout, const AttentionCalibration &calibration,
                                    Int8Activations int8Activations, AttentionWorkspace capacity,
-                                   AttentionVariant variant) {
+                                   AttentionVariant variant, bool rescaleFlags) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   static_cast<void>(commandRows(sequences, layout));
   const AttentionWorkspace slot = attentionWorkspace(slotRows(queryHeads), layout.headDimension);
@@ -387,6 +387,12 @@ AttentionPlan PagedAttention::plan(AttentionPass pass, std::span<const kv::Chunk
                            splitReads >= calibration.int8QueriesFromPages;
   plan.splitPipeline_ =
       kernelName((int8Queries ? "q8q" : kernelFormat(layout)) + (sparse ? "_sparse" : "_split"), suffix);
+  if (rescaleFlags && pass == AttentionPass::Verify && sequences.size() == 1 &&
+      sequences.front().chunk_tokens <= SPLASH_ATTENTION_TILE_ROWS && sequences.front().committed_tokens >= 32768 &&
+      layout.format == kv::Format::BFloat16 && !sparse && !layout.valuesTokenMajor && !layout.indexDimension &&
+      !layout.windowTokens && variant == AttentionVariant{} && queryHeads == 24 && layout.kvHeads == 4 &&
+      layout.headDimension == 256 && layout.attentionLayers == 16)
+    plan.splitPipeline_ = "attention_bf16_split_flags";
   if (sparse) plan.locatedSplitPipeline_ = kernelName(kernelFormat(layout) + "_sparse_located", kernel.suffix);
   plan.reducePipeline_ =
       kernelName(sparse ? "sparse_reduce" : "reduce", suffix + (kernel.sinks ? "_sinks" : ""));

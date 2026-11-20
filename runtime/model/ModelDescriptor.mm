@@ -74,6 +74,30 @@ NSDictionary *readObject(const std::filesystem::path &path,
   return static_cast<NSDictionary *>(value);
 }
 
+// Compare the content IDs in the verified assembly record. Private roots
+// have different file paths, timestamps and model.json hashes.
+bool decodeTrialAssembly(NSDictionary *record) {
+  NSDictionary *files = record[@"files"];
+  if (![files isKindOfClass:NSDictionary.class]) return false;
+  NSDictionary *expected = @{
+    @"config.json": @"806669083aa894f1e68654ffb354cf5e43ef33d89fa4e6327cdecb526a3592f1",
+    @"draft/config.json": @"79279cc5665bced6f3cdaa2095a2ffe819497b2e",
+    @"draft/model.safetensors": @"67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c",
+    @"target/Qwen3.8-27B-UD-Q6_K.gguf": @"6cac55f876015d6d4b94b1656d23f79f424ac9b583652aedf0633dba116576a8",
+    @"tokenizer/chat_template.jinja": @"12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+    @"tokenizer/config.json": @"806669083aa894f1e68654ffb354cf5e43ef33d89fa4e6327cdecb526a3592f1",
+    @"tokenizer/tokenizer.json": @"8e852142d8ab38bb7678f650bd504ba28c29d9c6357e6ed762bebdbd474689eb",
+    @"tokenizer/tokenizer_config.json": @"c0435ea80b819a4fb16914a820960ff7c38f9d48cb94e7e8a28780fe01e8dea0",
+    @"vision/mmproj.gguf": @"cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e",
+  };
+  if (files.count != expected.count) return false;
+  for (NSString *name in expected) {
+    NSDictionary *entry = files[name];
+    if (![entry isKindOfClass:NSDictionary.class] || ![expected[name] isEqual:entry[@"digest"]]) return false;
+  }
+  return true;
+}
+
 NSDictionary *requireObject(NSDictionary *object, NSString *key,
                             std::string_view label) {
   id value = object[key];
@@ -931,6 +955,8 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
       throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
     NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    result.decodeTrialAssembly = result.family() == "Qwen3.8-27B" && result.targetSource == TargetSource::Gguf &&
+                                 result.visionSource == VisionSource::Gguf && decodeTrialAssembly(record);
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;

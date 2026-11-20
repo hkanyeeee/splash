@@ -273,7 +273,7 @@ public:
   [[nodiscard]] static AttentionPlan plan(AttentionPass pass, std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                           kv::Layout layout, const AttentionCalibration &calibration,
                                           Int8Activations int8Activations, AttentionWorkspace capacity,
-                                          AttentionVariant variant = {});
+                                          AttentionVariant variant = {}, bool rescaleFlags = false);
   // `plan`'s sequences from the tile that holds each one's last row: their
   // kernels and splits, so each tile computes what it does in `plan`.
   [[nodiscard]] static AttentionPlan lastTiles(const AttentionPlan &plan);

@@ -7,8 +7,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
-#include <string_view>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -154,12 +152,9 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept
-    : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations) {
-  const char *option = std::getenv("SPLASH_LOCAL_PARALLEL_GATEUP");
-  localParallelGateUp_ = option && std::string_view(option) == "1" &&
-                         device.gpuClass() == GpuClass::Apple9 && device.plannedGpuCores() == 40;
-}
+Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, bool pairedGateUp) noexcept
+    : calibration_(KernelCalibration::of(device)), localParallelGateUp_(pairedGateUp),
+      int8Activations_(int8Activations) {}
 
 uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -210,7 +205,7 @@ LinearPlan Linear::plan(const Projection &p, uint32_t rows, LinearEpilogue epilo
   return part;
 }
 
-LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) const {
+LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows, FfnPass pass) const {
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET) throw std::invalid_argument("invalid linear scratch rows");
   LinearScratchSize bound;
   // Split scratch and tables grow with the rows of the decode tiles, each
@@ -219,7 +214,8 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
   const LinearMatrix matrix{shape.outputSize, shape.inputSize};
   for (uint32_t count = 1; count <= std::min(rows, kMaximumDecodeTileRows); ++count)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-      bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats));
+      bound.include(ggufDecodeScratchSize({matrix, count, epilogue}, shape.registerFormats,
+                                          shape.rotated ? FfnPass::General : pass));
   // A plan stores at most its rows' tiles: the decode tiles' up to
   // kMaximumDecodeTileRows, the prefill tiles' whole 128-row tiles.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
@@ -295,11 +291,11 @@ LinearInput Linear::swiGluInput(const SwiGluProjections &ffn, uint32_t rows, uin
 }
 void Linear::addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &b,
                        metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, uint32_t chunkRows,
-                       PreparedInput normalized) const {
+                       PreparedInput normalized, FfnPass pass) const {
   if ((chunkRows ? chunkRows : rows) <= kMaximumDecodeTileRows) {
     add(graph,
         {.input = b.normalized, .output = b.intermediate, .gateScratch = b.gateScratch, .scratch = b.scratch,
-         .prepared = normalized},
+         .prepared = normalized, .pass = pass},
         *ffn.up, plan(*ffn.up, rows, LinearEpilogue::GateUp, ffn.gate, chunkRows), ffn.gate);
   } else {
     normalized = add(graph,

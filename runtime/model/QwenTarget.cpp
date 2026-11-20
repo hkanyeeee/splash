@@ -365,7 +365,8 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows,
                                  b.linearScratch, linear.swiGluInput(ffn, rows, step.rows));
-  linear.addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows, step.rows, normalized);
+  linear.addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows, step.rows, normalized,
+                   step.decode ? ops::FfnPass::TargetVerify : ops::FfnPass::General);
 }
 
 // A decode step's lanes route their rows alone (ops::MoeBuffers::lanes).

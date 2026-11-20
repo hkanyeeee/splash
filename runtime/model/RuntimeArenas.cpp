@@ -296,7 +296,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // A step's rows: the target's projections, the vocabulary head shared with
   // the draft among them, and the draft's context projections.
   for (const auto &p : geometry.target.decodeProjections)
-    result.include(operators.linear().scratchSize(p, kDecodeStepRows));
+    result.include(operators.linear().scratchSize(p, kDecodeStepRows, ops::FfnPass::TargetVerify));
   for (const ops::ProjectionShape shape :
        {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
     result.include(operators.draftLinear().scratchSize(shape, kDecodeStepRows));
@@ -305,7 +305,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}})
-    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDraftRows));
+    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDraftRows, ops::FfnPass::DraftDecode));
   return result;
 }
 

@@ -211,7 +211,7 @@ static LinearScratchSize localPairScratch(LinearWorkload w, const LinearConfig &
           .counters = uint64_t{w.matrix.outputSize / GGUF_REGISTER_COLUMNS} * sizeof(uint32_t)};
 }
 
-LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
+LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats, FfnPass pass) const {
   // Every format the register tile takes K inputs in has one register plan,
   // whose partitions keep whole coefficient units of each (kRegisterTiers);
   // a projection of segments the tile does not take has none. One lane on the
@@ -219,7 +219,8 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerF
   LinearScratchSize size;
   for (const LinearConfig &config : decodeConfigurations(calibration_, w, registerFormats)) {
     size.include(LinearPlan(w, config).scratchSize());
-    if (localParallelGateUp_ && localPairShape(w, config)) size.include(localPairScratch(w, config));
+    if (localParallelGateUp_ && pass != FfnPass::General && localPairShape(w, config))
+      size.include(localPairScratch(w, config));
   }
   return size;
 }
@@ -259,6 +260,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     LinearBuffers rotated = b;
     rotated.input = b.scratch.rotated;
     rotated.prepared = {};
+    rotated.pass = FfnPass::General;
     Projection plain = p;
     plain.rotation = {};
     if (plan.configuration().decodeInt8) {
@@ -504,8 +506,9 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
               {segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1}, {GGUF_REGISTER_THREADS, 1, 1});
     return;
   }
-  if (localParallelGateUp_ && localPairShape(w, config) && plan.destination() == FloatOutput::BFloat16 &&
-      gate && gate->blocks().segments.size() == 1 && segments.size() == 1) {
+  if (localParallelGateUp_ && b.pass != FfnPass::General && localPairShape(w, config) &&
+      plan.destination() == FloatOutput::BFloat16 && gate && !gate->rotation &&
+      gate->destination == FloatOutput::BFloat16 && gate->blocks().segments.size() == 1 && segments.size() == 1) {
     const auto &g = gate->blocks().segments.front();
     const auto &u = segments.front();
     const std::string pair = std::string(g.name()) + "_" + u.name();
@@ -513,7 +516,7 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
         "iq4xs_q6k", "q5k_q5k", "q6k_q80", "q5k_q6k", "q6k_q5k", "iq4nl_q5k",
         "iq4xs_q5k", "q6k_q6k", "q80_q80", "af4g64_af4g64"};
     const auto need = localPairScratch(w, config);
-    if (!g.columnOffset && !u.columnOffset && g.outputSize == n && u.outputSize == n &&
+    if (!g.isFloat() && !u.isFloat() && !g.columnOffset && !u.columnOffset && g.outputSize == n && u.outputSize == n &&
         std::ranges::find(supported, pair) != supported.end() &&
         partials.sizeBytes() >= need.partials && counters.sizeBytes() >= need.counters) {
       graph.add("m4_borrow_pair_" + pair + suffix + "_g1",

@@ -337,7 +337,7 @@ inline float splash_attention_query_codes(device const bfloat *queries, device i
 // the block; its K/V, the store's, sit at the slots of their rows before
 // any tile runs, so a row of a later tile reads its ancestors' from them.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement, bool Int8Queries>
+          uint Window, typename CacheElement, bool Int8Queries, bool OverlapRescale = false>
 inline void splash_paged_attention_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -425,6 +425,9 @@ inline void splash_paged_attention_tile(
   }
 
   for (uint page = page_begin; page < page_end; ++page) {
+    // The next QK writes only scores. Its publication barrier drains this
+    // page's PV and scale readers before softmax reuses their storage.
+    threadgroup atomic_uint *page_rescale = rescale + (OverlapRescale ? (page & 1u) : 0u);
     const SplashKvPageTensors<CacheElement> tensors =
         addressing.page(page_table[page]);
     uint token_start = page * N;
@@ -440,15 +443,15 @@ inline void splash_paged_attention_tile(
     qk.run(q0, ks, page_scores);
     page_scores.store(st.template slice<N, M>(0, 0));
     if (thread_index == 0)
-      atomic_store_explicit(rescale, 0u, memory_order_relaxed);
+      atomic_store_explicit(page_rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, Window, Quantized>(
-        page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, rescale,
+        page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale, page_rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
         visible_tokens, committed_tokens, active_rows, in_tree, tree.anchor, ancestors, depth, thread_index);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (atomic_load_explicit(rescale, memory_order_relaxed)) {
+    if (atomic_load_explicit(page_rescale, memory_order_relaxed)) {
 #pragma unroll
       for (ushort index = 0; index < running.get_capacity(); ++index) {
         if (!running_full && !running.is_valid_element(index))
@@ -459,7 +462,7 @@ inline void splash_paged_attention_tile(
     }
     auto vs = vt.template slice<N, D>(0, 0);
     pv.run(p0, vs, running);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if constexpr (!OverlapRescale) threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   auto target = tensor(partials + slot * M * D, dextents<int, 2>{D, M},
                        array<int, 2>{1, D});

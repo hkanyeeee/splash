@@ -261,6 +261,8 @@ private:
   bool rotated_ = false;
 };
 
+enum class FfnPass { General, TargetVerify, DraftDecode };
+
 // The plan defines which fields are used and how much scratch they require.
 struct LinearBuffers final {
   metal::MetalBuffer input;
@@ -271,6 +273,7 @@ struct LinearBuffers final {
   // What the scratch table holds (for example after fused RMSNorm). A plan
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
+  FfnPass pass = FfnPass::General;
 };
 
 // Whether plans may round activations to int8 where an int8-activation path
@@ -286,7 +289,7 @@ enum class Int8Activations : uint8_t { Off, On };
 // which ExecutionPlans also gives its attention plans.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations) noexcept;
+  explicit Linear(const DeviceCapabilities &device, Int8Activations int8Activations, bool pairedGateUp = false) noexcept;
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
@@ -310,7 +313,8 @@ public:
   // and staged tiles, the rotated rows of `rows` rows, and where the device
   // runs the int8 prefill tile on the shape's formats, its codes and scales of
   // `rows` rows.
-  [[nodiscard]] LinearScratchSize scratchSize(ProjectionShape shape, uint32_t rows) const;
+  [[nodiscard]] LinearScratchSize scratchSize(ProjectionShape shape, uint32_t rows,
+                                             FfnPass pass = FfnPass::General) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // of rows in `formatId` (QuantizedSegment::rows) on this device
   // (selectFloatTile).
@@ -341,7 +345,7 @@ public:
   // first plan's input (swiGluInput).
   void addSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
                  metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, uint32_t chunkRows = 0,
-                 PreparedInput normalized = {}) const;
+                 PreparedInput normalized = {}, FfnPass pass = FfnPass::General) const;
   // The layout the producer of a SwiGLU's normalized rows writes for its first
   // plan (addSwiGlu).
   [[nodiscard]] LinearInput swiGluInput(const SwiGluProjections &ffn, uint32_t rows, uint32_t chunkRows = 0) const;
@@ -353,7 +357,7 @@ private:
                                                                       uint32_t splits);
   // The scratch of every tile a decode plan of the workload may take, the
   // register tile's where it takes the projection's formats.
-  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, bool registerFormats) const;
+  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, bool registerFormats, FfnPass pass) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate) const;

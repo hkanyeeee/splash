@@ -340,7 +340,7 @@ void DFlashDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buff
         attentionPlan, ops::DraftConvolutionStage::Prepare);
     linear.add(graph,
                {.input = buffers.convolved, .output = buffers.intermediate, .gateScratch = buffers.gateScratch,
-                .scratch = scratch},
+                .scratch = scratch, .pass = ops::FfnPass::DraftDecode},
                weights.upProjection,
                linear.plan(weights.upProjection, rows, ops::LinearEpilogue::GateUp, &weights.gateProjection),
                &weights.gateProjection);
