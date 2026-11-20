@@ -25,8 +25,8 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations
 
 // A chunk's rows pick its projections' tile, and a tile's height names its
 // kernels (gguf_decode_<format>_m<rows>_*, the register tile's _l<tiles>), so
-// each tile and height a chunk takes is a class, and the prefill tile one
-// more. Every other kernel a chunk's rows pick today changes once along them
+// each tile and height a chunk takes is a class. The short M4 prefill kernels
+// have two column-tile geometries. Other kernels change once along the row counts
 // (selectFloatTile, selectMoe, the staged norm, the hyper-connection norm's
 // quarters, and the Neural Engine split, which takes no class's first chunk:
 // AneFfn::kMinimumRows), so a chunk of one row and one of the most take both
@@ -34,13 +34,13 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations
 // 19 s for the 27B's cold 17-row chunk on a 16-core Apple9 plan.
 std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
   std::vector<uint32_t> first;
-  std::pair<LinearTile, uint32_t> last{};
+  std::tuple<LinearTile, uint32_t, uint32_t> last{};
   for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
     const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
     // Only the staged and register tiles' kernels are named by their height.
     const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
-    const std::pair key{tile, named ? plan.storageRows() : 0};
+    const std::tuple key{tile, named ? plan.storageRows() : 0, linear_.shortPrefillGroups(rows)};
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
   }

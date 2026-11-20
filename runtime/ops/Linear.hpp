@@ -300,6 +300,8 @@ public:
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return calibration_; }
   [[nodiscard]] Int8Activations int8Activations() const noexcept { return int8Activations_; }
 
+  // SIMD groups per narrow column tile for an eligible packed projection, or zero for the general tile.
+  [[nodiscard]] uint32_t shortPrefillGroups(uint32_t rows) const noexcept;
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
   [[nodiscard]] LinearPlan plan(LinearWorkload workload, const Projection &projection,

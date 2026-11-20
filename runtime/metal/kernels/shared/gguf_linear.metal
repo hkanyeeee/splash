@@ -207,12 +207,12 @@ QUANT_FORMATS(GGUF_DECODE_GATE_UP_FORMAT)
 // The segment s of column tile `tile` among the segments' tiles (cols, 0 past the last) and the tile's index `local`
 // within it; GGUF_SEGMENT_PLANE the segment's `plane` of x##a, x##b and x##c; GGUF_SEGMENT_OF both, with the
 // segment's planes w0, w1 and meta.
-#define GGUF_SEGMENT_INDEX(tile, cols)                                                                             \
-  const uint t0 = (cols)[0] / GGUF_TILE_COLUMNS, t1 = t0 + (cols)[1] / GGUF_TILE_COLUMNS;                          \
+#define GGUF_SEGMENT_INDEX(tile, cols, width)                                                                      \
+  const uint t0 = (cols)[0] / (width), t1 = t0 + (cols)[1] / (width);                                              \
   const uint s = (tile) < t0 ? 0 : (tile) < t1 ? 1 : 2, local = (tile) - (s == 0 ? 0 : s == 1 ? t0 : t1)
 #define GGUF_SEGMENT_PLANE(plane, x) device uchar *plane = s == 0 ? x##a : s == 1 ? x##b : x##c
-#define GGUF_SEGMENT_OF(tile, cols)                                                                                \
-  GGUF_SEGMENT_INDEX(tile, cols);                                                                                  \
+#define GGUF_SEGMENT_OF(tile, cols, width)                                                                         \
+  GGUF_SEGMENT_INDEX(tile, cols, width);                                                                           \
   GGUF_SEGMENT_PLANE(w0, w0);                                                                                      \
   GGUF_SEGMENT_PLANE(w1, w1);                                                                                      \
   GGUF_SEGMENT_PLANE(meta, m)
@@ -241,7 +241,7 @@ struct fused_formats {
                                      uint simd_lane [[thread_index_in_simdgroup]],                                \
                                      uint simd_group [[simdgroup_index_in_threadgroup]]) {                        \
     threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries]; threadgroup uint arrival; \
-    GGUF_SEGMENT_OF(group.x, p.cols);                                                                             \
+    GGUF_SEGMENT_OF(group.x, p.cols, GGUF_TILE_COLUMNS);                                                          \
     const uint per = p.input_size / GGUF_STAGED_STEP / p.splits;                                                  \
     const uint sb = group.y * per, se = sb + per;                                                                 \
     const uint origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin; \
@@ -258,39 +258,41 @@ struct fused_formats {
 GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUSED(48) GGUF_DECODE_FUSED(64)
 #undef GGUF_DECODE_FUSED
 
-// The prefill kernels: grid (GGUF_PREFILL_ROWS-row tiles of the chunk, column tiles), four simdgroups; the residual
-// and gate kernels run one tensor and read aux at buffer 5.
+// The prefill grid covers row and column tiles. Each simdgroup owns 32 rows. The residual and gate kernels
+// run one tensor and read aux at buffer 5.
 #define GGUF_PREFILL_BUFFERS                                                                                       \
-  device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],             \
+  device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],              \
       device uchar *meta [[buffer(3)]], device bfloat *output [[buffer(4)]]
 #define GGUF_PREFILL_THREAD                                                                                        \
   uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],                      \
       uint simd_group [[simdgroup_index_in_threadgroup]]
-#define GGUF_PREFILL_TABLES(F, Step)                                                                               \
+#define GGUF_PREFILL_TABLES(F, Step, Groups, Cols)                                                                 \
   threadgroup half2 tl[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];                                     \
-  quant_pair_table<F>(tl, simd_group * 32 + simd_lane, GGUF_PREFILL_THREADS);                                      \
-  threadgroup half stage[2 * GGUF_TILE_COLUMNS * Step]
+  quant_pair_table<F>(tl, simd_group * 32 + simd_lane, (Groups) * 32);                                             \
+  threadgroup half stage[2 * Cols * Step]
 // The plain kernel takes up to three segments of its format (GgufPrefillSegmentsParams), so the segments of a fused
 // projection that share a format run as one dispatch, grid.y over their column tiles in segment order.
-#define GGUF_PREFILL(F, f, Step)                                                                                   \
-  kernel void gguf_prefill_##f##_a(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                            \
-                                   device bfloat *output [[buffer(10)]],                                          \
+#define GGUF_PREFILL(F, f, Step, Groups, Cols)                                                                     \
+  kernel void gguf_prefill_##f##_a(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                              \
+                                   device bfloat *output [[buffer(10)]],                                           \
                                    constant GgufPrefillSegmentsParams &p [[buffer(11)]], GGUF_PREFILL_THREAD) {    \
-    GGUF_PREFILL_TABLES(F, Step);                                                                                  \
-    GGUF_SEGMENT_OF(group.y, p.cols);                                                                              \
-    const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
-    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, Step>(           \
+    GGUF_PREFILL_TABLES(F, Step, Groups, Cols);                                                                    \
+    GGUF_SEGMENT_OF(group.y, p.cols, Cols);                                                                        \
+    const uint first = group.x * GGUF_PREFILL_SIMDGROUP_ROWS * Groups;                                             \
+    const uint rows = p.rows > first ? p.rows - first : 0;                                                         \
+    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, Groups, Cols, Step>(                                         \
         input + ulong(first) * p.input_size, w0, w1, meta, output + ulong(first) * p.out_stride, p.input_size,     \
-        local * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group, p.out_stride, p.offset[s]);             \
+        local * Cols, rows, stage, tl, simd_lane, simd_group, p.out_stride, p.offset[s]);                          \
   }
-#define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep, Step)                                                                  \
-  kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                    \
+#define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep, Step, Groups, Cols)                                                    \
+  kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                      \
                                       constant GgufPrefillParams &p [[buffer(6)]], GGUF_PREFILL_THREAD) {          \
-    GGUF_PREFILL_TABLES(F, Step);                                                                                  \
-    const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
-    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, Step, Ep>(       \
+    GGUF_PREFILL_TABLES(F, Step, Groups, Cols);                                                                    \
+    const uint first = group.x * GGUF_PREFILL_SIMDGROUP_ROWS * Groups;                                             \
+    const uint rows = p.rows > first ? p.rows - first : 0;                                                         \
+    gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, Groups, Cols, Step, Ep>(                                     \
         input + ulong(first) * p.input_size, w0, w1, meta, output + ulong(first) * p.out_stride, p.input_size,     \
-        group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset,           \
+        group.y * Cols, rows, stage, tl, simd_lane, simd_group, p.out_stride, p.out_offset,                        \
         aux + ulong(first) * p.out_stride);                                                                        \
   }
 // The residual kernels over a view of the leading inputs of wider weight rows, for the Neural Engine FFN split's down
@@ -301,7 +303,7 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
   kernel void gguf_prefill_##f##_r_leading_inputs(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],          \
                                                   constant GgufPrefillLeadingParams &leading [[buffer(6)]],        \
                                                   GGUF_PREFILL_THREAD) {                                           \
-    GGUF_PREFILL_TABLES(F, Step);                                                                                  \
+    GGUF_PREFILL_TABLES(F, Step, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS);                                      \
     constant GgufPrefillParams &p = leading.prefill;                                                               \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
     const ulong before = ulong(group.y * GGUF_TILE_COLUMNS / QUANT_TILE_ROWS) * QUANT_TILE_ROWS;                   \
@@ -314,15 +316,25 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
                                   p.input_size, group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane,           \
                                   simd_group, p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);      \
   }
+#define GGUF_PREFILL_TILED(F, f, Step, Groups, Cols) \
+  GGUF_PREFILL(F, f, Step, Groups, Cols) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual, Step, Groups, Cols) \
+  GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate, Step, Groups, Cols)
 #define GGUF_PREFILL_KERNELS(F, f, Step) \
-  GGUF_PREFILL(F, f, Step) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual, Step) \
-  GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate, Step) GGUF_PREFILL_LEADING_INPUTS(F, f, Step)
+  GGUF_PREFILL_TILED(F, f, Step, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS) GGUF_PREFILL_LEADING_INPUTS(F, f, Step)
 #define GGUF_PREFILL_FORMAT(F, f) GGUF_PREFILL_KERNELS(F, f, GGUF_PREFILL_STEP)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
 // The 40-core M4 Max split prefill stages one 32-input quantization group at a time.
 GGUF_PREFILL_KERNELS(FmtQ5Pack, q5pack_k32, 32)
 GGUF_PREFILL_KERNELS(FmtQ6Pack, q6pack_k32, 32)
 GGUF_PREFILL_KERNELS(FmtQ80, q80_k32, 32)
+#define GGUF_PREFILL_SHORT(F, f) \
+  GGUF_PREFILL_TILED(F, f##_short128, 32, GGUF_PREFILL_SIMDGROUPS, GGUF_PREFILL_SHORT_COLUMNS) \
+  GGUF_PREFILL_TILED(F, f##_short256, 64, GGUF_PREFILL_SHORT_GROUPS, GGUF_PREFILL_SHORT_COLUMNS)
+GGUF_PREFILL_SHORT(FmtQ5Pack, q5pack)
+GGUF_PREFILL_SHORT(FmtQ6Pack, q6pack)
+GGUF_PREFILL_SHORT(FmtQ80, q80)
+#undef GGUF_PREFILL_SHORT
+#undef GGUF_PREFILL_TILED
 #undef GGUF_PREFILL_FORMAT
 #undef GGUF_PREFILL_KERNELS
 #undef GGUF_PREFILL_LEADING_INPUTS
@@ -470,7 +482,7 @@ kernel void gguf_decode_int8_fused(device char *input [[buffer(0)]], GGUF_SEGMEN
   threadgroup char stages[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][2 * GGUF_STAGED_COLUMNS * GGUF_STAGED_STEP];
   threadgroup float d[GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS][GGUF_STAGED_COLUMNS];
   threadgroup uint arrival;
-  GGUF_SEGMENT_OF(group.x, p.cols);
+  GGUF_SEGMENT_OF(group.x, p.cols, GGUF_TILE_COLUMNS);
   const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
              origin = local * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin;
   auto sums = gguf_int8_destination<Rows, float>(input, p.input_size, stages[simd_group]);

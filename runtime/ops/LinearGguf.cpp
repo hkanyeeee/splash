@@ -32,10 +32,27 @@ std::string decodeKernel(bool int8, const char *format, uint32_t rows, std::stri
   return std::string(int8 ? "gguf_decode_int8_" : "gguf_decode_") + format + "_m" + std::to_string(rows) + "_" +
          std::string(suffix);
 }
-std::string prefillKernel(const QuantizedSegment &segment, char epilogue, bool splitPrefill) {
-  const bool narrow = splitPrefill && (segment.formatId == GGUF_FMT_Q5PACK ||
-                                       segment.formatId == GGUF_FMT_Q6PACK || segment.formatId == GGUF_FMT_Q80);
-  return std::string("gguf_prefill_") + segment.name() + (narrow ? "_k32_" : "_") + epilogue;
+// A narrower column tile supplies more independent threadgroups when the chunk has few row tiles.
+struct PrefillTile {
+  const char *suffix;
+  uint32_t groups;
+  uint32_t columns;
+
+  metal::DispatchSize grid(uint32_t rows, uint32_t outputs) const noexcept {
+    const uint32_t height = groups * GGUF_PREFILL_SIMDGROUP_ROWS;
+    return {(rows + height - 1) / height, outputs / columns, 1};
+  }
+  metal::DispatchSize threads() const noexcept { return {groups * 32, 1, 1}; }
+  std::string kernel(const QuantizedSegment &segment, char epilogue) const {
+    return std::string("gguf_prefill_") + segment.name() + suffix + epilogue;
+  }
+};
+PrefillTile prefillTile(uint32_t format, uint32_t k, uint32_t shortGroups, bool split) noexcept {
+  const bool packed = format == GGUF_FMT_Q5PACK || format == GGUF_FMT_Q6PACK || format == GGUF_FMT_Q80;
+  if (packed && shortGroups && (k == 5120 || k == 6144 || k == 17408))
+    return {shortGroups == GGUF_PREFILL_SIMDGROUPS ? "_short128_" : "_short256_", shortGroups,
+            GGUF_PREFILL_SHORT_COLUMNS};
+  return {packed && split ? "_k32_" : "_", GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS};
 }
 
 // The projection is the plan's matrix, and each of its segments (which tile
@@ -125,6 +142,11 @@ std::pair<const QuantizedSegment &, const QuantizedSegment &> onePassTensors(con
 }
 
 } // namespace
+
+uint32_t Linear::shortPrefillGroups(uint32_t rows) const noexcept {
+  if (!smePrefill_ || rows <= kMaximumDecodeTileRows || rows > 256) return 0;
+  return rows <= 128 ? GGUF_PREFILL_SIMDGROUPS : GGUF_PREFILL_SHORT_GROUPS;
+}
 
 void LinearPlan::requireConfiguration() const {
   const uint32_t k = workload_.matrix.inputSize;
@@ -381,8 +403,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   for (const QuantizedSegment &s : segments) addDecodeTensor(b, w.epilogue, s, gate, tensor);
 }
 
-// The prefill tile, which runs plans of more than kMaximumDecodeTileRows rows
-// over 128-row tiles: a plain projection in one
+// Prefill uses 128-row tiles, or 64-row tiles on short M4 chunks. A plain projection runs in one
 // dispatch per format, over the column tiles of its segments of that format
 // (a fused projection's segments otherwise run as small grids of their own),
 // a projection with an epilogue in one dispatch per segment. Rows past the
@@ -393,7 +414,9 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const LinearWorkload w = plan.workload();
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
-  const uint32_t rowTiles = plan.storageRows() / GGUF_PREFILL_ROWS;
+  const auto tileFor = [&](uint32_t format) {
+    return prefillTile(format, k, p.planeInputs() ? 0 : shortPrefillGroups(w.rows), smePrefill_ && b.prefillCpu);
+  };
   if (w.epilogue == LinearEpilogue::None && !p.planeInputs()) {
     const std::vector<QuantizedSegment> &segments = p.blocks().segments;
     std::vector<uint32_t> formats;
@@ -429,8 +452,9 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         columns -= cpuColumns;
       }
       const auto gpu = [&] {
-        graph.add(prefillKernel(*group.front(), epilogue, smePrefill_ && b.prefillCpu), std::move(bindings), params,
-                  {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
+        const PrefillTile tile = tileFor(format);
+        graph.add(tile.kernel(*group.front(), epilogue), std::move(bindings), params, tile.grid(w.rows, columns),
+                  tile.threads());
       };
       if (cpuColumns)
         addSmePrefill(graph, *b.prefillCpu, b.input, b.output, *group[part], w.rows, n, cpuColumns, gpu);
@@ -443,14 +467,15 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
-    const std::string pipeline = prefillKernel(s, epilogue, smePrefill_ && b.prefillCpu);
+    const PrefillTile tile = tileFor(s.formatId);
+    const std::string pipeline = tile.kernel(s, epilogue);
     const auto gpu = [&](uint32_t columns) {
-      const metal::DispatchSize groups{rowTiles, columns / GGUF_TILE_COLUMNS, 1};
+      const metal::DispatchSize groups = tile.grid(w.rows, columns);
       if (p.planeInputs())
         graph.add(leadingInputsInstance(pipeline), std::move(bindings),
-                  GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
+                  GgufPrefillLeadingParams{params, p.planeInputs()}, groups, tile.threads());
       else
-        graph.add(pipeline, std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+        graph.add(pipeline, std::move(bindings), params, groups, tile.threads());
     };
     uint32_t cpu = 0;
     if (b.prefillCpu && smePrefill_ && !p.rotation && w.epilogue == LinearEpilogue::Residual && b.residual.contents())
