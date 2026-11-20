@@ -219,6 +219,7 @@ struct BlockMoeWeights final {
   uint32_t streamBlock = 0;
   metal::MetalBuffer loadSlotTable = {};
   ExpertChunks chunks = {};
+  [[nodiscard]] bool streams() const;
 };
 
 // The one chunk of a block whose routed segments hold all its `slots`
@@ -247,6 +248,7 @@ struct MoeLoadPart final {
 class MoeExpertStream {
 public:
   virtual ~MoeExpertStream() = default;
+  [[nodiscard]] virtual bool needsLoad(uint32_t) const { return true; }
   virtual void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block,
                        const std::function<void()> &beside = {}) const = 0;
 };
@@ -343,6 +345,7 @@ struct MoeConfig final {
   // the plan's rows and the router's format (selectFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
   bool simdgroupMma = false;
+  bool kquantColumns = false;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -390,6 +393,9 @@ struct MoeBuffers final {
 struct MoE final {
   // The plan of a step of 1 to SPLASH_PREFILL_TOKEN_BUDGET rows.
   [[nodiscard]] static MoePlan plan(MoeShape shape, uint32_t rows, MoeConfig config);
+  // A joint expert pass over the contiguous rows of several prompt chunks.
+  static constexpr uint32_t maximumGroupRows = 4096;
+  [[nodiscard]] static MoePlan groupPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   // A step's routing (addRouting: the router, the selection and the
   // grouping into tiles), the load of its streamed experts, and its routed
   // work (the gather, the expert passes and the combine). A streamed block's

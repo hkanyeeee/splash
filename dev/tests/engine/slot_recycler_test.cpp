@@ -326,6 +326,22 @@ void compactsToTheFloorOnce() {
   }
 }
 
+void compactKeepsProtectedKeys() {
+  Arena arena(8);
+  for (uint64_t key = 0; key < 8; ++key) arena.route({key}, false);
+  for (const uint64_t key : {0, 6, 7}) arena.order.protect(*arena.order.find(key), true);
+  arena.compact(4);
+  for (uint64_t key = 10; key < 30; ++key) arena.route({key}, true);
+  for (const uint64_t key : {0, 6, 7})
+    require(arena.order.find(key).has_value(), "compacting or scanning evicted a protected key");
+
+  const uint32_t slot = *arena.order.find(6);
+  arena.order.free(slot);
+  require(arena.order.claim(40, 40, false) == slot, "a freed protected slot could not be reused");
+  arena.order.touch(*arena.order.find(29), 41, true);
+  require(arena.order.claim(41, 41, true) == slot, "a reused slot inherited protection");
+}
+
 void aScanSparesTheFrequent() {
   Arena arena(6);
   const std::vector<uint64_t> frequent{0, 1, 2};
@@ -398,6 +414,7 @@ int main() {
     compactsAtTheTarget();
     compactionsKeepTheBounds();
     compactsToTheFloorOnce();
+    compactKeepsProtectedKeys();
     aScanSparesTheFrequent();
     aRoutedCoreOutlivesMoreLanes();
     claimsAllocateNothing();

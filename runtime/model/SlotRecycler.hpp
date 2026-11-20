@@ -58,6 +58,10 @@ public:
   void free(uint32_t slot);
   // Every slot free, and no ghost.
   void reset();
+  // Protect a resident key from replacement across loads and compaction.
+  // The caller leaves enough unprotected slots for the largest load.
+  void protect(uint32_t slot, bool keep);
+  [[nodiscard]] size_t freeSlots() const noexcept { return free_.size(); }
   // `slots` slots: those added are free, and those past it are gone with
   // their keys. The ghosts stay, as many as the slots at most: fewer keep the
   // newest, those of T1 within what T1 leaves of the slots.
@@ -124,7 +128,7 @@ private:
   void append(uint32_t slot, List list);
   void prepend(uint32_t slot, List list);
   // The least recently used slot of `list` the load does not use, or none.
-  [[nodiscard]] uint32_t oldest(List list, uint64_t load) const;
+  [[nodiscard]] uint32_t oldest(List list, std::optional<uint64_t> load) const;
   // Recycles a slot of T1 or T2 (ARC's REPLACE, `frequentGhost` when the
   // key T2 gave up claims it): its key becomes a ghost, unless a scan brought
   // it.
@@ -143,6 +147,7 @@ private:
   Links links_;
   std::vector<uint32_t> free_;
   std::vector<uint64_t> key_, lastLoad_;
+  std::vector<uint8_t> protected_;
   Order recent_, frequent_;
   KeyIndex slotOf_;
   // The ghosts: each a key of B1 or B2 (ghostList_) in a list of its own, at

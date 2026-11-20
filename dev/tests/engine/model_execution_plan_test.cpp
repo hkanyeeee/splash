@@ -531,8 +531,20 @@ void checkPrefillAttentionHistory() {
   require(splitsAfter(65'536) > splitsAfter(0), "a chunk's attention plan does not follow its history");
 }
 
+void checkStreamedMoeGroupSize() {
+  const auto model = loadedModel<model::Qwen3_6MoeWeights>();
+  const auto chunks = [&](bool experts, bool m2Moe) {
+    return model::RuntimeGeometry::from(model, kv::Format::BFloat16, ops::GdnStateFormat::BFloat16,
+                                        {.experts = experts}, m2Moe).prefillChunks;
+  };
+  require(chunks(false, true) == 1 && chunks(true, false) == model::kPrefillGroupChunks &&
+              chunks(true, true) == (model::kPrefillRows == 512 ? 8 : model::kPrefillGroupChunks),
+          "streamed MoE prefill group did not follow the GPU and row budget");
+}
+
 int main() {
   try {
+    checkStreamedMoeGroupSize();
     checkPrefillAttentionHistory();
     checkUnsizedProjection();
     checkCaptureLayers();

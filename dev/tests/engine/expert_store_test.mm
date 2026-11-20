@@ -128,8 +128,9 @@ struct StepPlan final {
   std::array<SplashLaneRows, splash::model::ExecutionLimits::maximumBatchWidth> blocks{};
 };
 
-// A decode step of `lanes` lanes of `laneRows` rows each, on 8-row tiles.
-StepPlan decodeStep(const MoeShape &shape, uint32_t lanes, uint32_t laneRows = kLaneRows) {
+// A decode step of up to the configured number of lanes, on 8-row tiles.
+StepPlan decodeStep(const MoeShape &shape, uint32_t requestedLanes, uint32_t laneRows = kLaneRows) {
+  const uint32_t lanes = std::min(requestedLanes, splash::model::ExecutionLimits::maximumBatchWidth);
   StepPlan step{MoE::plan(shape, lanes * laneRows, MoeConfig{}), lanes, {}};
   for (uint32_t lane = 0; lane < lanes; ++lane) step.blocks[lane] = {lane * laneRows, laneRows};
   return step;
@@ -138,9 +139,10 @@ StepPlan decodeStep(const MoeShape &shape, uint32_t lanes, uint32_t laneRows = k
 // A decode step of 16 rows whose two lanes hold 5 and 3 of them, its other 8
 // rows of no lane (VerifyRowsParams), which route no expert.
 StepPlan shortLanesStep(const MoeShape &shape) {
-  StepPlan step{MoE::plan(shape, 16, MoeConfig{}), 2, {}};
+  constexpr uint32_t lanes = std::min(2U, splash::model::ExecutionLimits::maximumBatchWidth);
+  StepPlan step{MoE::plan(shape, 16, MoeConfig{}), lanes, {}};
   step.blocks[0] = {0, 5};
-  step.blocks[1] = {5, 3};
+  if constexpr (lanes == 2) step.blocks[1] = {5, 3};
   return step;
 }
 
@@ -231,8 +233,7 @@ bool longChunk(const MoeShape &shape, uint32_t rows) {
 // round, any other load half of them a round. A long chunk's load whose next
 // block streams (`nextStreams`) reads it ahead in one step more.
 uint32_t loadSteps(const MoeShape &shape, uint32_t rows, bool nextStreams) {
-  // The store's (ExpertStore.cpp's kCycleRows), fewer than four 16-row lanes'.
-  constexpr uint32_t cycleRows = 32;
+  const uint32_t cycleRows = ExpertStore::cycleRows();
   const uint64_t places =
       std::max<uint64_t>(2, std::min<uint64_t>(shape.experts, uint64_t{cycleRows} * shape.expertsPerToken));
   const uint64_t routable = std::min<uint64_t>(shape.experts, uint64_t{rows} * shape.expertsPerToken);
@@ -518,6 +519,10 @@ int streamedUnionLoads(MetalBackend &backend, const MoeShape &shape, const std::
         std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
         parts.push_back({&b.moe, &plans[step].plan});
       }
+      // On alternate turns the down projection writes over the gathered
+      // input, as it does for a joint prefill group. Resident and loaded
+      // experts must still produce the independent resident reference.
+      if (turn % 2) steps[0].moe.scratch.expertOutput = steps[0].moe.scratch.groupedInput;
       // The first step's, of the most rows, is the scratch they share.
       for (size_t step = 1; step < steps.size(); ++step)
         for (const auto shared :
@@ -1259,6 +1264,61 @@ int streamedElastic(MetalBackend &backend, const MoeShape &shape, const std::fil
   return failures;
 }
 
+// An automatically sized store may borrow unused KV capacity. Bind before
+// growth, then use the same weights through both sides of a residency change.
+int elasticWholeLayout(MetalBackend &backend, const MoeShape &shape, const std::filesystem::path &directory) {
+  const Model m = makeModel(backend, shape, Q5K, true);
+  ExpertFile file(m, directory / "experts.bin");
+  file.blocks.blocks.resize(4, file.blocks.blocks.front());
+  bool failPromotion = false;
+  file.blocks.checks.emplace_back([&] {
+    if (failPromotion) throw std::runtime_error("injected expert preload failure");
+  });
+  const auto planned = 3 * shape.experts;
+  auto options = storeOptions(arenaBytes(m, planned) + kSpareBytes, file.blocks, shape);
+  options.elasticWhole = true;
+  options.floorBytes = ExpertStore::fixedBytes(file.blocks, shape) + arenaBytes(m, 2 * shape.experts);
+  options.elasticChunkBytes = arenaBytes(m, shape.experts);
+  ExpertStore store(backend, file.blocks, shape, options);
+  std::array<BlockMoeWeights, 4> bound{m.weights, m.weights, m.weights, m.weights};
+  for (uint32_t block = 0; block < bound.size(); ++block) store.bind(block, bound[block]);
+  Buffers b;
+  freshRows(backend, b, shape);
+  const auto step = prefillStep(shape, kMaximumRows);
+  const auto want = runWeights(backend, m.weights, b, step);
+  const auto check = [&](uint32_t residentBlocks) {
+    for (uint32_t block = 0; block < bound.size(); ++block) {
+      const auto &weights = bound[block];
+      if (weights.streams() != (block >= residentBlocks) || runWeights(backend, weights, b, step) != want)
+        return false;
+    }
+    return true;
+  };
+  const auto start = store.stats();
+  if (start.plannedBytes > options.memoryBytes || start.plannedBytes >= start.capBytes || !check(1)) return 1;
+  growToCap(store);
+  const uint64_t reads = store.readBytes();
+  if (!check(4) || store.readBytes() != reads || store.stats().resident != store.stats().experts) return 1;
+  // With three blocks of capacity for four blocks, the single fixed block
+  // stays whole and the other two blocks' slots serve all three dynamic blocks.
+  if (!store.releaseAboveFloor() || !check(1)) return 1;
+  if (!store.releaseToFloor() || store.stats().liveBytes != start.floorBytes || !check(1)) return 1;
+  growToCap(store);
+  if (!check(4)) return 1;
+  store.release();
+  if (!store.restore(splash::test::admitAll)) return 1;
+  if (!check(1)) return 1;
+  failPromotion = true;
+  growToCap(store);
+  failPromotion = false;
+  if (!check(1)) return 1;
+  if (!store.releaseToFloor()) return 1;
+  growToCap(store);
+  if (!check(4)) return 1;
+  printf("elastic whole-layout expert promotion, compaction and restore match resident outputs ok\n");
+  return 0;
+}
+
 // The store as an elastic pool (model::ExpertStorePool). The pool's state
 // is the store's statistics: its live bytes, its floor and cap, the next
 // chunk a shrink gives back and a regrow takes; release(1) gives the chunk
@@ -1790,7 +1850,7 @@ int main(int argc, const char *argv[]) {
     try {
       MetalBackend backend(argv[1]);
       const splash::test::TemporaryDirectory directory("expert-store");
-      int failures = 0;
+      int failures = elasticWholeLayout(backend, kShapes[0], directory.path());
       for (const MoeShape &shape : kShapes) {
         printf("%u experts, top %u, hidden %u, %u wide:\n", shape.experts, shape.expertsPerToken, shape.hiddenSize,
                shape.expertIntermediateSize);

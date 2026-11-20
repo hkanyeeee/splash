@@ -88,6 +88,7 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
   const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes,
                                    .floorBytes = options.expertFloorBytes,
                                    .floorShare = options.expertFloorShare,
+                                   .elasticWhole = options.elasticWholeExperts,
                                    .readers = options.readers};
   return std::visit(
       [&](const auto &layout) -> TargetWeights {
@@ -145,6 +146,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   result.target = loadTarget(backend, images, root, result.descriptor, options);
   result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
   result.vision = loadVisionWeights(backend, images, vision.get());
+  result.vision.lendToText = options.elasticWholeExperts && vision != nullptr;
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());

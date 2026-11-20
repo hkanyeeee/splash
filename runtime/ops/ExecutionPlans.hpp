@@ -60,6 +60,7 @@ public:
   // The plan of a step of `rows` rows of a MoE target's blocks, whose
   // routers are in `routerFormat` (moeRouterFormat).
   [[nodiscard]] MoePlan moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
+  [[nodiscard]] MoePlan groupedMoe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
 
   // The attention workspace that holds any one sequence's partials, a
   // prompt chunk's; and a decode lane's, the most split slots a lane of up to

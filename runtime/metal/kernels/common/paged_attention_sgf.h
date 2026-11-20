@@ -207,116 +207,140 @@ __attribute__((always_inline)) inline void tile(
   const uint scale_base = page_token(fm, 0);
   const SplashKvAddressing<KVHeads, D, CacheElement> addressing(kv, kv_head);
 
-  for (uint page = page_begin; page < page_end; ++page) {
-    const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
-    device const CacheElement *keys = tensors.keys;
-    device const CacheElement *values = tensors.values;
-    float key_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    float value_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    if constexpr (Quantized) {
-      device const float *key_scales = tensors.key_scales + scale_base;
-      device const float *value_scales = tensors.value_scales + scale_base;
-      const float2 k01 = *reinterpret_cast<device const float2 *>(key_scales);
-      const float2 k45 = *reinterpret_cast<device const float2 *>(key_scales + 4);
-      const float2 v01 = *reinterpret_cast<device const float2 *>(value_scales);
-      const float2 v45 = *reinterpret_cast<device const float2 *>(value_scales + 4);
-      key_scale[0] = k01.x, key_scale[1] = k01.y, key_scale[2] = k45.x, key_scale[3] = k45.y;
-      value_scale[0] = v01.x, value_scale[1] = v01.y, value_scale[2] = v45.x,
-      value_scale[3] = v45.y;
-    }
-
-    // S^T tile s: tokens page_token(fm, s) x rows (row, row + 1), each tile
-    // summing its (b, t) steps in order.
-    float2 scores[4];
-#pragma unroll
-    for (uint s = 0; s < 4; ++s)
-      scores[s] = float2(0.0f);
-#pragma unroll
-    for (uint b = 0; b < D / 64; ++b)
-#pragma unroll
-      for (uint s = 0; s < 4; ++s) {
-        KeyRun<CacheElement> run;
-        run.load(keys + page_token(fm, s) * D + 64 * b + 8 * fn);
-#pragma unroll
-        for (uint t = 0; t < 8; ++t)
-          mma(scores[s], run.step(t), bfloat_pair(queries[(b * 8 + t) * 32 + lane]));
+  constexpr bool SeparateHistory = !Quantized && KVHeads == 2 && G == 8 &&
+                                   D == 256 && Rows == 8 && Window == 0;
+  const auto accumulatePages = [&](uint begin, uint end, auto fullyVisible) {
+    constexpr bool Full = decltype(fullyVisible)::value;
+    for (uint page = begin; page < end; ++page) {
+      const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
+      device const CacheElement *keys = tensors.keys;
+      device const CacheElement *values = tensors.values;
+      float key_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+      float value_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+      if constexpr (Quantized) {
+        device const float *key_scales = tensors.key_scales + scale_base;
+        device const float *value_scales = tensors.value_scales + scale_base;
+        const float2 k01 = *reinterpret_cast<device const float2 *>(key_scales);
+        const float2 k45 = *reinterpret_cast<device const float2 *>(key_scales + 4);
+        const float2 v01 = *reinterpret_cast<device const float2 *>(value_scales);
+        const float2 v45 = *reinterpret_cast<device const float2 *>(value_scales + 4);
+        key_scale[0] = k01.x, key_scale[1] = k01.y, key_scale[2] = k45.x, key_scale[3] = k45.y;
+        value_scale[0] = v01.x, value_scale[1] = v01.y, value_scale[2] = v45.x,
+        value_scale[3] = v45.y;
       }
 
-    // Online softmax, as splash_attention_page_softmax: key scale, then
-    // 1/sqrt(D); masked tokens never contribute, whatever their cache holds.
-    // 1/sqrt(D): 0.0625 = 2^-4 (D of 256); 0.08838834764831845 = 2^-3.5 (128).
-    constexpr float kScoreScale = D == 256 ? 0.0625f : 0.08838834764831845f;
-    const uint token_start = page * N;
-    float2 local_max(-INFINITY);
+      // S^T tile s: tokens page_token(fm, s) x rows (row, row + 1), each tile
+      // summing its (b, t) steps in order.
+      float2 scores[4];
 #pragma unroll
-    for (uint s = 0; s < 4; ++s) {
-      const uint token = token_start + page_token(fm, s);
-      float2 score = scores[s];
-      if constexpr (Quantized)
-        score *= key_scale[s];
-      score *= kScoreScale;
-      scores[s] = float2(sees(token, row, limit.x) ? score.x : -INFINITY,
-                         sees(token, row + 1, limit.y) ? score.y : -INFINITY);
-      local_max = max(local_max, scores[s]);
-    }
-    // Lane bits 1, 2 and 4 select fm: the other 28 tokens of these rows.
-    local_max = max(local_max, simd_shuffle_xor(local_max, 2));
-    local_max = max(local_max, simd_shuffle_xor(local_max, 4));
-    local_max = max(local_max, simd_shuffle_xor(local_max, 16));
-    const float2 next_max = max(row_max, local_max);
-    float2 probability[4];
-    float2 local_sum(0.0f);
+      for (uint s = 0; s < 4; ++s)
+        scores[s] = float2(0.0f);
 #pragma unroll
-    for (uint s = 0; s < 4; ++s) {
-      const uint token = token_start + page_token(fm, s);
-      probability[s] =
-          float2(sees(token, row, limit.x)
-                     ? fast::exp(scores[s].x - next_max.x) : 0.0f,
-                 sees(token, row + 1, limit.y)
-                     ? fast::exp(scores[s].y - next_max.y) : 0.0f);
-      local_sum += probability[s];
-    }
-    local_sum += simd_shuffle_xor(local_sum, 2);
-    local_sum += simd_shuffle_xor(local_sum, 4);
-    local_sum += simd_shuffle_xor(local_sum, 16);
-    const float2 scale(
-        next_max.x == -INFINITY || next_max.x == row_max.x
-            ? 1.0f : fast::exp(row_max.x - next_max.x),
-        next_max.y == -INFINITY || next_max.y == row_max.y
-            ? 1.0f : fast::exp(row_max.y - next_max.y));
-    row_sum = row_sum * scale + local_sum;
-    row_max = next_max;
-    if (simd_any(scale.x != 1.0f || scale.y != 1.0f)) {
+      for (uint b = 0; b < D / 64; ++b)
 #pragma unroll
-      for (uint d = 0; d < D / 8; ++d)
-        output[d] *= scale;
-    }
-    // P^T tile s is the score tile's own fragment: B[k = fm][n = fn].
-    float2 weights[4];
+        for (uint s = 0; s < 4; ++s) {
+          KeyRun<CacheElement> run;
+          run.load(keys + page_token(fm, s) * D + 64 * b + 8 * fn);
 #pragma unroll
-    for (uint s = 0; s < 4; ++s) {
-      const uint token = token_start + page_token(fm, s);
-      weights[s] = float2(
-          sees(token, row, limit.x)
-              ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
-          sees(token, row + 1, limit.y)
-              ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
-    }
+          for (uint t = 0; t < 8; ++t)
+            mma(scores[s], run.step(t), bfloat_pair(queries[(b * 8 + t) * 32 + lane]));
+        }
 
-    // O^T tile d += V^T (dimensions 8 d + fm, tokens) x P^T, each output tile
-    // summing its four token steps in order. The steps are spelled out: as a
-    // nested loop inside the unrolled dimension loop, the compiler leaves the
-    // step index dynamic, which costs up to 10% in verify and 20% in BF16.
-    device const CacheElement *value_row = values + fm * N + 4 * fn;
+      // Online softmax, as splash_attention_page_softmax: key scale, then
+      // 1/sqrt(D); masked tokens never contribute, whatever their cache holds.
+      // 1/sqrt(D): 0.0625 = 2^-4 (D of 256); 0.08838834764831845 = 2^-3.5 (128).
+      constexpr float kScoreScale = D == 256 ? 0.0625f : 0.08838834764831845f;
+      const uint token_start = page * N;
+      float2 local_max(-INFINITY);
 #pragma unroll
-    for (uint d = 0; d < D / 8; ++d) {
-      ValueRun<CacheElement> run;
-      run.load(value_row + d * 8 * N);
-      mma(output[d], run.step(0), weights[0]);
-      mma(output[d], run.step(1), weights[1]);
-      mma(output[d], run.step(2), weights[2]);
-      mma(output[d], run.step(3), weights[3]);
+      for (uint s = 0; s < 4; ++s) {
+        const uint token = token_start + page_token(fm, s);
+        float2 score = scores[s];
+        if constexpr (Quantized)
+          score *= key_scale[s];
+        score *= kScoreScale;
+        if constexpr (Full)
+          scores[s] = score;
+        else
+          scores[s] = float2(sees(token, row, limit.x) ? score.x : -INFINITY,
+                             sees(token, row + 1, limit.y) ? score.y : -INFINITY);
+        local_max = max(local_max, scores[s]);
+      }
+      // Lane bits 1, 2 and 4 select fm: the other 28 tokens of these rows.
+      local_max = max(local_max, simd_shuffle_xor(local_max, 2));
+      local_max = max(local_max, simd_shuffle_xor(local_max, 4));
+      local_max = max(local_max, simd_shuffle_xor(local_max, 16));
+      const float2 next_max = max(row_max, local_max);
+      float2 probability[4];
+      float2 local_sum(0.0f);
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        const uint token = token_start + page_token(fm, s);
+        if constexpr (Full)
+          probability[s] = fast::exp(scores[s] - next_max);
+        else
+          probability[s] =
+              float2(sees(token, row, limit.x)
+                         ? fast::exp(scores[s].x - next_max.x) : 0.0f,
+                     sees(token, row + 1, limit.y)
+                         ? fast::exp(scores[s].y - next_max.y) : 0.0f);
+        local_sum += probability[s];
+      }
+      local_sum += simd_shuffle_xor(local_sum, 2);
+      local_sum += simd_shuffle_xor(local_sum, 4);
+      local_sum += simd_shuffle_xor(local_sum, 16);
+      const float2 scale(
+          next_max.x == -INFINITY || next_max.x == row_max.x
+              ? 1.0f : fast::exp(row_max.x - next_max.x),
+          next_max.y == -INFINITY || next_max.y == row_max.y
+              ? 1.0f : fast::exp(row_max.y - next_max.y));
+      row_sum = row_sum * scale + local_sum;
+      row_max = next_max;
+      if (simd_any(scale.x != 1.0f || scale.y != 1.0f)) {
+#pragma unroll
+        for (uint d = 0; d < D / 8; ++d)
+          output[d] *= scale;
+      }
+      // P^T tile s is the score tile's own fragment: B[k = fm][n = fn].
+      float2 weights[4];
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        const uint token = token_start + page_token(fm, s);
+        if constexpr (SeparateHistory)
+          weights[s] = float2(bfloat2(probability[s]));
+        else
+          weights[s] = float2(
+              sees(token, row, limit.x)
+                  ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
+              sees(token, row + 1, limit.y)
+                  ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
+      }
+
+      // O^T tile d += V^T (dimensions 8 d + fm, tokens) x P^T, each output tile
+      // summing its four token steps in order. The steps are spelled out: as a
+      // nested loop inside the unrolled dimension loop, the compiler leaves the
+      // step index dynamic, which costs up to 10% in verify and 20% in BF16.
+      device const CacheElement *value_row = values + fm * N + 4 * fn;
+#pragma unroll
+      for (uint d = 0; d < D / 8; ++d) {
+        ValueRun<CacheElement> run;
+        run.load(value_row + d * 8 * N);
+        mma(output[d], run.step(0), weights[0]);
+        mma(output[d], run.step(1), weights[1]);
+        mma(output[d], run.step(2), weights[2]);
+        mma(output[d], run.step(3), weights[3]);
+      }
     }
+  };
+  if constexpr (SeparateHistory) {
+    // Before the first query (or the tree anchor), every row sees every key
+    // in a complete page. Only the boundary and later pages need a mask.
+    const uint boundary = clamp((tree.rows ? tree.anchor : committed_tokens) / N,
+                                page_begin, page_end);
+    accumulatePages(page_begin, boundary, metal::true_type{});
+    accumulatePages(boundary, page_end, metal::false_type{});
+  } else {
+    accumulatePages(page_begin, page_end, metal::false_type{});
   }
 
   device float *target = partials + slot * M * D;

@@ -136,6 +136,8 @@ struct ExpertStoreOptions final {
   // The share of each streamed size's slots its floor holds where floorBytes
   // is zero, which the model's plan sets.
   double floorShare = kExpertFloorShare;
+  // Optional slots above the planned store borrow unused KV memory through the ledger.
+  bool elasticWhole = false;
   // The readers its reads run on: the engine's one pool, which the other
   // streamed weights and KV reads share.
   std::shared_ptr<SsdReaders> readers;
@@ -179,6 +181,7 @@ public:
   // block's router and shared-expert gate, set before, which predict its
   // routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
+  [[nodiscard]] bool needsLoad(uint32_t block) const override;
   void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
                const std::function<void()> &beside = {}) const override;
   [[nodiscard]] ExpertStoreStats stats() const;

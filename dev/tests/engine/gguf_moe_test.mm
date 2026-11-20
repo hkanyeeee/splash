@@ -888,6 +888,8 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
                            dispatch.threadgroups.y == plan.maximumTiles())),
             label + ": " + dispatch.pipelineName + " runs another grid than its live tiles");
     const std::string_view pass = withoutSlices(dispatch.pipelineName);
+    if (grid && plan.configuration().kquantColumns && b.moe.lanes)
+      require(pass.find("_columns_") != std::string_view::npos, label + ": missing verified column kernel");
     gateUpPasses += pass.ends_with("_gate_up") || pass.ends_with("_gate_up_mixed");
     downPasses += pass.ends_with("_down");
   }
@@ -1185,6 +1187,18 @@ int moe(MetalBackend &backend, bool packedMma = false) {
       MoeConfig config{rows <= 8 ? MoeExpertTile::M8 : MoeExpertTile::M32};
       config.simdgroupMma = true;
       runPlan(backend, m, b, MoE::plan(kShape, rows, config), products, stats, "packed MMA rows=" + std::to_string(rows));
+    }
+    if constexpr (kSharedSlices == 1) {
+      for (const uint32_t rows : {1u, 2u, 8u}) {
+        const SplashLaneRows lane{0, rows};
+        b.moe.lanes = 1;
+        b.moe.laneRows = upload(backend, &lane, sizeof(lane), "verified-column-rows");
+        MoeConfig config{MoeExpertTile::M8};
+        config.simdgroupMma = true;
+        config.kquantColumns = true;
+        runPlan(backend, m, b, MoE::plan(kShape, rows, config), products, stats,
+                "verified K-quant columns rows=" + std::to_string(rows));
+      }
     }
     std::cout << "packed Apple7/8 MMA tail guard, intermediates, down and residual: PASS\n";
     return 0;

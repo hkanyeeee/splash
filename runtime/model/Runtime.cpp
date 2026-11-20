@@ -290,6 +290,7 @@ QwenTargetPrefillBuffers targetBuffers(const TargetArena &target, uint32_t chunk
   buffers.ropeCos = t(TargetTensor::RopeCos);
   buffers.ropeSin = t(TargetTensor::RopeSin);
   buffers.moe = target.moeScratch(chunk);
+  if (!chunk) buffers.group = target.group();
   return buffers;
 }
 
@@ -716,7 +717,8 @@ struct Runtime::Impl {
       : backend(value.backend),
         model(value.model),
         geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format, value.stateStorage.layout().target,
-                                       StreamedParts::loaded(value.model, value.blockCache != nullptr))),
+                                       StreamedParts::loaded(value.model, value.blockCache != nullptr),
+                                       value.operators.calibration().m2Moe)),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
@@ -1056,8 +1058,14 @@ struct Runtime::Impl {
   // counts the rows it shares as reuses, each once.
   StateAdmission activate(const ModelRequest &request, uint32_t stateLane,
                           std::vector<ImageState> &images) {
-    if (request.images.empty())
+    if (request.images.empty()) {
+      // At 64K tokens this target's BF16 KV already exceeds the vision
+      // tower's allocation. Its expert store can use that room during text.
+      if (model.vision.lendToText && kvPages.layout().format == kv::Format::BFloat16 &&
+          request.prompt.size() >= 65536 && (!vision || vision.use_count() == 1) && visionIdle())
+        model.images->releaseComponent(model.vision.files.front().relativePath);
       return laneAdmission(stateLane, states.tryActivateLane(stateLane, request.id));
+    }
     // The engine rejects image requests at submission when there is no vision.
     if (!model.descriptor.hasVision())
       throw std::logic_error("image request reached a model without vision");
@@ -1090,6 +1098,9 @@ struct Runtime::Impl {
         encodePatches = std::max(encodePatches, span.gridHeight * span.gridWidth);
       staged.push_back({span, std::move(rows)});
     }
+    const bool needsTower = encodePatches && model.vision.lendToText;
+    const uint64_t towerBytes =
+        needsTower ? model.images->missingComponentBytes(model.vision.files.front().relativePath) : 0;
     const uint64_t encoderBytes =
         encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
             ? ops::Vision::scratchBytes(model.vision.tensors.layout, encodePatches)
@@ -1113,9 +1124,10 @@ struct Runtime::Impl {
         }
         pixels += span.pixelBytes();
       }
+      if (needsTower) model.images->restoreComponent(model.vision.files.front().relativePath);
     };
     StateAdmission admission = laneAdmission(
-        stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + bytes, allocate));
+        stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + towerBytes + bytes, allocate));
     if (!admission.granted()) {
       admission.held = std::make_shared<const Matched>(
           Matched{std::move(shared), encodePatches && !encoderBytes ? vision : nullptr});
@@ -4625,8 +4637,9 @@ void withPrefillArena(
     MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<MetalBuffer, 2> &)> &use) {
   // A prefill arena holds no state cell, so either state format sizes it.
-  const PrefillArena arena(backend, RuntimeGeometry::from(model, format, ops::GdnStateFormat::Float32),
-                           operators);
+  const auto geometry = RuntimeGeometry::from(model, format, ops::GdnStateFormat::Float32,
+                                              StreamedParts::loaded(model), operators.calibration().m2Moe);
+  const PrefillArena arena(backend, geometry, operators);
   const QwenTargetPrefillBuffers buffers = prefillBuffers(arena, 0);
   use(buffers.ffn(), buffers.hidden);
 }
@@ -4649,8 +4662,8 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      kv::Format kvFormat,
                                      ops::GdnStateFormat stateFormat, StreamedParts parts) {
   requireCompatibleModel(model);
-  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts),
-                      operators);
+  const auto geometry = RuntimeGeometry::from(model, kvFormat, stateFormat, parts, operators.calibration().m2Moe);
+  return memoryPlanOf(model.descriptor, stateFormat, geometry, operators);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor, const QwenTargetGeometry &target,
@@ -4658,7 +4671,8 @@ ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor, const Qw
                                      ops::GdnStateFormat stateFormat, StreamedParts parts) {
   return memoryPlanOf(
       descriptor, stateFormat,
-      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts), operators);
+      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts,
+                            operators.calibration().m2Moe), operators);
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

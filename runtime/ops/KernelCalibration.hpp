@@ -125,6 +125,7 @@ struct KernelCalibration final {
   FloatTileCalibration floatTile;
   AttentionCalibration attention;
   bool simdgroupMma = false;
+  bool m2Moe = false;
 
   [[nodiscard]] static KernelCalibration of(const DeviceCapabilities &device) noexcept;
 };
@@ -333,7 +334,7 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   const uint32_t cores = device.plannedGpuCores();
   const GpuClass gpu = device.gpuClass();
   if (gpu == GpuClass::Apple7)
-    return {cores, kApple7Projection, kApple9FloatTile, {32, kNever, cores}, true};
+    return {cores, kApple7Projection, kApple9FloatTile, {32, kNever, cores}, true, device.appleGpuFamily == 8};
   if (gpu != GpuClass::Apple9)
     return {cores, gpu == GpuClass::Apple11 ? kApple11Projection : kApple10Projection, kApple10FloatTile,
             kApple10Attention};

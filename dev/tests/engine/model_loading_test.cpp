@@ -114,8 +114,9 @@ splash::model::ImagePlan fileImage(const std::filesystem::path &path, std::strin
 
 void testStartupCapabilities() {
     using splash::model::ExecutionLimits;
-    require(ExecutionLimits::maximumBatchWidth == 4 &&
-                ExecutionLimits::prefillTokenBudget == 2048 &&
+    require(SPLASH_MAXIMUM_BATCH_WIDTH == 4 &&
+                ExecutionLimits::maximumBatchWidth == SPLASH_RUNTIME_MAXIMUM_BATCH_WIDTH &&
+                ExecutionLimits::prefillTokenBudget == SPLASH_PREFILL_TOKEN_BUDGET &&
                 ExecutionLimits::draftQueryRows == 8 &&
                 ExecutionLimits::draftProposalTokens == 7 &&
                 ExecutionLimits::targetVerifyRows == 16 && splash::ops::kNarrowLaneRows == 8 &&
@@ -199,6 +200,16 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         require(backend.memoryStats().allocatedBytes >= baseline + fileBytes,
                 "an image's memory was not tracked");
         require(readBack(), "GPU read of an image section was incorrect");
+        const std::string_view component = file.record().relativePath;
+        require(images.missingComponentBytes(component) == 0, "resident image requests another allocation");
+        images.releaseComponent(component);
+        images.releaseComponent(component);
+        require(!images.released() && !retained.contents() && images.missingComponentBytes(component) == fileBytes,
+                "releasing one component did not detach its views from memory");
+        images.restoreComponent(component);
+        images.restoreComponent(component);
+        require(readBack(), "restoring one component changed its contents");
+        images.releaseComponent(component);
         images.release();
         require(!retained.contents() && backend.memoryStats().allocatedBytes == baseline,
                 "released image memory remains");

@@ -79,6 +79,10 @@ MoePlan ExecutionPlans::moe(MoeShape shape, uint32_t routerFormat, uint32_t rows
   return MoE::plan(shape, rows, selectMoe(calibration(), shape, routerFormat, rows));
 }
 
+MoePlan ExecutionPlans::groupedMoe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const {
+  return MoE::groupPlan(shape, rows, selectMoe(calibration(), shape, routerFormat, rows));
+}
+
 AttentionWorkspace ExecutionPlans::sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const {
   return PagedAttention::workspace(kAttentionSequenceSplits, queryHeads, layout);
 }

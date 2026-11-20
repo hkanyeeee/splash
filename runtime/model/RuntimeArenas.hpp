@@ -45,8 +45,8 @@ inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 // spills reads each attention layer's spilled history once
 // (model::SpilledKvReads). A group holds the tensors its chunks carry from
 // layer to layer once per chunk (prefillGroupTensor), and requests that
-// arrive while it runs wait for the whole command: four chunks read a layer
-// once per 8192 rows and keep both bounded.
+// arrive while it runs wait for the whole command. Four chunks are the
+// default. The 512-row M2 streamed MoE path amortizes expert reads over eight.
 inline constexpr uint32_t kPrefillGroupChunks = 4;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextTokens;
@@ -65,6 +65,7 @@ struct RuntimeGeometry final {
   uint32_t prefillChunks = 1;
   // Whether the target's experts stream from the SSD.
   bool streamedExperts = false;
+  bool groupMoe = false;
   // The step scratch the target keeps itself beside the arenas.
   QwenTargetScratchBytes targetScratch{};
 
@@ -78,18 +79,18 @@ struct RuntimeGeometry final {
     return from(model, kvFormat, stateFormat, StreamedParts::loaded(model));
   }
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts, bool m2Moe = false) {
     const DFlashDraftLayout &draft = model.draft.layout;
     return from(model.descriptor, draft,
                 std::visit([&](const auto &weights) { return qwenTargetGeometry(weights, draft.targetLayerIds()); },
                            model.target),
-                kvFormat, stateFormat, parts);
+                kvFormat, stateFormat, parts, m2Moe);
   }
   // The same with a cached state's form as `states`, a runtime's state
   // storage's, holds it (GdnStateLayout::cachedCodes).
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
-                                            const GdnStateLayout &states, StreamedParts parts) {
-    RuntimeGeometry result = from(model, kvFormat, states.format, parts);
+                                            const GdnStateLayout &states, StreamedParts parts, bool m2Moe = false) {
+    RuntimeGeometry result = from(model, kvFormat, states.format, parts, m2Moe);
     result.target.stateLayout.cachedCodes = states.cachedCodes;
     return result;
   }
@@ -99,7 +100,7 @@ struct RuntimeGeometry final {
   // streaming.
   [[nodiscard]] static RuntimeGeometry from(const ModelDescriptor &descriptor, const DFlashDraftLayout &draft,
                                             QwenTargetGeometry target, kv::Format kvFormat,
-                                            ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                            ops::GdnStateFormat stateFormat, StreamedParts parts, bool m2Moe = false) {
     RuntimeGeometry result;
     result.draft = draft;
     result.target = std::move(target);
@@ -110,7 +111,12 @@ struct RuntimeGeometry final {
     result.target.ropeScaling = descriptor.ropeScaling;
     if (parts.kv) result.spilledKv = descriptor.capabilities.sparseKv;
     result.streamedExperts = parts.experts;
-    if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
+    if (const auto *layout = std::get_if<Qwen3_6MoeLayout>(&descriptor.target))
+      result.groupMoe = parts.experts && layout->family == Qwen3_6MoeLayout{}.family;
+    if (parts.experts || parts.kv) {
+      const bool wideGroup = kPrefillRows == 512 && m2Moe && result.groupMoe && !parts.kv;
+      result.prefillChunks = wideGroup ? 8 : kPrefillGroupChunks;
+    }
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         (parts.kv && !result.target.kvLayout.spillable()) ||
         result.target.contextTokens() != descriptor.capabilities.maximumContextTokens ||
@@ -257,6 +263,7 @@ struct TargetRows final {
   uint32_t chunks = 1;
   ops::AttentionWorkspace attention{};
   ops::MoeWorkspace moe{};
+  bool groupMoe = false;
 };
 
 // Whether a target tensor's rows outlive a layer of a prefill group, which
@@ -325,7 +332,18 @@ public:
       }
       cursor += alignUp(sizes[index]);
     }
+    if (shape.groupMoe) {
+      const auto whole = [&](TargetTensor t) { return tensors_[static_cast<uint32_t>(t)]; };
+      group_.emplace(QwenPrefillMoeGroup{whole(TargetTensor::Normalized), whole(TargetTensor::GdnOutput),
+                                         whole(TargetTensor::AttentionOutput),
+                                         {whole(TargetTensor::Hidden0), whole(TargetTensor::Hidden1)}, {}});
+      for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+        group_->scratch.*ops::kMoeScratchFields[field].buffer = whole(moeScratchTensor<TargetTensor>(field));
+      group_->scratch.expertOutput = group_->scratch.groupedInput;
+    }
   }
+
+  [[nodiscard]] const QwenPrefillMoeGroup *group() const { return group_ ? &*group_ : nullptr; }
 
   // Chunk `chunk`'s view of a group's tensor (targetGroupTensor), or the
   // tensor of an arena of one chunk.
@@ -350,6 +368,7 @@ public:
 
 private:
   TargetRows shape_;
+  std::optional<QwenPrefillMoeGroup> group_;
   std::array<metal::MetalBuffer, targetTensorCount> tensors_{};
   std::array<std::vector<metal::MetalBuffer>, targetTensorCount> chunkViews_{};
 };

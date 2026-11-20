@@ -19,6 +19,7 @@ struct QwenVisionWeights final {
   ops::VisionWeights tensors;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
+  bool lendToText = false;
 };
 
 // The tower's image, written from an upstream source.

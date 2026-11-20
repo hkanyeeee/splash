@@ -250,6 +250,12 @@ struct QwenTargetPrefillSequence final {
   metal::MetalBuffer auxiliaryOut;
 };
 
+struct QwenPrefillMoeGroup final {
+  metal::MetalBuffer normalized, gdnResidual, attentionResidual;
+  std::array<metal::MetalBuffer, 2> hidden;
+  ops::MoeScratch scratch;
+};
+
 struct QwenTargetPrefillBuffers final {
   // Split projections of the chunks the staged tile runs (LinearGguf.cpp).
   ops::LinearScratch linearScratch{};
@@ -281,6 +287,7 @@ struct QwenTargetPrefillBuffers final {
   // them, which the attention layers read (ops::AttentionRows).
   metal::MetalBuffer laneRows;
   ops::MoeScratch moe;
+  const QwenPrefillMoeGroup *group = nullptr;
 
   // The dense FFN's buffers among these.
   [[nodiscard]] ops::PrefillFfnBuffers ffn() const {
@@ -569,6 +576,7 @@ protected:
     // The layer's MoE buffers, which its routing (addPrefillLayer), the
     // layer's load and its routed work (addPrefillExperts) share.
     ops::MoeBuffers ffn{};
+    bool grouped = false;
     ops::AneFfn *aneFfn = nullptr;
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;
@@ -632,19 +640,42 @@ protected:
     std::vector<ops::MoeLoadPart> parts;
     if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
       for (const Step &step : steps) parts.push_back({&step.ffn, &*step.moe});
+    const auto *group = steps.front().buffers.group;
+    std::optional<ops::MoePlan> groupPlan;
+    if (group && steps.size() > 1 && !warmupTrace_ &&
+        std::ranges::all_of(steps.first(steps.size() - 1), [](const Step &s) {
+          return s.rows == ExecutionLimits::prefillTokenBudget;
+        })) {
+      const uint32_t rows = (steps.size() - 1) * ExecutionLimits::prefillTokenBudget + steps.back().rows;
+      groupPlan = operators_.groupedMoe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, rows);
+    }
     for (uint32_t index = range.first; index < range.end; ++index) {
+      const ops::BlockMoeWeights *ffn = layers.moe(index);
+      const bool streams = ffn && ffn->streams();
+      const bool grouped = groupPlan && ffn && index + 1 < geometry_.layers;
+      for (Step &step : steps) step.grouped = grouped;
       const uint32_t attentionLayer = steps.front().attentionLayer;
       for (Step &step : steps) layers.addPrefillLayer(step, index);
       if (steps.front().attentionLayer != attentionLayer)
         steps.front().spilled.layerEnd(steps.front().graph, attentionLayer);
-      const ops::BlockMoeWeights *ffn = layers.moe(index);
-      const bool streams = ffn && ffn->stream;
-      if (streams)
+      if (grouped) {
+        ops::MoeBuffers buffers{.input = group->normalized,
+                                .residual = layers.attends(index) ? group->attentionResidual : group->gdnResidual,
+                                .output = group->hidden[(index & 1) ^ 1], .scratch = group->scratch};
+        auto &graph = steps.front().graph;
+        ops::MoE::addRouting(graph, buffers, *ffn, *groupPlan);
+        if (streams) {
+          const ops::MoeLoadPart part{&buffers, &*groupPlan};
+          ffn->stream->addLoad(graph, std::span(&part, 1), ffn->streamBlock,
+                               [&] { ops::MoE::addResident(graph, buffers, *ffn, *groupPlan); });
+        }
+        ops::MoE::addRouted(graph, buffers, *ffn, *groupPlan);
+      } else if (streams)
         ffn->stream->addLoad(steps.front().graph, parts, ffn->streamBlock, [&] {
           ops::MoE::addResident(steps.front().graph, steps.front().ffn, *ffn, *steps.front().moe);
         });
       for (size_t at = 0; at < steps.size(); ++at) {
-        if (streams && at) ops::MoE::addResident(steps[at].graph, steps[at].ffn, *ffn, *steps[at].moe);
+        if (!grouped && streams && at) ops::MoE::addResident(steps[at].graph, steps[at].ffn, *ffn, *steps[at].moe);
         layers.addPrefillExperts(steps[at], index);
       }
       // Yield the GPU between prefill layers on Apple7/8 (ImpactingInteractivity).

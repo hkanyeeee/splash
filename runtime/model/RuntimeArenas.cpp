@@ -63,6 +63,17 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
                    .moe = {}};
   if (target.ffnKind == QwenFfnKind::SparseMoe)
     shape.moe = operators.moeWorkspace(target.moeBlockShape(), target.moeRouterFormat, kPrefillRows);
+  if (geometry.groupMoe && operators.calibration().m2Moe && shape.chunks > 1 &&
+      (kPrefillRows * shape.chunks <= 2048 || (kPrefillRows == 512 && shape.chunks == 8))) {
+    shape.groupMoe = true;
+    // The carried tensors already contain every chunk. The joint down projection
+    // reuses the gathered rows once gate and up have consumed them. A streamed
+    // grouping puts the loaded experts after all resident and shared rows.
+    const auto wide = operators.groupedMoe(target.moeBlockShape(), target.moeRouterFormat,
+                                          kPrefillRows * shape.chunks).workspace();
+    shape.moe.groupedInputBytes = wide.groupedInputBytes;
+    shape.moe.expertIntermediateBytes = wide.expertIntermediateBytes;
+  }
   return shape;
 }
 

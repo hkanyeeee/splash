@@ -120,11 +120,17 @@ std::array<uint32_t, Count> passFormats(std::array<uint32_t, Count> formats) {
 // groupedInput to expertIntermediate, then down to expertOutput
 // (moe_expert_gguf_m<rows>_down).
 void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
-                const metal::MetalBuffer &slots, const MoePlan &plan, const MoeGroupParams &group, uint32_t range) {
+                const metal::MetalBuffer &slots, const MoePlan &plan, const MoeGroupParams &group, uint32_t range,
+                bool verified) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   const bool mma = plan.configuration().simdgroupMma;
-  const std::string kernel = std::string(mma ? "moe_expert_gguf_mma_m" : "moe_expert_gguf_m") + std::to_string(plan.tileRows());
+  std::string kernel = std::string(mma ? "moe_expert_gguf_mma_m" : "moe_expert_gguf_m") +
+                       std::to_string(plan.tileRows());
+  if (verified && plan.configuration().kquantColumns && plan.tileRows() == 8 &&
+      weights.gate.routed.formatId == GGUF_FMT_Q4K && weights.up.routed.formatId == GGUF_FMT_Q4K &&
+      weights.gate.shared.formatId == weights.up.shared.formatId)
+    kernel += "_columns";
   // The passes' instances for the shape's shared slices.
   const std::string slices(compiledRouting(shape).slicesSuffix);
   const size_t gateUpOffset = range == MOE_TILES_LOADED     ? offsetof(MoeTileCount, loaded_gate_up_grid)
@@ -149,7 +155,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
             MoeGgufGateUpParams{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
                                 up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots, range},
             {group.gate_up_columns, tiles, 1}, gateUpGrid, {GGUF_STAGED_THREADS, 1, 1});
-  if (!mma) graph.specialize(passFormats<4>({gate.routed.formatId, gate.shared.formatId, up.routed.formatId, up.shared.formatId}));
+  graph.specialize(passFormats<4>({gate.routed.formatId, gate.shared.formatId, up.routed.formatId, up.shared.formatId}));
   graph.addresses(weights.chunks.planes());
   // Down, projection 2 of the routed experts, which it reaches in the chunks.
   graph.add(kernel + "_down" + slices,
@@ -158,7 +164,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
             MoeGgufExpertParams{intermediate, hidden, shape.experts, down.routed.formatId, down.shared.formatId,
                                 floorSlots, chunkSlots, range},
             {group.down_columns, tiles, 1}, downGrid, {GGUF_STAGED_THREADS, 1, 1});
-  if (!mma) graph.specialize(passFormats<2>({down.routed.formatId, down.shared.formatId}));
+  graph.specialize(passFormats<2>({down.routed.formatId, down.shared.formatId}));
   graph.addresses(weights.chunks.planes());
 }
 
@@ -183,7 +189,7 @@ MoeGroupParams groupParams(const MoePlan &plan, const BlockMoeWeights &weights) 
           shape.experts,
           shape.expertIntermediateSize / GGUF_STAGED_COLUMNS,
           shape.hiddenSize / GGUF_TILE_COLUMNS,
-          weights.stream != nullptr,
+          weights.streams(),
           0};
 }
 
@@ -208,6 +214,8 @@ void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const Moe
 }
 
 } // namespace
+
+bool BlockMoeWeights::streams() const { return stream && stream->needsLoad(streamBlock); }
 
 void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
                      const MoePlan &plan) {
@@ -252,7 +260,7 @@ void MoE::addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
   if (!weights.stream) throw std::invalid_argument("a resident MoE block's experts run after its routing alone");
   addGather(graph, buffers, plan);
   addExperts(graph, buffers.scratch, weights, buffers.scratch.expertSlots, plan, groupParams(plan, weights),
-             MOE_TILES_RESIDENT);
+             MOE_TILES_RESIDENT, buffers.lanes != 0);
 }
 
 // A streamed block's passes over the experts its load brought, on the load
@@ -261,11 +269,11 @@ void MoE::addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
 void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                     const BlockMoeWeights &weights, const MoePlan &plan) {
   const MoeGroupParams group = groupParams(plan, weights);
-  if (weights.stream) {
-    addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
+  if (weights.streams()) {
+    addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED, buffers.lanes != 0);
   } else {
     addGather(graph, buffers, plan);
-    addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL);
+    addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL, buffers.lanes != 0);
   }
   addCombine(graph, buffers, plan);
 }
@@ -390,7 +398,12 @@ ExpertChunks residentExpertChunks(const BlockMoeWeights &weights) {
 }
 
 MoePlan MoE::plan(MoeShape shape, uint32_t rows, MoeConfig config) {
-  if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET)
+  if (rows > SPLASH_PREFILL_TOKEN_BUDGET) throw std::invalid_argument("invalid MoE rows");
+  return groupPlan(shape, rows, config);
+}
+
+MoePlan MoE::groupPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
+  if (!rows || rows > maximumGroupRows)
     throw std::invalid_argument("invalid MoE rows");
   return MoePlan(shape, rows, config);
 }

@@ -508,6 +508,7 @@ void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights 
     step.ffn.lanes = d->step.lanes;
     step.ffn.laneRows = b.laneRows;
   }
+  if (step.grouped) return;
   ops::MoE::addRouting(step.graph, step.ffn, ffn, *step.moe);
   observe(step.graph, "moe_route_weights", b.moe.routingWeights, step.outputRows(), step.moe->shape().routesPerToken(), 4);
 }
@@ -614,7 +615,8 @@ private:
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const { return qwenMoeBlock(weights_.layers[index]); }
   void addPrefillExperts(PrefillStep &step, uint32_t index) const {
     const QwenTargetPrefillBuffers &b = step.buffers;
-    if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
+    if (const ops::BlockMoeWeights *ffn = moe(index); ffn && !step.grouped)
+      ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
     if (warmupTrace_ && step.moe) {
       const auto shape = step.moe->shape();
       const auto routes = shape.routesPerToken(), rows = step.outputRows();

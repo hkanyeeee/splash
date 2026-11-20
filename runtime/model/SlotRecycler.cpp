@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <stdexcept>
+#include <utility>
 
 namespace splash::model {
 namespace {
@@ -102,9 +103,16 @@ void SlotRecycler::prepend(uint32_t slot, List list) {
   links_.prepend(slots(list), slot);
 }
 
-uint32_t SlotRecycler::oldest(List list, uint64_t load) const {
+void SlotRecycler::protect(uint32_t slot, bool keep) {
+  if (keep && list_.at(slot) == Free) throw std::logic_error("cannot protect a free expert slot");
+  if (keep && protected_.empty()) protected_.resize(size());
+  if (!protected_.empty()) protected_.at(slot) = keep;
+}
+
+uint32_t SlotRecycler::oldest(List list, std::optional<uint64_t> load) const {
   uint32_t slot = list == Recent ? recent_.head : frequent_.head;
-  while (slot != kNone && lastLoad_[slot] == load) slot = links_.next[slot];
+  while (slot != kNone && ((!protected_.empty() && protected_[slot]) || (load && lastLoad_[slot] == *load)))
+    slot = links_.next[slot];
   return slot;
 }
 
@@ -250,11 +258,13 @@ void SlotRecycler::free(uint32_t slot) {
     slotOf_.erase(key_[slot]);
     free_.push_back(slot);
   }
+  if (!protected_.empty()) protected_[slot] = false;
   scan_[slot] = 0;
   lastLoad_[slot] = 0;
 }
 
 void SlotRecycler::reset() {
+  protected_.clear();
   recent_ = frequent_ = {};
   slotOf_.clear();
   forgetGhosts();
@@ -276,6 +286,7 @@ void SlotRecycler::resize(uint32_t slots) {
     target_ = std::min<uint64_t>(target_, slots);
     keepGhosts(slots);
   }
+  if (!protected_.empty()) protected_.resize(slots);
   list_.resize(slots, Free);
   scan_.resize(slots, 0);
   links_.previous.resize(slots);
@@ -306,8 +317,9 @@ void SlotRecycler::compact(uint32_t slots, const std::function<void(uint32_t)> &
   // past them takes a key less to move.
   while (past > free_.size()) {
     const bool fromRecent = recent_.count > target_;
-    uint32_t slot = fromRecent ? recent_.head : frequent_.head;
-    if (slot == kNone) slot = fromRecent ? frequent_.head : recent_.head;
+    uint32_t slot = oldest(fromRecent ? Recent : Frequent, std::nullopt);
+    if (slot == kNone) slot = oldest(fromRecent ? Frequent : Recent, std::nullopt);
+    if (slot == kNone) throw std::logic_error("protected keys exceed the compacted store");
     evict(slot, false);
     lastLoad_[slot] = 0;
     if (slot < slots) free_.push_back(slot);
@@ -326,6 +338,7 @@ void SlotRecycler::compact(uint32_t slots, const std::function<void(uint32_t)> &
     list_[from] = Free;
     key_[to] = key_[from];
     lastLoad_[to] = lastLoad_[from];
+    if (!protected_.empty()) protected_[to] = std::exchange(protected_[from], 0);
     scan_[to] = scan_[from];
     scan_[from] = 0;
     slotOf_.erase(key_[to]);

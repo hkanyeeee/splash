@@ -323,6 +323,8 @@ MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape,
                     uint32_t rows) noexcept {
   MoeConfig config;
   config.simdgroupMma = calibration.simdgroupMma;
+  config.kquantColumns = calibration.m2Moe && shape.hiddenSize == 2048 && shape.expertIntermediateSize == 512 &&
+                         shape.experts == 256 && shape.expertsPerToken == 8 && shape.sharedSlices == 1;
   config.expertTile = uint64_t{rows} * shape.expertsPerToken > shape.experts ? MoeExpertTile::M32
                                                                               : MoeExpertTile::M8;
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);

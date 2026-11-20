@@ -17,6 +17,7 @@ struct ExpertStoreStats final {
   // counts them (its staging and tables too), its chunks at the cap and
   // those live. The store as it is, the live chunks, their bytes and their
   // slots are zero while the store is released.
+  uint64_t plannedBytes = 0; // Store size charged beside the reserved KV capacity.
   uint64_t capBytes = 0;
   uint64_t floorBytes = 0;
   uint64_t liveBytes = 0;

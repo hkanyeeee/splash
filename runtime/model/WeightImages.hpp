@@ -86,6 +86,11 @@ public:
   [[nodiscard]] bool released() const noexcept override { return released_; }
   // An image being written ends first: its memory goes back with the others.
   void release() override;
+  // A component with no pending GPU use may lend its allocation while the
+  // model is resident. Bind its views again only after restoreComponent().
+  void releaseComponent(std::string_view component);
+  [[nodiscard]] uint64_t missingComponentBytes(std::string_view component) const;
+  void restoreComponent(std::string_view component);
   // Ends the write of the last image it took back, then takes back the next
   // and starts writing it on a thread of its own.
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
@@ -108,7 +113,9 @@ private:
     std::string component;
     metal::MetalBuffer buffer;
     ImageWriter write;
+    bool needsRewrite = false;
   };
+  [[nodiscard]] size_t componentIndex(std::string_view component) const;
   // The write of the last image restore() took back, on its thread: whether
   // it ended, and how it failed.
   struct Writing final {

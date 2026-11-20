@@ -347,6 +347,15 @@ schema, and the client times what a user sees.
 | `agent` | `--conversations` (4) coding-agent tool loops of `--turns` (12) turns that only grow: every turn all of them send, at the same instant, their conversation with the model's own last reply as an OpenAI client sends it back (its reasoning, its text and its tool call) and the tool's result after it, about `--turn-tokens` (1,000) tokens of source; they share their system prompt, with a guide of as many tokens, and their tool. The next turn starts `--gap` (0.5) seconds after the last reply, a tool that returns at once; `/status` at each turn's start and after the last turn's writes |
 | `edit` | `--conversations` (2) chats, one request at a time, each a turn, the chats taking turns, `--gap` (8) seconds after each reply, a user's pace: built over `--turns` (8) turns of a user message of about `--turn-tokens` tokens and the model's reply (`build`); then, at the turns a quarter, half and three quarters in, the conversation up to that turn's message sent again (`regenerate`), sent with another message in its place (`edit`), the edited branch taken a turn further (`follow`) and the original conversation, whole, a turn further (`return`); `/status` as `agent` |
 
+For 100K, 150K and 208K cold inputs, use
+`dev/benchmarks/long_context.py` against the configured server. Its
+`prepare` command uses the model tokenizer and a fixed source revision.
+`run` replays those files and checks three references spread across each
+prompt. It saves the response and reports actual input tokens, prefill and
+decode throughput, and time to first token. For a per-length comparison,
+start each build with a fresh cache and pass the same `--size` and input
+directory. See `python dev/benchmarks/long_context.py --help` for commands.
+
 Every request timestamps each content chunk of its stream; its gaps are the
 intervals between consecutive chunks after the first. Each request may take
 `--request-seconds` from its send (by default twice the longest request

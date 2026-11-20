@@ -40,13 +40,48 @@ std::exception_ptr WeightImages::endWrite() {
   return failure;
 }
 
+size_t WeightImages::componentIndex(std::string_view component) const {
+  const auto it = std::ranges::find(images_, component, &Image::component);
+  if (it == images_.end()) throw std::logic_error("unknown weight image: " + std::string(component));
+  return static_cast<size_t>(it - images_.begin());
+}
+
+void WeightImages::releaseComponent(std::string_view component) {
+  if (released_ || backend_->commandInFlight()) return;
+  Image &image = images_[componentIndex(component)];
+  if (image.buffer.contents()) backend_->releaseMemory(image.buffer);
+}
+
+uint64_t WeightImages::missingComponentBytes(std::string_view component) const {
+  const Image &image = images_[componentIndex(component)];
+  return image.buffer.contents() ? 0 : image.buffer.sizeBytes();
+}
+
+void WeightImages::restoreComponent(std::string_view component) {
+  if (released_) throw std::logic_error("component restored during a whole-model release");
+  Image &image = images_[componentIndex(component)];
+  if (image.buffer.contents() && !image.needsRewrite) return;
+  if (!image.buffer.contents()) backend_->restoreMemory(image.buffer);
+  image.needsRewrite = true;
+  try {
+    image.write(contentsOf(image.buffer), image.buffer);
+    image.needsRewrite = false;
+  } catch (...) {
+    // A concurrent command can delay detaching the allocation. Its next
+    // admission retries the writer before any encoder can bind these bytes.
+    if (!backend_->commandInFlight()) backend_->releaseMemory(image.buffer);
+    throw;
+  }
+}
+
 void WeightImages::release() {
   // The next restore writes the image again, so its write's failure, if
   // any, no longer matters.
   static_cast<void>(endWrite());
   // During a restore, only the images it took back hold memory.
   const size_t held = released_ ? restored_ : images_.size();
-  for (size_t index = 0; index < held; ++index) backend_->releaseMemory(images_[index].buffer);
+  for (size_t index = 0; index < held; ++index)
+    if (images_[index].buffer.contents()) backend_->releaseMemory(images_[index].buffer);
   released_ = true;
   restored_ = 0;
 }
@@ -82,6 +117,7 @@ bool WeightImages::restore(const metal::AllocationAdmission &admit) {
     writing->thread = std::thread([&image, &state = *writing, written = written_] {
       try {
         image.write(contentsOf(image.buffer), image.buffer);
+        image.needsRewrite = false;
       } catch (...) {
         state.failure = std::current_exception();
       }

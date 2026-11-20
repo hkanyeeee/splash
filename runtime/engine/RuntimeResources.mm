@@ -372,10 +372,7 @@ bool keepsFloor(const model::ModelLoadOptions &loaded, double share, const model
          loaded.expertFloorShare == share;
 }
 
-// What streams of the loaded model, and how an automatic part's store was
-// sized; for the routed experts' store, its cap and the floor it starts at
-// and gives memory back down to, the model plan's `floorShare` of its slots:
-// all of them in a store --expert-memory sizes.
+// Report the streamed store's planned floor and its cap under the memory governor.
 void reportStreamedStores(const model::LoadedModel &loaded, const model::StreamableWeights &streamable,
                           const StreamedSetting &experts, const StreamedSetting &table, double floorShare) {
   const auto automatic = [](const StreamedSetting &setting, std::string_view option, std::string_view beside) {
@@ -404,9 +401,11 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
     const std::string size =
         sized ? ", the " + std::to_string(experts.bytes / kMiB) + " MiB --expert-memory sets" +
                     (stats.capBytes / kMiB != experts.bytes / kMiB ? " in whole slots and chunks" : "")
-              : automatic(experts, "--expert-memory", "the floors and the KV kept resident");
+              : stats.plannedBytes < stats.capBytes
+                    ? ", including slots that can borrow idle KV memory"
+                    : automatic(experts, "--expert-memory", "the floors and the KV kept resident");
     const std::string floor = std::to_string(stats.floorBytes / kMiB) + " MiB, " +
-                              std::to_string(static_cast<int>(std::lround(floorShare * 100))) + "% of its slots";
+                              std::to_string(static_cast<int>(std::lround(floorShare * 100))) + "% of its planned slots";
     const std::string shrinks =
         stats.floorBytes < stats.capBytes
             ? "; it starts at its floor and grows toward its cap as memory allows; while memory is short it gives "
@@ -853,6 +852,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                    .expertMemoryBytes = plan.expertBytes,
                                    .expertFloorBytes = plan.expertFloorBytes,
                                    .expertFloorShare = plan.expertFloorShare,
+                                   .elasticWholeExperts = device.appleGpuFamily == 8 && plan.expertBytes &&
+                                       config.model.family() == model::Qwen3_6MoeLayout{}.family &&
+                                       config.expertMemory.mode == StreamedSetting::Mode::Auto && !plan.spill.enabled &&
+                                       streamable.expertBytes < saturatingSubtract(hardBudgetBytes, streamable.loadedBytes),
                                    .readers = readers};
   };
   model::ModelLoadOptions loadOptions;
@@ -1012,16 +1015,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // The model's side of the split (startAneFfn).
   AneFfnModel splitModel;
-  // Readies the model as it loaded: the expert store's bytes above the floor
-  // it starts at are held back, as the engine's plan charges the store at its
-  // cap and the weights' allocations count its floor alone; the PLE row cache
-  // takes all of its host memory now, before the checks of the host that the
-  // start and the expert store's growth make, which see it whole from here
-  // on rather than as rows fill it; and the split's side is that model's.
+  // Reserve the planned expert slots above the live floor alongside KV.
+  // Additional elastic slots use the governor's ordinary admission. Commit
+  // the PLE row cache before startup and subsequent growth check host memory.
   const auto ready = [&] {
     if (const model::ExpertStore *store = loaded.expertStore()) {
       const model::ExpertStoreStats stats = store->stats();
-      hostHeldBackBytes = stats.capBytes - stats.liveBytes;
+      hostHeldBackBytes = saturatingSubtract(stats.plannedBytes, stats.liveBytes);
     }
     if (model::SparseRowStore *table = loaded.streamedTable())
       table->commit();

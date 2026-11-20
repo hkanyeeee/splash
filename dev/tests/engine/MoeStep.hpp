@@ -11,7 +11,7 @@ namespace splash::test {
 inline void addMoeStep(metal::CommandGraph &graph, const ops::MoeBuffers &buffers,
                        const ops::BlockMoeWeights &weights, const ops::MoePlan &plan) {
   ops::MoE::addRouting(graph, buffers, weights, plan);
-  if (weights.stream) {
+  if (weights.streams()) {
     const ops::MoeLoadPart part{&buffers, &plan};
     weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock,
                             [&] { ops::MoE::addResident(graph, buffers, weights, plan); });
