@@ -29,7 +29,7 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
     const std::string name =
         sliced ? "norm_rms_table16_sliced" : std::string("norm_rms") + tableSuffix(layout) + "_decode";
     graph.add(normKernel(name, weight, width), {input, weight.buffer, output, scratch.input, scratch.sums},
-              width, {rows, sliced ? 8u : 1u, 1});
+              width, {rows, sliced ? 10u : 1u, 1});
     return {std::move(output), layout};
   }
   if (rows <= SPLASH_STAGED_NORM_ROWS && width <= SPLASH_STAGED_NORM_WIDTH && width % 4 == 0)

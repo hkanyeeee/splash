@@ -350,7 +350,8 @@ inline void gdn_decode_scan(device const State *state_in,
     // condition (once a batch or once a row), its trees ran 10-20% faster on
     // an M5 Max and 10-13% faster on an M5 Pro, but 13% slower on the M5 Pro
     // at one lane of the 27B, and its chains 0.5% slower.
-    constexpr bool kValuesOnce = Rows == 16;
+    // The four-row M4 Max scan reuses the same values across its eight tree queries.
+    constexpr bool kValuesOnce = Rows == 16 || RowsInFlight == 4;
     float lane_values[RowsInFlight];
     if constexpr (Tree && kValuesOnce)
       for (uint r = 0; r < RowsInFlight; ++r)
@@ -714,9 +715,9 @@ inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
 #define GDN_DECODE_THREADS \
     uint2 group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
-#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, table, sums, Layout, W, State) \
+#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, Flight, table, sums, Layout, W, State) \
     threadgroup GdnDecodeShared<HeadDim, Rows> shared; \
-    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, 2, Layout, W, State>( \
+    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, Flight, Layout, W, State>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, tape, a_scale, dt_bias, \
         gdn_norm_weight, gdn_hidden, tree, lane_rows, params, group, lane, simd_group, shared, \
@@ -725,7 +726,7 @@ inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
 #define GDN_DECODE_KERNEL(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, W, State) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, nullptr, nullptr, gguf_sg::Table16, W, \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, 2, nullptr, nullptr, gguf_sg::Table16, W, \
                     State) \
   }
 // The out-projection's table (Layout: gguf_sg::Table16).
@@ -733,8 +734,14 @@ inline void gdn_fold_phase(device const uchar *state, device uchar *fold,
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       device bfloat *table [[buffer(17)]], device float *sums [[buffer(18)]], \
       constant GDNDecodeBatchParams &params [[buffer(19)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, table, sums, Layout, W, State) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Rows, 2, table, sums, Layout, W, State) \
   }
+// Four independent value rows overlap state loads and reductions on the 40-core M4 Max.
+kernel void verify_gdn_fused_table16_f32_m4(GDN_DECODE_BUFFERS(float),
+    device bfloat *table [[buffer(17)]], device float *sums [[buffer(18)]],
+    constant GDNDecodeBatchParams &params [[buffer(19)]], GDN_DECODE_THREADS) {
+  GDN_DECODE_BODY(16, 48, 128, 10240, 16640, 8, 4, table, sums, gguf_sg::Table16, float, float)
+}
 // Each entry over an fp32 state and, as Name_bf16_state, a bf16 one, of the
 // narrow rows (SPLASH_GDN_NARROW_ROWS) and, as ..._r16, of a verify block's.
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \

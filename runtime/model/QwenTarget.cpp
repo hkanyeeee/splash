@@ -154,7 +154,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     throw std::invalid_argument("invalid Qwen prefill chunk");
   PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
   step.decode = chunk.decode;
-  step.sliceVerifyNorm = step.decode && geometry_.isDense27B() && backend_.capabilities().is40CoreM4Max();
+  step.m4DenseDecode = step.decode && geometry_.isDense27B() && backend_.capabilities().is40CoreM4Max();
   if (step.decode && (step.decode->step.lanes != chunk.sequences.size() || step.decode->step.rows != chunk.rows))
     throw std::invalid_argument("a Qwen decode step's lanes or rows do not match its chunk");
   for (size_t index = 0; index < chunk.sequences.size(); ++index) {
@@ -232,7 +232,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
         {b.gdnPacked, mixer.convolutionWeights, d->currentGdnStates, d->nextGdnStates, d->gdnTape,
          std::span(d->gdnTapeLanes).first(d->step.lanes), b.laneRows, step.rows, d->step.laneCap, mixer.decay,
          mixer.timeBias, mixer.mixerNorm, b.gdnHidden, d->tree, b.linearScratch},
-        geometry_.gdnShape(), layer, geometry_.stateLayout.strides(), mixer.outputHeadOrder, outputPlan.input());
+        geometry_.gdnShape(), layer, geometry_.stateLayout.strides(), mixer.outputHeadOrder, outputPlan.input(), step.m4DenseDecode);
   } else {
     for (const QwenTargetPrefillSequence &sequence : step.sequences) {
       const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
@@ -379,7 +379,7 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows,
                                  b.linearScratch, linear.swiGluInput(ffn, rows, step.rows),
-                                 step.sliceVerifyNorm);
+                                 step.m4DenseDecode);
   linear.addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows, step.rows, normalized,
                    step.decode ? ops::FfnPass::TargetVerify : ops::FfnPass::General);
 }
@@ -481,7 +481,7 @@ private:
           const ops::PreparedInput normalized = ops::Normalization::addRms(
               step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch,
               operators_.linear().plan(mixer.inputProjection, step.rows).input(),
-              step.sliceVerifyNorm);
+              step.m4DenseDecode);
           const BlockOutput block{mixerOutput(b, mixer), input};
           addPrefillMixer(step, mixer, normalized, block);
           return block.rows;

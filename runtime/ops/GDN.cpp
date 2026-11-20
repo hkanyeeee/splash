@@ -226,7 +226,7 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
 
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                              GdnShape shape, uint32_t layer,
-                             GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
+                             GdnStateStrides state, GdnHeadOrder order, LinearInput input, bool m4DenseDecode) {
   const uint32_t lanes = static_cast<uint32_t>(buffers.tapes.size());
   // Each lane holds 1 to laneCap of the step's rows.
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || !buffers.laneCap ||
@@ -291,8 +291,12 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);
-  graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format) +
-                (most > SPLASH_GDN_NARROW_ROWS ? "_r16" : ""),
+  std::string pipeline = stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format);
+  if (most > SPLASH_GDN_NARROW_ROWS) pipeline += "_r16";
+  else if (m4DenseDecode && lanes == 1 && kernel.suffix.empty() && input == LinearInput::Table16 &&
+           buffers.mixerNorm.float32 && state.format == GdnStateFormat::Float32)
+    pipeline += "_m4";
+  graph.add(std::move(pipeline),
             std::move(bindings), params, {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
   return {buffers.hidden, input};

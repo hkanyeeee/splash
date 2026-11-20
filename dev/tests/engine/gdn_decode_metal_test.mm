@@ -733,6 +733,54 @@ struct PreparedTables final {
   }
 };
 
+// The four-row scan must leave exactly the same FP32 cell, BF16 hidden rows,
+// speculative tape and prepared out-projection operands after a retained path.
+void m4NarrowScan(MetalBackend &backend, const GdnShape &shape) {
+  Fixture fixture(backend, shape, 1, true);
+  fixture.blocks[0].rows = SPLASH_GDN_NARROW_ROWS;
+  PreparedTables tables(backend, LinearInput::Table16, shape.valueHeads * shape.headDimension, 1);
+  const auto encode = [&](CommandGraph &graph, bool m4) {
+    auto buffers = fixture.decodeBuffers(0);
+    buffers.linearScratch = tables.scratch();
+    GDN::addDecode(graph, buffers, shape, 0, fixture.cell.strides(), GdnHeadOrder::Tiled, LinearInput::Table16, m4);
+  };
+  CommandGraph first;
+  encode(first, false);
+  (void)backend.submitCommandAsync(first.dispatches()).wait();
+  const std::array<uint32_t, kMaxLanes> accepted{4};
+  fixture.advance(accepted);
+  fixture.fillPacked();
+  for (uint32_t count : {8u, 5u}) {
+    fixture.blocks[0].rows = count;
+    if (count == 5) {
+      auto *rows = static_cast<TreeRow *>(fixture.tree.contents());
+      for (uint32_t row = 1; row < count; ++row) {
+        const uint16_t parent = (row - 1) / 2;
+        rows[row] = {rows[parent].ancestors | (1u << row), parent, static_cast<uint16_t>(rows[parent].depth + 1)};
+      }
+    }
+    std::vector<uint8_t> expected;
+    for (bool m4 : {false, true}) {
+      const auto outputTape = backend.view(fixture.tape, fixture.blocks[0].tape.stepSlot, fixture.tapeBytes);
+      const std::array buffers{fixture.next[0], fixture.hidden, outputTape, tables.table, tables.sums};
+      for (const auto &buffer : buffers) std::memset(buffer.contents(), 0xb5, buffer.sizeBytes());
+      CommandGraph graph;
+      encode(graph, m4);
+      require(graph.dispatches().front().pipelineName ==
+                  (m4 ? "verify_gdn_fused_table16_f32_m4" : "verify_gdn_fused_table16_f32"),
+              "wrong narrow GDN scan");
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
+      std::vector<uint8_t> actual;
+      for (const auto &buffer : buffers) {
+        const auto *bytes = static_cast<const uint8_t *>(buffer.contents());
+        actual.insert(actual.end(), bytes, bytes + buffer.sizeBytes());
+      }
+      if (m4) require(actual == expected, "four-row GDN scan changed its cell, tape or projection operands");
+      else expected = std::move(actual);
+    }
+  }
+}
+
 std::string caseName(const char *test, const GdnShape &shape, uint32_t lanes, LinearInput layout) {
   return std::string(test) + " vh" + std::to_string(shape.valueHeads) + " lanes " +
          std::to_string(lanes) +
@@ -2151,6 +2199,8 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
+    for (const GdnShape &shape : kShapes)
+      if (shape.packedWidth == 16640) m4NarrowScan(backend, shape);
     for (const GdnShape &shape : kShapes)
       for (const uint32_t lanes : {1U, kMaxLanes})
         for (const bool float32 : familyNorms(shape))

@@ -185,7 +185,7 @@ public:
                                  GdnShape shape, uint32_t layer,
                                  GdnStateStrides state,
                                  GdnHeadOrder order,
-                                 LinearInput input);
+                                 LinearInput input, bool m4DenseDecode = false);
   // The state after the first `rows` rows of the path a lane retained of a
   // decode step's rows, in each of `layers` layers, as a cached state stores
   // it in buffers.fold: those rows folded into the state before them, the
