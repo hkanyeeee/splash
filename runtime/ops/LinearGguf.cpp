@@ -32,8 +32,10 @@ std::string decodeKernel(bool int8, const char *format, uint32_t rows, std::stri
   return std::string(int8 ? "gguf_decode_int8_" : "gguf_decode_") + format + "_m" + std::to_string(rows) + "_" +
          std::string(suffix);
 }
-std::string prefillKernel(const char *format, char epilogue) {
-  return std::string("gguf_prefill_") + format + "_" + epilogue;
+std::string prefillKernel(const QuantizedSegment &segment, char epilogue, bool splitPrefill) {
+  const bool narrow = splitPrefill && (segment.formatId == GGUF_FMT_Q5PACK ||
+                                       segment.formatId == GGUF_FMT_Q6PACK || segment.formatId == GGUF_FMT_Q80);
+  return std::string("gguf_prefill_") + segment.name() + (narrow ? "_k32_" : "_") + epilogue;
 }
 
 // The projection is the plan's matrix, and each of its segments (which tile
@@ -427,7 +429,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         columns -= cpuColumns;
       }
       const auto gpu = [&] {
-        graph.add(prefillKernel(group.front()->name(), epilogue), std::move(bindings), params,
+        graph.add(prefillKernel(*group.front(), epilogue, smePrefill_ && b.prefillCpu), std::move(bindings), params,
                   {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
       };
       if (cpuColumns)
@@ -441,13 +443,14 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
+    const std::string pipeline = prefillKernel(s, epilogue, smePrefill_ && b.prefillCpu);
     const auto gpu = [&](uint32_t columns) {
       const metal::DispatchSize groups{rowTiles, columns / GGUF_TILE_COLUMNS, 1};
       if (p.planeInputs())
-        graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
+        graph.add(leadingInputsInstance(pipeline), std::move(bindings),
                   GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
       else
-        graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+        graph.add(pipeline, std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
     };
     uint32_t cpu = 0;
     if (b.prefillCpu && smePrefill_ && !p.rotation && w.epilogue == LinearEpilogue::Residual && b.residual.contents())
