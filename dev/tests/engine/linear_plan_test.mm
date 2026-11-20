@@ -1296,6 +1296,46 @@ void producerTableContract(metal::MetalBackend &backend) {
   }
 }
 
+// The split verify norm must preserve the row, projection table and FP32 group sums.
+void slicedVerifyNorm(metal::MetalBackend &backend) {
+  constexpr uint32_t width = 5120, rows = 8;
+  constexpr uint64_t bytes = uint64_t{width} * rows * 2;
+  const auto arena = allocate(backend, 2 * bytes);
+  const auto input = backend.view(arena, 0, bytes);
+  const auto output = backend.view(arena, bytes, bytes);
+  const NormWeights weight{allocate(backend, width * 4), true};
+  auto *x = static_cast<uint16_t *>(input.contents());
+  auto *w = static_cast<float *>(weight.buffer.contents());
+  for (uint32_t i = 0; i < width * rows; ++i)
+    x[i] = i < width ? 0 : uint16_t((i & 1 ? 0x8000 : 0) | (0x3280 + (i * 197u) % 4109));
+  for (uint32_t i = 0; i < width; ++i) w[i] = float(int(i % 113) - 56) / 32.0f;
+  const LinearScratch scratch{.input = allocate(backend, tableBytes(width, rows)),
+                              .sums = allocate(backend, tableSumsBytes(LinearInput::Table16, width, rows))};
+  const auto encode = [&](metal::CommandGraph &graph, metal::MetalBuffer dest, bool sliced) {
+    (void)Normalization::addRms(graph, input, weight, dest, width, rows, scratch, LinearInput::Table16, sliced);
+    return graph.dispatches().front().pipelineName;
+  };
+  metal::CommandGraph overlapping;
+  require(encode(overlapping, backend.view(arena, bytes / 2, bytes), true) == "norm_rms_table16_decode_f32",
+          "overlapping views must use the single-group norm");
+  std::vector<uint8_t> reference;
+  for (bool sliced : {false, true}) {
+    metal::CommandGraph graph;
+    require(encode(graph, output, sliced) == (sliced ? "norm_rms_table16_sliced_f32" : "norm_rms_table16_decode_f32"),
+            "verify norm selected the wrong kernel");
+    for (const auto &buffer : {output, scratch.input, scratch.sums})
+      std::memset(buffer.contents(), sliced ? 0x55 : 0xaa, buffer.sizeBytes());
+    (void)backend.submitCommandAsync(graph.command()).wait();
+    std::vector<uint8_t> actual;
+    for (const auto &buffer : {output, scratch.input, scratch.sums}) {
+      const auto *begin = static_cast<const uint8_t *>(buffer.contents());
+      actual.insert(actual.end(), begin, begin + buffer.sizeBytes());
+    }
+    if (sliced) require(actual == reference, "split verify norm changed its output or operand tables");
+    else reference = std::move(actual);
+  }
+}
+
 // A rotated projection prepares its register tile's table from the rotated
 // rows (LinearGguf.cpp), so its plan asks its producer for plain rows: on
 // Apple9 a rotated PQ2_0 projection keeps the register tile and its input
@@ -1701,6 +1741,7 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     ggufProjectionMatrix(backend);
     producerTableContract(backend);
+    slicedVerifyNorm(backend);
     rotatedRegisterInput(backend);
     decodeInt8Setting(backend);
     decodeInt8TakesRotation(backend);

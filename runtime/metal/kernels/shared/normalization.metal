@@ -219,3 +219,49 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
 NORM_RMS_TABLE(norm_rms_table16_decode, gguf_sg::Table16, bfloat)
 NORM_RMS_TABLE(norm_rms_table16_decode_f32, gguf_sg::Table16, float)
 #undef NORM_RMS_TABLE
+
+// With eight 5120-wide GGUF verify rows a group per row leaves most M4 Max cores idle.
+// Eight groups independently reduce the row in canonical order and each publishes disjoint spans.
+kernel void norm_rms_table16_sliced_f32(
+    device const bfloat *input [[buffer(0)]], device const float *weight [[buffer(1)]],
+    device bfloat *output [[buffer(2)]], device bfloat *table [[buffer(3)]],
+    device float *sums [[buffer(4)]], constant uint &width [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+#pragma clang fp reassociate(off)
+  constexpr uint slices = 8, simdgroups = 8;
+  constexpr uint spans = 5120 / GGUF_TABLE16_SPAN_INPUTS;
+  static_assert(spans > slices * simdgroups && spans <= 2 * slices * simdgroups);
+  const uint row = group.x, first = group.y * simdgroups + sg;
+  device const bfloat *source = input + row * width;
+  bfloat2 values[2];
+  float2 weights[2];
+#pragma unroll
+  for (uint i = 0; i < 2; ++i) {
+    const uint span = first + i * slices * simdgroups;
+    if (span < spans) {
+      const uint col = span * GGUF_TABLE16_SPAN_INPUTS + 2 * lane;
+      values[i] = bfloat2(source[col], source[col + 1]);
+      weights[i] = float2(weight[col], weight[col + 1]);
+    }
+  }
+  threadgroup float partials[8];
+  const float partial = simd_sum(row_squares(source, width, tid));
+  if (lane == 0) partials[sg] = partial;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float value = partials[lane & 7];
+  float total = 0.0f;
+#pragma unroll
+  for (uint j = 0; j < 8; ++j) total += simd_broadcast(value, j);
+  const float inverse = rsqrt(total / width + kRmsEpsilon);
+#pragma unroll
+  for (uint i = 0; i < 2; ++i) {
+    const uint span = first + i * slices * simdgroups;
+    if (span >= spans) continue;
+    const uint col = span * GGUF_TABLE16_SPAN_INPUTS + 2 * lane;
+    const bfloat2 norm = bfloat2((float2(values[i]) * inverse) * weights[i]);
+    output[row * width + col] = norm.x;
+    output[row * width + col + 1] = norm.y;
+    gguf_sg::write_input(table, sums, width, span, row, lane, norm.x, norm.y);
+  }
+}

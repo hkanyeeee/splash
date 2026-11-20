@@ -67,6 +67,8 @@ public:
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
+  // Whether the two views cover any of the same bytes, including private storage.
+  [[nodiscard]] bool overlaps(const MetalBuffer &other) const noexcept;
 
 private:
   struct Impl;

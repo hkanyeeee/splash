@@ -571,6 +571,7 @@ protected:
     std::vector<uint32_t> readRows{};
     // A decode step's own buffers; none for a prompt chunk.
     const QwenTargetDecodeBuffers *decode = nullptr;
+    bool sliceVerifyNorm = false;
     [[nodiscard]] uint32_t outputRows() const noexcept {
       return readRows.empty() ? rows : static_cast<uint32_t>(readRows.size());
     }

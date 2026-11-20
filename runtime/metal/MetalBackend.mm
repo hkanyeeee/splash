@@ -2240,6 +2240,13 @@ bool MetalBuffer::sameView(const MetalBuffer &other) const noexcept {
            impl_->lengthBytes == other.impl_->lengthBytes;
 }
 
+bool MetalBuffer::overlaps(const MetalBuffer &other) const noexcept {
+    if (!impl_ || !other.impl_ || impl_->allocation != other.impl_->allocation) return false;
+    const auto &a = *impl_, &b = *other.impl_;
+    return a.lengthBytes && b.lengthBytes && a.offsetBytes < b.offsetBytes + b.lengthBytes &&
+           b.offsetBytes < a.offsetBytes + a.lengthBytes;
+}
+
 BufferStorage MetalBuffer::storage() const noexcept {
     return impl_ ? impl_->allocation->storage : BufferStorage::Shared;
 }

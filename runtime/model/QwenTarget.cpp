@@ -154,6 +154,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     throw std::invalid_argument("invalid Qwen prefill chunk");
   PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
   step.decode = chunk.decode;
+  step.sliceVerifyNorm = step.decode && geometry_.isDense27B() && backend_.capabilities().is40CoreM4Max();
   if (step.decode && (step.decode->step.lanes != chunk.sequences.size() || step.decode->step.rows != chunk.rows))
     throw std::invalid_argument("a Qwen decode step's lanes or rows do not match its chunk");
   for (size_t index = 0; index < chunk.sequences.size(); ++index) {
@@ -377,7 +378,8 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   }
   const ops::PreparedInput normalized =
       ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, rows,
-                                 b.linearScratch, linear.swiGluInput(ffn, rows, step.rows));
+                                 b.linearScratch, linear.swiGluInput(ffn, rows, step.rows),
+                                 step.sliceVerifyNorm);
   linear.addSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows, step.rows, normalized,
                    step.decode ? ops::FfnPass::TargetVerify : ops::FfnPass::General);
 }
@@ -478,7 +480,8 @@ private:
         [&](const auto &mixer) {
           const ops::PreparedInput normalized = ops::Normalization::addRms(
               step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows, b.linearScratch,
-              operators_.linear().plan(mixer.inputProjection, step.rows).input());
+              operators_.linear().plan(mixer.inputProjection, step.rows).input(),
+              step.sliceVerifyNorm);
           const BlockOutput block{mixerOutput(b, mixer), input};
           addPrefillMixer(step, mixer, normalized, block);
           return block.rows;

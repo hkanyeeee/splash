@@ -18,14 +18,18 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
                                     const NormWeights &weight,
                                     metal::MetalBuffer output, uint32_t width,
                                     uint32_t rows, LinearScratch scratch,
-                                    LinearInput layout) {
+                                    LinearInput layout, bool sliceTableRows) {
   const uint64_t bytes = uint64_t{rows} * width * 2;
   requireBytes(input, bytes, "norm input");
   requireBytes(output, bytes, "norm output");
   if (layout != LinearInput::Plain) {
     requireTableScratch(scratch, layout, width, rows);
-    graph.add(normKernel(std::string("norm_rms") + tableSuffix(layout) + "_decode", weight, width),
-              {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, 1, 1});
+    const bool sliced = sliceTableRows && weight.float32 && width == 5120 && rows == 8 &&
+                        layout == LinearInput::Table16 && !input.overlaps(output);
+    const std::string name =
+        sliced ? "norm_rms_table16_sliced" : std::string("norm_rms") + tableSuffix(layout) + "_decode";
+    graph.add(normKernel(name, weight, width), {input, weight.buffer, output, scratch.input, scratch.sums},
+              width, {rows, sliced ? 8u : 1u, 1});
     return {std::move(output), layout};
   }
   if (rows <= SPLASH_STAGED_NORM_ROWS && width <= SPLASH_STAGED_NORM_WIDTH && width % 4 == 0)
